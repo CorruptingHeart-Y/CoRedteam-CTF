@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "commands": [
+    {
+      "description": "列出当前目录（Win/Linux 通用 Python）",
+      "command": "python -c \"import os; print(os.listdir('.'))\""
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-DEMO-PT-001-1"
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-DEMO-PT-001-1"
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-unknown-1"
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-DEMO-PT-001-1"
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-unknown-1"
+    },
+    {
+      "context": "修复python -c中的多行语法错误",
+      "command_template": "python -c \"import sys; sys.path.insert(0, 'target_codebase'); import vuln_test; username_input = \\\"' OR '1'='1\\\"; query_template = \\\"SELECT * FROM users WHERE name = '%s'\\\"; query = query_template % username_input; print('Simulated SQL query:', query)\"",
+      "purpose": "单行版本的SQL注入模拟，避免多行字符串问题"
+    },
+    {
+      "context": "修复python -c中的多行语法错误",
+      "command_template": "python -c \"import os; base_dir = 'downloads'; user_input = '../../etc/passwd'; full_path = os.path.join(base_dir, user_input); normalized_path = os.path.normpath(full_path); print('Base directory:', base_dir); print('User input:', user_input); print('Joined path:', full_path); print('Normalized path:', normalized_path); print('Path escapes base directory:', not normalized_path.startswith(base_dir))\"",
+      "purpose": "单行版本的路径遍历模拟，避免多行字符串问题"
+    },
+    {
+      "command": "dir /s /b vuln_test.py",
+      "purpose": "在Windows上递归搜索目标文件",
+      "context": "环境检查失败后定位文件"
+    },
+    {
+      "command": "python -c \"username_input = \\\"' OR '1'='1\\\"; query_template = 'SELECT * FROM users WHERE name = \\\"%s\\\"'; query = query_template % username_input; print('SQL Injection Simulation:'); print('  Original template:', query_template); print('  Malicious input:', repr(username_input)); print('  Resulting query:', query))\"",
+      "purpose": "修复后的SQL注入验证命令（正确转义）",
+      "context": "SQL注入逻辑验证"
+    },
+    {
+      "command": "python -c \"username_input = \\\"' OR '1'='1\\\"; query_template = 'SELECT * FROM users WHERE name = \\\"%s\\\"'; query = query_template % username_input; print('SQL Injection Simulation:'); print('  Original template:', query_template); print('  Malicious input:', repr(username_input)); print('  Resulting query:', query)\"",
+      "purpose": "修复后的SQL注入模拟命令，避免语法错误",
+      "platform": "Windows"
+    },
+    {
+      "command": "python -c \"import os; print('CWD:', os.getcwd()); print('Dir contents:', os.listdir('.'))\"",
+      "purpose": "更详细的环境检查命令，明确打印当前目录和内容",
+      "context": "环境预检查"
+    },
+    {
+      "command": "python -c \"username = \\\"' OR '1'='1\\\"; template = 'SELECT * FROM users WHERE name = {}'; print(template.format(username))\"",
+      "purpose": "使用str.format()替代%格式化，避免转义问题",
+      "context": "SQL注入逻辑验证"
+    },
+    {
+      "name": "sql_injection_simulation_safe",
+      "command": "python -c \"username_input = \\\"' OR '1'='1\\\"; query_template = 'SELECT * FROM users WHERE name = \\\"%s\\\"'; query = query_template % username_input; print('SQL注入逻辑验证:'); print('  原始查询模板:', repr(query_template)); print('  恶意输入:', repr(username_input)); print('  拼接后的查询:', repr(query))\"",
+      "description": "修正后的SQL注入模拟命令，使用单引号包裹外部字符串，避免转义问题",
+      "platform": "cross-platform",
+      "tags": [
+        "sql_injection",
+        "simulation",
+        "safe"
+      ]
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-unknown-1"
+    },
+    {
+      "name": "robust_env_check_python",
+      "command": "python -c \"import os, sys; print('CWD:', os.getcwd()); print('Files in CWD:', os.listdir('.')); target = 'target_codebase/vuln_test.py'; exists = os.path.exists(target); print(f'Target {target} exists: {exists}'); if exists: print('Target content preview:'); with open(target, 'r') as f: print(f.read()[:500])\"",
+      "purpose": "健壮的环境检查命令，详细输出工作目录、文件列表，并检查目标文件存在性及预览内容",
+      "platform": "cross-platform"
+    },
+    {
+      "name": "sql_injection_simulation_fixed",
+      "command": "python -c \"username_input = \\\"' OR '1'='1\\\"; query_template = 'SELECT * FROM users WHERE name = \\\"%s\\\"'; query = query_template % username_input; print('SQL_INJECTION_VERIFICATION_START'); print('Original template:', repr(query_template)); print('Malicious input:', repr(username_input)); print('Final query:', repr(query)); print('Vulnerability confirmed: input alters SQL logic'); print('SQL_INJECTION_VERIFICATION_END')\"",
+      "description": "修复了转义问题的SQL注入模拟命令，添加明确的开始/结束标记"
+    },
+    {
+      "name": "path_traversal_verification_fixed",
+      "command": "python -c \"import os; base_dir = 'downloads'; user_input = '../../etc/passwd'; full_path = os.path.join(base_dir, user_input); normalized_path = os.path.normpath(full_path); print('PATH_TRAVERSAL_VERIFICATION_START'); print('Base dir:', repr(base_dir)); print('Malicious input:', repr(user_input)); print('Joined path:', repr(full_path)); print('Normalized path:', repr(normalized_path)); escapes_base = not normalized_path.startswith(base_dir); print('Escapes base dir?', escapes_base); print('Vulnerability confirmed:', escapes_base); print('PATH_TRAVERSAL_VERIFICATION_END')\"",
+      "description": "添加明确输出标记的路径遍历验证命令"
+    },
+    {
+      "name": "debug_syntax_check",
+      "command": "python -c \"print('Syntax check passed')\"",
+      "purpose": "验证Python解释器可用性和基本语法"
+    },
+    {
+      "name": "fixed_sql_injection_simulation",
+      "command": "python -c \"import json; username_input = \\\"' OR '1'='1\\\"; query_template = 'SELECT * FROM users WHERE name = \\\"%s\\\"'; query = query_template % username_input; print('SQL注入逻辑验证:'); print('  原始查询模板:', repr(query_template)); print('  恶意输入:', repr(username_input)); print('  拼接后查询:', repr(query))\"",
+      "purpose": "修正后的SQL注入模拟命令，使用更安全的字符串构造方式",
+      "tags": [
+        "sql-injection",
+        "simulation",
+        "safe-escape"
+      ]
+    },
+    {
+      "name": "simplified_python_inline_check",
+      "command": "python -c \"print('TEST_OUTPUT')\"",
+      "purpose": "最基本的Python命令测试，验证解释器可用性和简单输出功能",
+      "context": "环境检查前的简单验证"
+    },
+    {
+      "name": "simple_env_check_fallback",
+      "command": "dir target_codebase\\vuln_test.py",
+      "description": "Windows下简单的文件存在检查，避免Python命令转义问题",
+      "context": "当复杂Python环境检查失败时的回退方案"
+    },
+    {
+      "description": "最后一次运行的计划摘要",
+      "command": "# plan_id=mock-unknown-1"
+    },
+    {
+      "command": "find . -name \"vuln_test.py\" -type f",
+      "context": "定位目标文件",
+      "description": "在文件系统中搜索目标Python文件"
+    },
+    {
+      "command": "python -c \"username='\\'' OR '1'='1'; template='SELECT * FROM users WHERE name = \\\"%s\\\"'; query=template % username; print('SQLi query:', query)\"",
+      "context": "SQL注入字符串格式化（修复版）",
+      "description": "修复转义字符问题的SQL注入模拟命令"
+    },
+    {
+      "command": "find . -name \"*vuln*\" -type f 2>/dev/null || dir /s /b *vuln* 2>nul",
+      "purpose": "搜索包含'vuln'关键词的文件，定位实际漏洞文件",
+      "context": "目标文件不存在时的文件搜索"
+    },
+    {
+      "command": "echo %cd%",
+      "purpose": "Windows环境下获取当前工作目录",
+      "context": "替代pwd命令"
+    },
+    {
+      "command": "if exist \"target_codebase\\vuln_test.py\" (echo File exists) else (echo File not found)",
+      "purpose": "Windows环境下检查文件是否存在",
+      "context": "替代Unix的-f测试"
+    },
+    {
+      "command": "dir /s /b *vuln_test.py*",
+      "purpose": "Windows环境下递归搜索文件",
+      "context": "更精确搜索目标文件"
+    },
+    {
+      "command": "dir /s /b *vuln_test.py* 2>nul || echo \"File not found via dir search\"",
+      "purpose": "Windows下递归搜索特定文件，并处理未找到的情况。",
+      "context": "文件定位",
+      "platform": "windows"
+    },
+    {
+      "command": "if exist \"target_codebase\\vuln_test.py\" (echo File exists) else (echo File not found)",
+      "purpose": "检查Windows路径下文件是否存在。",
+      "context": "文件存在性检查",
+      "platform": "windows"
+    },
+    {
+      "os": "windows",
+      "command": "dir /s /b *vuln*",
+      "purpose": "Windows递归搜索包含vuln的文件"
+    },
+    {
+      "os": "windows",
+      "command": "if exist \"target_codebase\\vuln_test.py\" (echo File exists) else (echo File not found)",
+      "purpose": "Windows检查文件存在性"
+    },
+    {
+      "command": "dir /s /b *vuln_test.py* 2>nul || echo File not found via dir search",
+      "purpose": "在Windows环境下递归搜索指定文件。",
+      "context": "文件定位，环境探测",
+      "os": "windows"
+    },
+    {
+      "command": "if exist \"target_path\\file.py\" (echo File exists) else (echo File not found)",
+      "purpose": "检查Windows下指定路径的文件是否存在。",
+      "context": "文件存在性检查",
+      "os": "windows"
+    },
+    {
+      "command": "dir /s /b *vuln* 2>nul",
+      "purpose": "在Windows环境中递归搜索包含'vuln'关键词的文件",
+      "context": "文件定位"
+    },
+    {
+      "command": "python -c \"import os; target='target_codebase/vuln_test.py'; print('Target exists:', os.path.exists(target))\"",
+      "purpose": "使用Python检查特定文件是否存在",
+      "context": "跨平台文件存在性验证"
+    },
+    {
+      "command": "dir /s /b *vuln* 2>nul",
+      "context": "Windows环境文件搜索",
+      "description": "递归搜索包含'vuln'关键词的文件",
+      "purpose": "定位可能的漏洞文件"
+    },
+    {
+      "command": "python -c \"import os; target='target_codebase/vuln_test.py'; print('Target exists:', os.path.exists(target)); print('CWD:', os.getcwd()); print('Files in CWD:', os.listdir('.'))\"",
+      "context": "跨平台文件检查",
+      "description": "检查目标文件存在性并打印目录结构",
+      "purpose": "确认环境状态"
+    }
+  ],
+  "payload_templates": [
+    {
+      "name": "basic_traversal",
+      "template": "../",
+      "notes": "按目标编码与过滤规则替换为 %2e%2e%2f 等变体"
+    },
+    {
+      "name": "SQLi_basic_bypass",
+      "payload": "' OR '1'='1",
+      "context": "SQL注入",
+      "description": "基本的SQL注入payload，用于绕过身份验证"
+    },
+    {
+      "name": "path_traversal_basic",
+      "payload": "../../etc/passwd",
+      "context": "路径遍历",
+      "description": "基本的路径遍历payload，用于读取系统文件"
+    }
+  ],
+  "scripts": [
+    {
+      "name": "vulnerability_verification_template.py",
+      "description": "安全的漏洞验证脚本模板，避免命令行转义问题",
+      "content": "#!/usr/bin/env python3\n# 漏洞验证脚本模板\nimport os\nimport sys\n\ndef check_environment():\n    print('ENV_CHECK_START')\n    print('CWD:', os.getcwd())\n    print('Files in CWD:', os.listdir('.'))\n    \n    target = 'target_codebase/vuln_test.py'\n    exists = os.path.exists(target)\n    print(f'Target {target} exists: {exists}')\n    \n    if exists:\n        print('Target content preview (first 500 chars):')\n        with open(target, 'r') as f:\n            print(f.read()[:500])\n    else:\n        print('ERROR: Target file not found.')\n    \n    print('ENV_CHECK_END')\n    return exists\n\ndef verify_sqli():\n    print('SQLI_VERIFICATION_START')\n    username_input = \"' OR '1'='1\"\n    query_template = 'SELECT * FROM users WHERE name = \"%s\"'\n    query = query_template % username_input\n    print('Original template:', repr(query_template))\n    print('Malicious input (source):', repr(username_input))\n    print('Final query (sink):', repr(query))\n    print('Vulnerability confirmed: input alters SQL logic (source->sink).')\n    print('SQLI_VERIFICATION_END')\n    return True\n\ndef verify_path_traversal():\n    print('PATH_TRAVERSAL_VERIFICATION_START')\n    base_dir = 'downloads'\n    user_input = '../../etc/passwd'\n    full_path = os.path.join(base_dir, user_input)\n    normalized_path = os.path.normpath(full_path)\n    print('Base dir:', repr(base_dir))\n    print('Malicious input (source):', repr(user_input))\n    print('Joined path (via os.path.join):', repr(full_path))\n    print('Normalized path (sink to open):', repr(normalized_path))\n    escapes_base = not normalized_path.startswith(base_dir)\n    print('Escapes base dir?', escapes_base)\n    print('Vulnerability confirmed:', escapes_base, '(source->sink).')\n    print('PATH_TRAVERSAL_VERIFICATION_END')\n    return escapes_base\n\nif __name__ == '__main__':\n    sys.stdout.flush()\n    # 执行验证\n    env_ok = check_environment()\n    if env_ok:\n        sqli_ok = verify_sqli()\n        pt_ok = verify_path_traversal()\n        print(f'\\nSummary: SQL Injection verified={sqli_ok}, Path Traversal verified={pt_ok}')\n    else:\n        print('Environment check failed, skipping vulnerability verification')"
+    },
+    {
+      "name": "safe_python_verification_script",
+      "description": "安全的Python验证脚本模板，避免命令行转义问题",
+      "content": "import sys\nimport os\n\nprint('VERIFICATION_START')\ntry:\n    # 验证逻辑放在这里\n    print('Verification logic executed')\nexcept Exception as e:\n    print(f'ERROR: {e}')\nprint('VERIFICATION_END')",
+      "usage": "保存为.py文件执行，避免命令行转义问题"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "vuln_id": "DEMO-PT-001",
+  "title": "示例：路径拼接导致任意文件读取",
+  "severity": "high",
+  "confirmed": true,
+  "summary": "用户输入进入 open()/send_file 的路径拼接点，缺少规范化，可穿越读取敏感文件。",
+  "call_chain": [
+    {"role": "source", "function": "parse_query_param", "note": "用户输入进入 name 参数"},
+    {"role": "propagation", "function": "build_report_path", "note": "字符串拼接未规范 basename"},
+    {"role": "sink", "function": "send_report", "note": "open(path) 读取任意文件"}
+  ],
+  "related_functions": ["parse_query_param", "build_report_path", "send_report"],
+  "evidence": {
+    "location": "app/routes.py:send_report",
+    "poc_hint": "尝试以 ../../../etc/passwd 变体验证（请在授权环境内测试）"
+  },
+  "risk_notes": "仅用于课程复现与授权测试；禁止对他人系统使用。",
+  "from_agent": "analysis_stub"
+}

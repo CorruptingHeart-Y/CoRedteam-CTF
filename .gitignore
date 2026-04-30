@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 密钥 & 环境变量（绝对不要提交！）
+.env
+
+# ChromaDB 长期记忆数据库
+co_redteam_memory/
+chroma_db/
+
+# Stage 2 运行时产出
+b/workspace/
+
+# 运行时输出报告（如需保留模板示例请手动 add）
+reports/
+
+# 运行日志
+a.txt
+
+# IDE
+.vscode/
+.idea/
+.trae/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 压缩包 & 大文件
+*.zip
+*.tar.gz
+*.pdf
+
+# 临时文件
+*.tmp

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecurePay - Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        header { background: #1a73e8; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .status-completed { color: green; }
+        .status-pending { color: orange; }
+        .status-failed { color: red; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SecurePay Platform</h1>
+            <p>Welcome back! Your secure payment dashboard.</p>
+        </header>
+        
+        <div class="card">
+            <h2>Recent Transactions</h2>
+            <table id="transactions-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Amount</th>
+                        <th>Status</th>
+                        <th>Date</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td colspan="4">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <button onclick="location.href='/api/v1/payments/process'">New Payment</button>
+            <button onclick="location.href='/api/v1/files/upload'">Upload File</button>
+            <button onclick="location.href='/api/v1/search?q=test'">Search</button>
+        </div>
+        
+        <div id="user-info" class="card">
+            <!-- User info will be loaded here -->
+        </div>
+    </div>
+    
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

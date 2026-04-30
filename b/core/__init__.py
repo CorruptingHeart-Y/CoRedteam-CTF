@@ -1,0 +1,1 @@
+# Co-RedTeam core package
