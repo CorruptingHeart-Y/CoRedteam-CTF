@@ -1,0 +1,36 @@
+metadata:
+  id: cwe-601-open-redirect
+  name: Open Redirect
+  cwe_ids:
+  - CWE-601
+  target_type: generic
+  tags:
+  - open-redirect
+  - phishing
+  - oauth-theft
+  - url-param
+  - callback
+  author: co-redteam
+  severity: medium
+content: 'Test: modify url/redirect/next/target/callback/return_to parameter to external
+  domain
+
+  import requests,urllib3; urllib3.disable_warnings(); base=''{TARGET_BASE_URL}''
+
+  r=requests.get(f''{base}{REDIRECT_ENDPOINT}?url=https://evil.com'', allow_redirects=False,
+  verify={VERIFY_FLAG})
+
+  print(''###CHAIN_OUTPUT###''+str({''status'':r.status_code,''location'':r.headers.get(''Location'')}))
+
+
+  Exploitation scenarios:
+
+  - Phishing attacks (disguise malicious URLs behind trusted domain)
+
+  - OAuth token theft (redirect URI manipulation)
+
+  - Referer/Origin header bypass for CSRF
+
+  - Combined with XSS for more complex attacks
+
+  '

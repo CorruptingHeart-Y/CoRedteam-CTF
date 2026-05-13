@@ -323,6 +323,7 @@ class LayeredMemory:
             "strategy_success_count": len(bundle.get("strategy", {}).get("success_strategies", [])),
             "strategy_failure_count": len(bundle.get("strategy", {}).get("failure_lessons", [])),
             "strategy_samples": bundle.get("strategy", {}).get("success_strategies", [])[:3],
+            "failure_lesson_samples": bundle.get("strategy", {}).get("failure_lessons", [])[:5],
             "tech_commands_count": len(bundle.get("tech", {}).get("commands", [])),
             "tech_payloads_count": len(bundle.get("tech", {}).get("payload_templates", [])),
             "tech_scripts_count": len(bundle.get("tech", {}).get("scripts", [])),

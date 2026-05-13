@@ -25,7 +25,10 @@ RUN apk add --no-cache \
     git \
     gcc \
     musl-dev \
-    linux-headers
+    linux-headers \
+    python3-dev \
+    ca-certificates \
+    bash
 
 RUN pip3 install --no-cache-dir \
     requests>=2.28.0 \
@@ -33,6 +36,9 @@ RUN pip3 install --no-cache-dir \
     pyyaml>=6.0 \
     beautifulsoup4>=4.12.0 \
     lxml>=4.9.0
+
+RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap && \
+    ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap
 
 RUN mkdir -p /sandbox/workspace && chmod 777 /sandbox/workspace
 

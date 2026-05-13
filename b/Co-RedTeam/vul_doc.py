@@ -7,7 +7,7 @@ chroma_client = chromadb.PersistentClient(path="./co_redteam_memory")
 
 # 获取已经存在的集合 (Collection)
 # 如果提示找不到 collection，说明你前面的初始化脚本没跑成功
-collection = chroma_client.get_collection(name="vulnerability_docs")
+collection = chroma_client.get_or_create_collection(name="vulnerability_docs")
 
 # 2. 定义静态摘要工具 [cite: 650]
 @tool

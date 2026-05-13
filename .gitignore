@@ -42,3 +42,15 @@ Thumbs.db
 
 # 临时文件
 *.tmp
+
+# Claude 本地配置
+.claude/
+.mcp.json
+.mcp/
+
+# 临时文本文件
+b.txt
+
+# Stage 2 运行时产物（备份 & 执行结果）
+b/data/confirmed_vuln_backup_*.json
+b/co_redteam_exec/

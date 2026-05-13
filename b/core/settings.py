@@ -44,7 +44,7 @@ def get_settings() -> Settings:
         confirmed_vuln_path=ROOT.parent / "reports" / "vulnerability_proposal_latest.json",
         docker_enabled=docker_enabled,
         docker_image=os.getenv("CO_REDTEAM_DOCKER_IMAGE", "co-redteam-sandbox:latest"),
-        docker_timeout=int(os.getenv("CO_REDTEAM_DOCKER_TIMEOUT", "60")),
+        docker_timeout=int(os.getenv("CO_REDTEAM_DOCKER_TIMEOUT", "300")),
         docker_memory_limit=os.getenv("CO_REDTEAM_DOCKER_MEMORY", "512m"),
         docker_cpu_quota=int(os.getenv("CO_REDTEAM_DOCKER_CPU_QUOTA", "100000")),
     )

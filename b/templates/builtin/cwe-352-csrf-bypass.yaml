@@ -1,0 +1,29 @@
+metadata:
+  id: cwe-352-csrf-bypass
+  name: CSRF Protection Bypass
+  cwe_ids:
+  - CWE-352
+  target_type: generic
+  tags:
+  - csrf
+  - bypass
+  - token-theft
+  - jwt
+  - same-site
+  - referer-check
+  author: co-redteam
+  severity: high
+content: "Common CSRF protection mechanisms and bypass methods:\n\n1. Token validation\
+  \ (Referer/Origin check):\n   - Bypass: if token obtainable via XSS/CSS injection,\
+  \ construct full CSRF request\n   - Bypass: if token validation loose (accepts empty/arbitrary\
+  \ values)\n\n2. SameSite Cookie:\n   - Strict: fully blocks cross-site (hardest)\n\
+  \   - Lax: GET requests cross-site OK (combine with open redirect)\n   - None: no\
+  \ protection (requires Secure flag + HTTPS)\n\n3. JWT-contained CSRF token:\n  \
+  \ - If JWT in non-HttpOnly cookie, JS readable\n   - Extract CSRF token from JWT\
+  \ via XSS/CSS injection\n   - Construct valid request with extracted token\n\n4.\
+  \ Double-submit pattern (cookie + header):\n   - Try satisfying only one side\n\
+  \   - Check if either can be predicted/forged\n\nGeneric bypass flow:\nA - Obtain\
+  \ CSRF token through other vulnerability (XSS/CSS injection)\nB - Analyze token\
+  \ generation logic, try prediction/forgery\nC - Find API endpoints missing token\
+  \ requirement (oversight)\nD - If dual-token mechanism (cookie+header), try partial\
+  \ satisfaction\n"

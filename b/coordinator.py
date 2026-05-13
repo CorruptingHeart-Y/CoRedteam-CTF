@@ -14,13 +14,29 @@ from agents.evaluator import run_evaluator
 from agents.executor import run_executor
 from agents.planner import run_planner
 from agents.validator import run_validator
+from core.challenge_adapter import ChallengeAdapter, get_adapter, list_adapters
 from core.llm_client import DeepSeekClient
 from core.memory_store import LayeredMemory
 from core.settings import get_settings
+from core.target_context import TargetContext
+from core.ui import (
+    console,
+    detail,
+    fail,
+    is_verbose,
+    muted,
+    ok,
+    render_evaluator_feedback,
+    render_iteration_header,
+    render_summary_table,
+    stage,
+    warn,
+)
 
 
 def _print_agent_header(name: str) -> None:
-    print(f"[agent:{name}] ----------------")
+    if is_verbose():
+        console.print(f"[muted][agent:{name}] ----------------[/muted]")
 
 
 def _list_json_files(folder: Path) -> list[str]:
@@ -55,7 +71,41 @@ def _load_confirmed(path: Path) -> dict[str, Any]:
                 f"data 目录可用 JSON 文件: {available if available else '无'}"
             )
 
-    return json.loads(target.read_text(encoding="utf-8"))
+    confirmed = json.loads(target.read_text(encoding="utf-8"))
+
+    if not confirmed.get("target_context") or not confirmed["target_context"].get("base_url"):
+        fallback_context = _ROOT / "data" / "confirmed_vuln.json"
+        if fallback_context.exists() and fallback_context.resolve() != target:
+            try:
+                fb = json.loads(fallback_context.read_text(encoding="utf-8"))
+                fb_ctx = fb.get("target_context", {})
+                fb_routes = fb.get("discovered_routes", fb_ctx.get("discovered_routes", []))
+                if fb_ctx.get("base_url"):
+                    confirmed["target_context"] = confirmed.get("target_context", {})
+                    confirmed["target_context"]["base_url"] = fb_ctx["base_url"]
+                    confirmed["target_context"]["app_name"] = confirmed["target_context"].get("app_name") or fb_ctx.get("app_name", "")
+                    if fb_routes and not confirmed["target_context"].get("discovered_routes"):
+                        confirmed["target_context"]["discovered_routes"] = fb_routes
+                    print(f"[coordinator] ⚠️ 输入文件缺少 target_context，已从 {fallback_context.name} 自动补全")
+            except Exception:
+                pass
+
+    return confirmed
+
+
+def _override_base_url_from_env(confirmed: dict[str, Any]) -> dict[str, Any]:
+    import os
+    env_url = os.getenv("CO_REDTEAM_TARGET_BASE", "").strip()
+    if not env_url:
+        return confirmed
+    tc = confirmed.get("target_context") or {}
+    current = tc.get("base_url", "")
+    if "host.docker.internal" in current or not current:
+        tc["base_url"] = env_url
+        confirmed["target_context"] = tc
+        print(f"[coordinator] 🔒 CO_REDTEAM_TARGET_BASE 覆盖 base_url: {env_url}")
+    return confirmed
+
 
 def _count_execution_failures(exec_out: dict[str, Any]) -> dict[str, list[str]]:
     failures: dict[str, list[str]] = {"skipped": [], "error": [], "blocked": []}
@@ -82,21 +132,360 @@ def _build_retry_prompt(failures: dict[str, list[str]], confirmed: dict[str, Any
             prompt += f"\n[{category}]类失败：\n" + "\n".join(f"  - {item}" for item in items)
     prompt += (
         "\n\n请只针对上述失败步骤生成修复版计划。已经成功的漏洞无需再测。"
-        "重点修复 Pickle 反序列化的语法问题、命令注入的 payload 参数选择、SSRF 的内网地址替换。"
-        "每个失败步骤生成 1-2 个修复变体。"
+        "每个失败步骤生成 1-2 个修复变体，重点关注 payload 语法、URL 路径、参数格式等常见错误。"
     )
     return prompt
 
-def run_pipeline(confirmed_path: Path | None = None) -> int:
+
+_HTTP_SEMANTIC_ERRORS = {
+    "All fields are required!": (
+        "请求格式或字段名不匹配！排查顺序："
+        "1) 所有API使用 data= (form-encoded)，因为证据代码全是 request.form.get()"
+        "2) 检查字段名：从证据代码中找 request.form.get('REAL_NAME') — 极可能不是 username！"
+        "   Register/Login 需要 email+password，Profile 需要 email+fullName+username"
+        "3) 如果上轮已试过 data= 和 json= 都失败，99%是字段名问题"
+    ),
+    "All fields are required": (
+        "请求格式或字段名不匹配！排查顺序："
+        "1) 所有API使用 data= (form-encoded)，因为证据代码全是 request.form.get()"
+        "2) 检查字段名：从证据代码中找 request.form.get('REAL_NAME') — 极可能不是 username！"
+        "   Register/Login 需要 email+password，Profile 需要 email+fullName+username"
+        "3) 如果上轮已试过 data= 和 json= 都失败，99%是字段名问题"
+    ),
+    "Invalid Email Address": (
+        "邮箱字段存在格式校验，SSTI/注入payload无法通过。"
+        "应换用其他字段（username/fullName等）注入payload"
+    ),
+    "Unauthorised access detected!": (
+        "认证未通过：首先确认上一步登录/注册是否真的200OK了，"
+        "如果登录一直失败（All fields required），先修登录格式再管后续"
+    ),
+    "Method Not Allowed": (
+        "HTTP方法错误：GET/POST混用。立即尝试另一种方法"
+    ),
+}
+
+
+def _detect_http_failures_from_chain(
+    step_results: list[dict[str, Any]],
+    adapter: ChallengeAdapter | None = None,
+) -> list[dict[str, Any]]:
+    all_errors = dict(_HTTP_SEMANTIC_ERRORS)
+    if adapter is not None:
+        all_errors.update(adapter.http_semantic_errors())
+
+    http_failures: list[dict[str, Any]] = []
+    for r in step_results:
+        rr = r.get("result") or {}
+        if not rr.get("ok"):
+            continue
+        chain_output = r.get("chain_output")
+        chain_str = ""
+        if isinstance(chain_output, dict):
+            chain_str = json.dumps(chain_output, ensure_ascii=False)
+        stdout = rr.get("stdout") or ""
+        search_text = f"{chain_str} {stdout}"
+        for pattern, fix_hint in all_errors.items():
+            if pattern in search_text:
+                http_failures.append({
+                    "step_id": r.get("step_id", "?"),
+                    "purpose": r.get("purpose", ""),
+                    "pattern": pattern,
+                    "fix_hint": fix_hint,
+                    "chain_output_snippet": search_text[:300],
+                })
+                break
+    return http_failures
+
+
+def _save_failure_lessons(
+    memory: LayeredMemory,
+    exec_out: dict[str, Any],
+    last_plan: dict[str, Any],
+    confirmed: dict[str, Any],
+    adapter: ChallengeAdapter | None = None,
+) -> None:
+    step_results = exec_out.get("step_results") or []
+    cwe_ids = []
+    for v in confirmed.get("vulnerabilities", []):
+        cwe = v.get("cwe_id", "")
+        if cwe:
+            cwe_ids.append(cwe)
+
+    lesson_count = 0
+
+    for r in step_results:
+        rr = r.get("result") or {}
+        if rr.get("ok"):
+            continue
+        stderr = (rr.get("stderr") or "")[:500]
+        step_id = r.get("step_id", "?")
+        purpose = r.get("purpose", "")
+
+        if not stderr.strip():
+            continue
+
+        error_summary = ""
+        if "Invalid URL" in stderr:
+            error_summary = "URL格式错误：base变量未从 CO_REDTEAM_CONTEXT 动态读取，请检查代码中是否使用了硬编码域名。"
+        elif "Connection refused" in stderr or "ConnectionError" in stderr:
+            error_summary = "目标连接失败：请检查目标是否在运行以及端口是否正确。"
+        elif "SSLError" in stderr or "CERTIFICATE" in stderr:
+            error_summary = "SSL证书验证失败：HTTPS请求必须使用 verify=False (Python) 或 -k (curl)。"
+        elif "SyntaxError" in stderr or "NameError" in stderr or "IndentationError" in stderr:
+            error_summary = "Python语法错误：单行代码使用了def/for/if等需要缩进的语句，请用lambda/列表推导替代。"
+        elif "KeyError" in stderr:
+            error_summary = "JSON字段不存在：从CO_REDTEAM_CONTEXT提取数据时键名错误，检查cookies/token字段名。"
+        elif "401" in stderr or "Unauthorized" in stderr:
+            error_summary = "认证失败(401)：session或token未正确传递，请在前一步输出正确的cookies信息。"
+        elif "404" in stderr or "Not Found" in stderr:
+            error_summary = "端点不存在(404)：URL路径错误，请从已知endpoint列表中选择正确路径。"
+        elif "500" in stderr or "Internal Server" in stderr:
+            error_summary = "服务器内部错误(500)：payload可能触发但未正确利用，检查payload格式。"
+        else:
+            error_summary = f"步骤失败(step={step_id}): {stderr[:200]}"
+
+        lesson = (
+            f"[RCW-{','.join(cwe_ids[:3])}] {error_summary} "
+            f"目的: {purpose[:100]}. "
+            f"stderr片段: {stderr[:300]}"
+        )
+        memory.upsert_strategy(lesson, "failure", {
+            "cwe_ids": cwe_ids,
+            "step_id": step_id,
+            "from": "auto-failure-logger",
+        })
+        lesson_count += 1
+
+    http_failures = _detect_http_failures_from_chain(step_results, adapter=adapter)
+    for hf in http_failures:
+        lesson = (
+            f"[RCW-{','.join(cwe_ids[:3])}] HTTP语义错误(step={hf['step_id']}): {hf['pattern']}. "
+            f"修复: {hf['fix_hint']}. "
+            f"目的: {hf['purpose'][:100]}. "
+            f"响应片段: {hf['chain_output_snippet'][:300]}"
+        )
+        memory.upsert_strategy(lesson, "failure", {
+            "cwe_ids": cwe_ids,
+            "step_id": hf["step_id"],
+            "from": "auto-http-semantic-detector",
+        })
+        lesson_count += 1
+
+    if lesson_count > 0:
+        print(f"[coordinator] �� 已自动记录 {lesson_count} 条失败教训到长期记忆")
+
+
+def _build_breaker_memory_context(
+    memory: LayeredMemory,
+    vuln_summary: str,
+    confirmed: dict[str, Any],
+) -> str:
+    """
+    查询长期记忆三个层次，构建注入到 Planner 的历史经验上下文。
+    论文 Co-RedTeam §3.4：长期记忆通过 ChromaDB 向量检索，为 Planner 提供
+    相似漏洞的成功/失败经验，避免重蹈覆辙。
+    """
+    cwe_ids = [
+        v.get("cwe_id", "")
+        for v in confirmed.get("vulnerabilities", [])
+        if v.get("cwe_id")
+    ]
+    query = f"{vuln_summary} {' '.join(cwe_ids)} 漏洞利用 攻击策略 payload"
+    parts: list[str] = []
+
+    # ── 漏洞模式层 ────────────────────────────────
+    try:
+        patterns = memory.query_patterns(query, n_results=3)
+        if patterns:
+            parts.append("\n【�� 长期记忆 — 相关漏洞模式】：")
+            for i, item in enumerate(patterns):
+                parts.append(f"  模式{i + 1}: {item['content']}")
+    except Exception:
+        pass
+
+    # ── 利用策略层（成功 / 失败分开展示）──────────────
+    try:
+        strategies = memory.query_strategies(query, n_results=6)
+        if strategies:
+            success_items = [
+                s for s in strategies
+                if s.get("metadata", {}).get("strategy_type") != "failure"
+            ]
+            failure_items = [
+                s for s in strategies
+                if s.get("metadata", {}).get("strategy_type") == "failure"
+            ]
+            if success_items:
+                parts.append("\n【✅ 长期记忆 — 历史成功策略】：")
+                for i, item in enumerate(success_items[:3]):
+                    parts.append(f"  成功策略{i + 1}: {item['content']}")
+            if failure_items:
+                parts.append("\n【❌ 长期记忆 — 已知失败教训（禁止重蹈覆辙）】：")
+                for i, item in enumerate(failure_items[:3]):
+                    parts.append(f"  失败教训{i + 1}: {item['content']}")
+    except Exception:
+        pass
+
+    # ── 技术操作层 ────────────────────────────────
+    try:
+        tech = memory.query_tech(query, n_results=3)
+        if tech:
+            parts.append("\n【�� 长期记忆 — 可复用技术操作】：")
+            for i, item in enumerate(tech):
+                ttype = item.get("metadata", {}).get("tech_type", "unknown")
+                parts.append(f"  技术{i + 1} [{ttype}]: {item['content']}")
+    except Exception:
+        pass
+
+    if not parts:
+        return ""
+    return "\n" + "\n".join(parts)
+
+
+def _extract_step_error_fingerprint(step_results: list[dict[str, Any]]) -> str:
+    """Produce a short fingerprint of the dominant failure pattern this iteration.
+
+    Used to detect when the same error repeats across iterations so the breaker
+    can fire on strategy-level stagnation, not just consecutive eval failures.
+    """
+    error_tokens: list[str] = []
+    for r in step_results:
+        rr = r.get("result") or {}
+        if rr.get("ok"):
+            continue
+        stderr = (rr.get("stderr") or "")[:300]
+        stdout = (rr.get("stdout") or "")[:300]
+        text = f"{stderr} {stdout}"
+        for keyword in (
+            "Invalid URL", "ConnectionError", "Connection refused",
+            "SSLError", "SyntaxError", "NameError", "IndentationError",
+            "KeyError", "401", "403", "404", "405", "500",
+            "All fields are required", "Invalid Email",
+            "CSRF Detected", "Unauthorised",
+            "security_blocked", "skipped_syntax_error",
+        ):
+            if keyword in text:
+                error_tokens.append(keyword)
+                break
+        else:
+            error_tokens.append("unknown_error")
+    return "|".join(sorted(set(error_tokens))) or "no_failures"
+
+
+class _VulnRotator:
+    """Tracks which vulnerabilities have been attempted and rotates to the next one.
+
+    When a vuln is declared fully BLOCKED (all steps BLOCKED in the plan), the
+    rotator advances to the next unblocked vuln in confirmed["vulnerabilities"].
+    The coordinator calls `rotate()` to get a modified `confirmed` dict that
+    focuses on the next candidate.
+    """
+
+    def __init__(self, confirmed: dict[str, Any]) -> None:
+        self._original = confirmed
+        vulns = confirmed.get("vulnerabilities") or []
+        self._vuln_ids: list[str] = [v.get("id", str(i)) for i, v in enumerate(vulns)]
+        self._attempted: set[str] = set()
+        self._current_idx: int = 0
+
+    def mark_attempted(self, vuln_id: str) -> None:
+        self._attempted.add(vuln_id)
+
+    def current_vuln_id(self) -> str:
+        vulns = self._original.get("vulnerabilities") or []
+        if self._current_idx < len(vulns):
+            return vulns[self._current_idx].get("id", str(self._current_idx))
+        return ""
+
+    def rotate(self) -> tuple[dict[str, Any], str] | None:
+        """Return (new_confirmed_focused_on_next_vuln, vuln_id) or None if exhausted."""
+        vulns = self._original.get("vulnerabilities") or []
+        for i, v in enumerate(vulns):
+            vid = v.get("id", str(i))
+            if vid not in self._attempted:
+                self._current_idx = i
+                self._attempted.add(vid)
+                # Build a focused confirmed dict with only this vuln
+                import copy
+                focused = copy.deepcopy(self._original)
+                focused["vulnerabilities"] = [v]
+                focused["_rotated_from"] = self.current_vuln_id()
+                focused["_rotation_note"] = (
+                    f"攻击面轮换：已跳过 {sorted(self._attempted - {vid})}，"
+                    f"当前聚焦漏洞 {vid} ({v.get('title', '?')})"
+                )
+                return focused, vid
+        return None
+
+    def all_attempted(self) -> bool:
+        vulns = self._original.get("vulnerabilities") or []
+        return all(
+            v.get("id", str(i)) in self._attempted
+            for i, v in enumerate(vulns)
+        )
+
+
+def _is_plan_fully_blocked(plan: dict[str, Any]) -> bool:
+    """Return True if every step in the plan has status BLOCKED."""
+    steps = plan.get("steps") or []
+    if not steps:
+        return False
+    return all(
+        isinstance(st, dict) and st.get("status") == "BLOCKED"
+        for st in steps
+    )
+
+
+def _cleanup_sandbox_workspace(ws: Path) -> None:
+    """迭代上限到达后清理工作区临时文件（Docker 容器已由 executor 自动清理）。"""
+    import shutil
+    tmp_dirs = [ws / "tmp", ws / "__pycache__"]
+    for d in tmp_dirs:
+        if d.exists():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                print(f"[coordinator] �� 已清理临时目录: {d.name}")
+            except Exception:
+                pass
+    # 清理步骤脚本文件
+    for f in ws.glob("step_*.py"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+
+def run_pipeline(
+    confirmed_path: Path | None = None,
+    challenge_name: str = "generic",
+    target: TargetContext | None = None,
+) -> int:
     settings = get_settings()
     memory = LayeredMemory(settings.memory_dir)
     ws = settings.workspace_dir
     ws.mkdir(parents=True, exist_ok=True)
 
+    import core.adapters  # noqa: F401  trigger adapter registration
+    adapter = get_adapter(challenge_name)
+    stage("CLI", f"挑战适配器: [bold]{adapter.challenge_name}[/bold]")
+
     confirmed_file = confirmed_path or settings.confirmed_vuln_path
     confirmed = _load_confirmed(confirmed_file)
-    print(f"[coordinator] 输入漏洞文件: {confirmed_file}")
-    print(f"[coordinator] mock_llm={settings.mock_llm}, model={settings.deepseek_model}")
+
+    # ── 兜底：用环境变量覆盖 JSON 中残留的 host.docker.internal ──
+    confirmed = _override_base_url_from_env(confirmed)
+
+    if target is not None:
+        tc = confirmed.setdefault("target_context", {})
+        tc["base_url"] = target.url
+        tc["locked_host"] = target.hostname
+        tc["locked_ip"] = target.ip
+        tc["locked_port"] = target.port
+        stage("CLI", f"目标白名单已锁定 → [bold]{target.url}[/bold] (ip={target.ip})")
+
+    muted(f"输入漏洞文件: {confirmed_file}")
+    muted(f"mock_llm={settings.mock_llm}, model={settings.deepseek_model}, max_iter={settings.max_iterations}")
 
     llm: DeepSeekClient | None = None
     if settings.deepseek_api_key and not settings.mock_llm:
@@ -112,10 +501,22 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
     success_log: list[dict[str, Any]] = []
     _retry_iteration_done = False
 
-    for iteration in range(1, settings.max_iterations + 1):
-        print(f"[coordinator] 迭代 {iteration}/{settings.max_iterations}")
+    # ── 熔断器状态（论文 §3.3 防死循环机制）──────────────
+    _consecutive_failures  = 0
+    _BREAKER_THRESHOLD     = 3
+    _breaker_triggered     = False
+    _error_fingerprints: list[str] = []   # rolling window of per-iteration error patterns
 
+    # ── 攻击面轮换器 ──────────────────────────────────────
+    _rotator = _VulnRotator(confirmed)
+    _rotator.mark_attempted(_rotator.current_vuln_id())
+
+    for iteration in range(1, settings.max_iterations + 1):
+        render_iteration_header(iteration, settings.max_iterations)
+
+        # ── Planner ────────────────────────────────────────────────────────
         _print_agent_header("planner")
+        stage("Planner", "构建攻击链...")
         last_plan = run_planner(
             settings=settings,
             memory=memory,
@@ -123,25 +524,31 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
             feedback=feedback,
             out_path=plan_path,
             llm=llm,
+            adapter=adapter,
         )
-        print(
-            f"[planner] plan_id={last_plan.get('plan_id')} steps={len(last_plan.get('steps') or [])} "
-            f"输出={plan_path.name}"
+        muted(
+            f"plan_id={last_plan.get('plan_id')} steps={len(last_plan.get('steps') or [])} "
+            f"→ {plan_path.name}"
         )
+        if last_plan.get("error") == "config":
+            fail("配置错误，无法继续。请检查 target_context.base_url 或 CO_REDTEAM_TARGET_BASE")
+            return 1
         for st in (last_plan.get("steps") or []):
             if isinstance(st, dict) and st.get("type") == "python":
-                print(f"[planner] step_id={st.get('id')} python_cmd={repr(st.get('command', ''))[:220]}")
+                detail(f"step_id={st.get('id')} python_cmd={repr(st.get('command', ''))[:220]}")
 
+        # ── Validator ──────────────────────────────────────────────────────
         _print_agent_header("validator")
+        stage("Validator", "校验计划安全策略与语法...")
         v = run_validator(plan_path, validated_path)
         val = v.get("validation", {})
         warnings = v.get("warnings") or []
-        print(
-            f"[validator] passed={val.get('passed')} "
-            f"errors={len(val.get('errors') or [])} warnings={len(warnings)} 输出={validated_path.name}"
+        muted(
+            f"passed={val.get('passed')} errors={len(val.get('errors') or [])} "
+            f"warnings={len(warnings)} → {validated_path.name}"
         )
         if warnings:
-            print("[validator] 自动修复/提示:", warnings)
+            detail(f"自动修复/提示: {warnings}")
         if not v["validation"]["passed"]:
             feedback = {
                 "from": "validator",
@@ -150,10 +557,12 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
                 "warnings": warnings,
                 "hint": "根据校验错误修订 plan.json 结构与安全策略",
             }
-            print("[coordinator] 验证未通过，反馈规划智能体:", v["validation"]["errors"])
+            warn(f"验证未通过，反馈规划智能体: {v['validation']['errors']}")
             continue
 
+        # ── Executor ───────────────────────────────────────────────────────
         _print_agent_header("executor")
+        stage("Executor", "执行沙箱脚本...")
         try:
             exec_out = run_executor(
                 validated_path=validated_path,
@@ -162,9 +571,10 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
                 timeout_sec=settings.docker_timeout,
                 docker_image=settings.docker_image,
                 dockerfile_dir=_ROOT,
+                target=target,
             )
         except Exception as e:
-            print(f"[executor] 🚨 FATAL: {e}")
+            fail(f"FATAL: {e}")
             exec_out = {
                 "version": 1,
                 "executed": False,
@@ -175,20 +585,39 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
         step_results = exec_out.get("step_results") or []
         ok_cnt = sum(1 for r in step_results if (r.get("result") or {}).get("ok"))
         fail_cnt = len(step_results) - ok_cnt
-        print(
-            f"[executor] executed={exec_out.get('executed')} steps={len(step_results)} "
-            f"ok={ok_cnt} fail={fail_cnt} 输出={exec_path.name}"
+        muted(
+            f"executed={exec_out.get('executed')} steps={len(step_results)} "
+            f"ok={ok_cnt} fail={fail_cnt} → {exec_path.name}"
         )
         if fail_cnt > 0:
             for r in step_results:
                 rr = r.get("result") or {}
                 if not rr.get("ok"):
-                    print(
-                        f"[executor] step_id={r.get('step_id')} exit={rr.get('exit_code')} "
+                    detail(
+                        f"step_id={r.get('step_id')} exit={rr.get('exit_code')} "
                         f"stderr={(rr.get('stderr') or '')[:160]}"
                     )
 
+        # ── Evaluator ──────────────────────────────────────────────────────
         _print_agent_header("evaluator")
+        stage("Evaluator", "评估复现结果...")
+
+        # 自动记录失败教训到长期记忆
+        _save_failure_lessons(memory, exec_out, last_plan, confirmed, adapter=adapter)
+
+        # 检测 HTTP 语义错误
+        http_failures = _detect_http_failures_from_chain(step_results)
+        http_feedback_parts: list[str] = []
+        if http_failures:
+            seen_hints: set[str] = set()
+            for hf in http_failures:
+                if hf["fix_hint"] not in seen_hints:
+                    seen_hints.add(hf["fix_hint"])
+                    http_feedback_parts.append(
+                        f"• step[{hf['step_id']}] {hf['pattern']} → {hf['fix_hint']}"
+                    )
+            print(f"[coordinator] �� 检测到 {len(http_failures)} 个HTTP语义错误")
+
         fb = run_evaluator(
             settings=settings,
             memory=memory,
@@ -197,16 +626,153 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
             exec_out=exec_out,
             feedback_path=feedback_path,
             llm=llm,
+            adapter=adapter,
         )
         feedback = fb
-        print(
-            f"[evaluator] repro_success={fb.get('repro_success')} confidence={fb.get('confidence')} "
-            f"should_continue={fb.get('should_continue')} 输出={feedback_path.name}"
+        render_evaluator_feedback(fb)
+
+        # ── 熔断器逻辑（论文 §3.3 Long-Term Memory & 纠偏机制）────────────
+        if fb.get("repro_success"):
+            _consecutive_failures = 0
+            _breaker_triggered    = False
+            _error_fingerprints.clear()
+        else:
+            _consecutive_failures += 1
+            fp = _extract_step_error_fingerprint(step_results)
+            _error_fingerprints.append(fp)
+            if len(_error_fingerprints) > _BREAKER_THRESHOLD:
+                _error_fingerprints.pop(0)
+            print(f"[coordinator] ⚠️  连续失败计数: {_consecutive_failures}/{_BREAKER_THRESHOLD} | 错误指纹: {fp}")
+
+        # Stagnation check: same error fingerprint repeated across the window
+        _stagnating = (
+            len(_error_fingerprints) >= _BREAKER_THRESHOLD
+            and len(set(_error_fingerprints)) == 1
+            and _error_fingerprints[0] != "no_failures"
         )
 
+        # ── 攻击面轮换：计划全部 BLOCKED 时强制切换漏洞 ──────────────────
+        if last_plan and _is_plan_fully_blocked(last_plan) and not _rotator.all_attempted():
+            rotation = _rotator.rotate()
+            if rotation is not None:
+                confirmed, rotated_vid = rotation
+                note = confirmed.get("_rotation_note", "")
+                warn(f"[coordinator] 攻击面轮换 → 切换至漏洞 {rotated_vid}")
+                print(f"[coordinator] {note}")
+                # Reset breaker state for the new attack surface
+                _consecutive_failures = 0
+                _breaker_triggered    = False
+                _error_fingerprints.clear()
+                fb["feedback_for_planner"] = (
+                    f"\n\n【攻击面强制轮换】\n{note}\n"
+                    "上一个漏洞的所有步骤均已 BLOCKED，系统已切换到新漏洞。\n"
+                    "请针对新漏洞重新设计完整攻击链，不要沿用上一轮的 payload 或端点。"
+                ) + "\n" + (fb.get("feedback_for_planner") or "")
+                feedback = fb
+                continue
+            else:
+                warn("[coordinator] 所有漏洞均已尝试，无可轮换目标。")
+
+        if (_consecutive_failures >= _BREAKER_THRESHOLD or _stagnating) and not _breaker_triggered:
+            # ── 触发熔断：CWE 记忆增强 + 强制策略切换 ────────────────────
+            _breaker_triggered = True
+            trigger_reason = "策略停滞（相同错误重复）" if _stagnating else f"连续 {_BREAKER_THRESHOLD} 次失败"
+            print(f"[coordinator] 🔴 熔断器触发！{trigger_reason}，强制策略切换！")
+
+            vuln_summary = (
+                confirmed.get("title", "")
+                or confirmed.get("description", "")
+                or ""
+            )
+            cwe_ids = [
+                v.get("cwe_id", "")
+                for v in confirmed.get("vulnerabilities", [])
+                if v.get("cwe_id")
+            ]
+
+            # CWE-keyed memory retrieval: query each CWE separately for targeted recall
+            cwe_memory_parts: list[str] = []
+            for cwe in cwe_ids[:4]:
+                try:
+                    results = memory.query_strategies(
+                        query_text=f"{cwe} 漏洞利用 成功 失败 payload 攻击",
+                        n_results=3,
+                    )
+                    if results:
+                        cwe_memory_parts.append(f"\n  [{cwe}] 历史经验：")
+                        for item in results:
+                            stype = item.get("metadata", {}).get("strategy_type", "unknown")
+                            label = "✅" if stype != "failure" else "❌"
+                            cwe_memory_parts.append(f"    {label} {item['content'][:200]}")
+                except Exception:
+                    pass
+
+            _mem_ctx = _build_breaker_memory_context(memory, vuln_summary, confirmed)
+            cwe_block = "\n".join(cwe_memory_parts) if cwe_memory_parts else ""
+
+            breaker_injection = (
+                "\n\n"
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                f"║  🔴 熔断器硬中断 — {trigger_reason}，强制策略切换！\n"
+                "╚══════════════════════════════════════════════════════════════╝\n"
+                "当前路径已被判定为死路，必须满足以下要求：\n"
+                "1. 【禁止重复】不得再次使用上两轮相同的 payload、端点、参数组合\n"
+                "2. 【更换漏洞路径】选择 confirmed_vuln 中尚未尝试的其他漏洞类型\n"
+                "3. 【降级策略】若复杂漏洞链失败，改用最简单的单步验证\n"
+                "4. 【探测优先】生成计划第一步必须是纯探测步骤（验证连通性 + 枚举接口）\n"
+            )
+            if cwe_block:
+                breaker_injection += f"\n【CWE 专项记忆检索结果（{', '.join(cwe_ids[:4])}）】：{cwe_block}\n"
+            if _mem_ctx:
+                breaker_injection += f"\n{_mem_ctx}"
+
+            fb["feedback_for_planner"] = breaker_injection
+            feedback = fb
+            print("[coordinator] 熔断器指令已注入 feedback_for_planner")
+
+        elif not fb.get("repro_success") and _consecutive_failures < _BREAKER_THRESHOLD:
+            # ── 未达熔断阈值的普通失败：注入记忆经验辅助决策 ─────────────
+            vuln_summary = (
+                confirmed.get("title", "")
+                or confirmed.get("description", "")
+                or ""
+            )
+            _mem_ctx = _build_breaker_memory_context(memory, vuln_summary, confirmed)
+            if _mem_ctx:
+                existing = fb.get("feedback_for_planner") or ""
+                fb["feedback_for_planner"] = existing + "\n\n【长期记忆辅助参考】" + _mem_ctx
+                feedback = fb
+                print(f"[coordinator] 已将长期记忆经验注入 feedback（失败 {_consecutive_failures}/{_BREAKER_THRESHOLD}）")
+
+        # ── HTTP 语义错误修复注入（独立于熔断器，始终追加）──────────────────
+        if http_feedback_parts:
+            fix_block = (
+                "\n\n"
+                "══════════════════════════════════════════\n"
+                "【�� HTTP 语义错误自动诊断 — 必须在下轮修复！】\n"
+                "══════════════════════════════════════════\n"
+                + "\n".join(http_feedback_parts)
+                + "\n══════════════════════════════════════════"
+            )
+            fb["feedback_for_planner"] = fix_block + "\n" + (fb.get("feedback_for_planner") or "")
+            feedback = fb
+            print(f"[coordinator] �� 已将 {len(http_feedback_parts)} 条HTTP语义修复注入下轮planning")
+
+        # ── 全部步骤失败时注入 URL 修正指令 ──────────────────────────────
+        if fail_cnt == len(step_results) and fail_cnt > 0:
+            target_base = confirmed.get("target_context", {}).get("base_url", "")
+            if target_base:
+                fb["feedback_for_planner"] = (
+                    f"【URL 修正指令】目标基础 URL 是 {target_base}，"
+                    "所有请求必须以该地址为前缀。请检查并修正所有步骤中的 base 变量。\n"
+                ) + (fb.get("feedback_for_planner") or "")
+                feedback = fb
+                print(f"[coordinator] �� 全部步骤失败，已注入目标 URL 修正指令: {target_base}")
+
+        # ── 成功处理逻辑 ───────────────────────────────────────────────────
         if fb.get("repro_success"):
             conf = fb.get("confidence", 0)
-            print(f"[coordinator] ✅ 本轮复现成功！confidence={conf}")
+            ok(f"本轮复现成功！confidence={conf}")
             success_log.append({
                 "iteration": iteration,
                 "plan_id": last_plan.get("plan_id"),
@@ -220,17 +786,22 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
                 has_failures = any(v for v in failures.values())
                 if has_failures and not _retry_iteration_done and iteration < settings.max_iterations:
                     _retry_iteration_done = True
-                    print(f"[coordinator] 🟡 置信度达标但存在失败步骤: skipped={len(failures['skipped'])} error={len(failures['error'])} blocked={len(failures['blocked'])}")
-                    print("[coordinator] 🔄 启动定向修复迭代，专攻失败步骤...")
+                    warn(
+                        f"置信度达标但存在失败步骤: "
+                        f"skipped={len(failures['skipped'])} "
+                        f"error={len(failures['error'])} "
+                        f"blocked={len(failures['blocked'])}"
+                    )
+                    stage("CLI", "启动定向修复迭代，专攻失败步骤...")
                     retry_prompt = _build_retry_prompt(failures, confirmed)
                     fb["feedback_for_planner"] = retry_prompt
                     fb["should_continue"] = True
                     feedback = fb
                     continue
-                print(f"[coordinator] 🎉 置信度 {conf:.0%} 达标，停止迭代。")
+                ok(f"置信度 {conf:.0%} 达标，停止迭代。")
                 break
             vulns = confirmed.get("vulnerabilities") or []
-            remaining = [f"CWE-{v.get('cwe_id','').replace('CWE-','')} {v.get('vuln_name','')}" for v in vulns]
+            remaining = [f"{v.get('cwe_id', '?')} {v.get('title', '')}" for v in vulns]
             fb["feedback_for_planner"] = (
                 (fb.get("feedback_for_planner") or "")
                 + f" 【继续探索】目标系统仍有漏洞待验证。confirmed_vuln 中共 {len(remaining)} 个漏洞：\n"
@@ -241,30 +812,65 @@ def run_pipeline(confirmed_path: Path | None = None) -> int:
             continue
 
         if fb.get("should_continue") is False:
-            print("[coordinator] 评估建议终止迭代。")
+            warn("评估建议终止迭代。")
             return 2
 
+    # ── 迭代上限退出（论文 §3.3 Max Iterations）──────────────────────────
+    warn(f"已达最大迭代次数 {settings.max_iterations}，安全退出。")
+    _cleanup_sandbox_workspace(ws)
+
     if success_log:
-        print(f"[coordinator] 🎉 总计复现成功 {len(success_log)} 次！")
-        for s in success_log:
-            print(f"[coordinator]   迭代{s['iteration']} plan={s['plan_id']} confidence={s['confidence']}")
+        ok(f"总计复现成功 {len(success_log)} 次！")
+        render_summary_table(success_log)
         return 0
-    print("[coordinator] 达到最大迭代次数，未判定成功。")
+
+    fail("达到最大迭代次数，未判定成功。")
     return 3
 
 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Co-RedTeam 协调器（多智能体 + 分层长期记忆）")
+    import core.adapters  # noqa: F401
+    from core.target_context import lock_target, TargetLockError
+
+    parser = argparse.ArgumentParser(
+        description="Co-RedTeam 协调器（多智能体 + 分层长期记忆）"
+    )
     parser.add_argument(
         "--confirmed",
         type=Path,
         default=None,
         help="confirmed_vuln.json 路径，默认 data/confirmed_vuln.json",
     )
+    parser.add_argument(
+        "--challenge",
+        type=str,
+        default="generic",
+        choices=["generic"] + list_adapters(),
+        help="挑战适配器名称（加载挑战专属规则）。可用: %(choices)s",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help="目标 URL 白名单（如 https://192.168.1.100:9443）。省略时从 confirmed_vuln 读取",
+    )
     args = parser.parse_args()
-    code = run_pipeline(confirmed_path=args.confirmed)
+
+    target: TargetContext | None = None
+    if args.url:
+        try:
+            target = lock_target(args.url)
+        except TargetLockError as e:
+            fail(str(e))
+            raise SystemExit(2)
+
+    code = run_pipeline(
+        confirmed_path=args.confirmed,
+        challenge_name=args.challenge,
+        target=target,
+    )
     raise SystemExit(code)
 
 

@@ -273,8 +273,15 @@ def convert_phase1_to_phase2(phase1_report: dict[str, Any]) -> dict[str, Any]:
         cwe_id = vuln.get("cwe_id", "UNKNOWN")
         line_num = vuln.get("line", vuln.get("line_start", 0))
         description = vuln.get("description", "")
-        evidence = vuln.get("evidence", "")
+        evidence_raw = vuln.get("evidence", "")
         file_path = vuln.get("file_path", "")
+        
+        if isinstance(evidence_raw, dict):
+            evidence_text = evidence_raw.get("code_snippet", "")
+            if not file_path:
+                file_path = evidence_raw.get("file", "")
+        else:
+            evidence_text = str(evidence_raw)
         
         if file_path and file_path.startswith(str(ROOT)):
             try:
@@ -285,18 +292,23 @@ def convert_phase1_to_phase2(phase1_report: dict[str, Any]) -> dict[str, Any]:
         else:
             location = file_path or f"unknown_file_{i+1}"
         
-        source, sink = extract_source_sink(evidence, description)
+        source, sink = extract_source_sink(evidence_text, description)
         
         converted = {
+            "id": vuln.get("id", f"VULN-{i+1:03d}"),
             "type": get_type(cwe_id),
+            "cwe_id": cwe_id,
             "cwe": cwe_id,
-            "severity": get_severity(cwe_id),
+            "title": vuln.get("title", ""),
+            "severity": vuln.get("severity", get_severity(cwe_id)),
             "location": location,
-            "function": extract_function_from_evidence(evidence),
-            "evidence": evidence,
-            "source": source,
-            "sink": sink,
+            "function": extract_function_from_evidence(evidence_text),
+            "evidence": evidence_raw,
+            "source": vuln.get("source", source),
+            "sink": vuln.get("sink", sink),
             "description": description,
+            "attack_chain": vuln.get("attack_chain", ""),
+            "data_flow": vuln.get("data_flow", ""),
         }
         
         phase2_vulns.append(converted)
@@ -312,14 +324,123 @@ def convert_phase1_to_phase2(phase1_report: dict[str, Any]) -> dict[str, Any]:
     return phase2_report
 
 
+def extract_target_context(vulns: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    从漏洞证据中自动提取目标系统上下文信息
+    """
+    import re
+    
+    context: dict[str, Any] = {
+        "base_url": os.getenv("CO_REDTEAM_TARGET_BASE", "http://host.docker.internal:9443"),
+        "app_name": "目标应用",
+        "os_hint": "linux",
+    }
+    
+    app_names = set()
+    
+    for vuln in vulns:
+        location = vuln.get("location", "")
+        evidence = vuln.get("evidence", "")
+        
+        if isinstance(evidence, dict):
+            file_path = evidence.get("file", "")
+            code = evidence.get("code_snippet", "")
+        else:
+            file_path = ""
+            code = str(evidence) if evidence else ""
+        
+        search_text = f"{location} {file_path} {code}"
+        
+        for pattern in [
+            r"cybench_web_challenges/[^/]*?\[[^\]]*\]\s+(\w+)",
+            r"target_codebase[/\\]cybench_web_challenges[/\\][^/\\]*?\[[^\]]*?\][/\\]?\s*(\w+)",
+            r"([a-zA-Z][a-zA-Z0-9_-]{2,})[/\\]challenge[/\\]",
+        ]:
+            match = re.search(pattern, search_text)
+            if match:
+                app_names.add(match.group(1).strip())
+        
+        if re.search(r"\.js\b|node|npm|Node\.js|express", code or "", re.IGNORECASE):
+            pass
+        if re.search(r"\.py\b|flask|django|Jinja2|render_template", code or "", re.IGNORECASE):
+            pass
+        if re.search(r"\.php\b", code or "", re.IGNORECASE):
+            pass
+    
+    if app_names:
+        context["app_name"] = sorted(app_names)[0]
+    
+    routes = _scan_source_routes(vulns)
+    if routes:
+        context["discovered_routes"] = sorted(set(routes))
+    
+    return context
+
+
+def _scan_source_routes(vulns: list[dict[str, Any]]) -> list[str]:
+    """扫描漏洞引用的真实源文件，提取所有 @route 装饰器中的端点"""
+    import re
+    routes: list[str] = []
+    seen_files: set[str] = set()
+    route_re = re.compile(r"""@(\w+)\.route\(['\"](/[\w/<>-]*)['\"]""")
+    
+    for vuln in vulns:
+        evidence = vuln.get("evidence", "")
+        location = vuln.get("location", "")
+        
+        if isinstance(evidence, dict):
+            source_file = evidence.get("file", "")
+        else:
+            source_file = location or ""
+        
+        if not source_file or source_file in seen_files:
+            continue
+        
+        full_path = ROOT / source_file
+        if not full_path.exists():
+            continue
+        
+        seen_files.add(source_file)
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+            for match in route_re.finditer(content):
+                bp_name, ep = match.group(1), match.group(2)
+                routes.append(f"@{bp_name}.route('{ep}')")
+        except Exception:
+            continue
+        
+        dir_path = full_path.parent
+        for py_file in sorted(dir_path.glob("*.py")):
+            py_path = str((ROOT / py_file).relative_to(ROOT) if py_file.is_relative_to(ROOT) else py_file)
+            if py_path in seen_files:
+                continue
+            seen_files.add(py_path)
+            try:
+                content = py_file.read_text(encoding="utf-8", errors="replace")
+                for match in route_re.finditer(content):
+                    bp_name, ep = match.group(1), match.group(2)
+                    routes.append(f"@{bp_name}.route('{ep}')")
+            except Exception:
+                continue
+    
+    return routes
+
+
 def bridge_to_phase2(phase2_report: dict[str, Any]) -> Path:
     """
-    将转换后的数据写入 Phase 2 的输入目录
+    将转换后的数据写入 Phase 2 的输入目录，并自动注入目标系统上下文
     返回写入的文件路径
     """
     print(f"\n{BOLD}{MAGENTA}{'─'*70}{RESET}")
     print(f"{BOLD}{MAGENTA}[Bridge] 数据桥接：Phase 1 → Phase 2{RESET}")
     print(f"{BOLD}{MAGENTA}{'─'*70}{RESET}")
+    
+    vulns = phase2_report.get("vulnerabilities", [])
+    target_context = extract_target_context(vulns)
+    phase2_report["target_context"] = target_context
+    
+    print(f"[Bridge] 目标系统识别: {target_context['app_name']}")
+    print(f"[Bridge] 基础 URL: {target_context['base_url']}")
     
     PHASE2_DATA_DIR.mkdir(parents=True, exist_ok=True)
     
@@ -335,12 +456,12 @@ def bridge_to_phase2(phase2_report: dict[str, Any]) -> Path:
         json.dump(phase2_report, f, ensure_ascii=False, indent=4)
     
     print(f"[Bridge] [OK] 情报移交成功！已写入: {PHASE2_CONFIRMED_PATH}")
-    print(f"[Bridge] 移交漏洞总数: {len(phase2_report['vulnerabilities'])}")
+    print(f"[Bridge] 移交漏洞总数: {len(vulns)}")
     
-    for vuln in phase2_report['vulnerabilities']:
+    for vuln in vulns:
         severity_color = RED if vuln['severity'] == 'CRITICAL' else YELLOW if vuln['severity'] == 'HIGH' else GREEN
         print(f"  {severity_color}[{vuln['severity']}] {vuln['cwe']} - {vuln['type']}{RESET}")
-        print(f"         Location: {vuln['location']}:{vuln.get('line', '?')}")
+        print(f"         Location: {vuln['location']}")
     
     return PHASE2_CONFIRMED_PATH
 
