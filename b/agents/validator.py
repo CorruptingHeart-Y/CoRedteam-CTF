@@ -227,6 +227,49 @@ def _check_python_syntax(cmd: str) -> tuple[bool, str]:
         return False, msg
 
 
+def _check_polyglot_correctness(code: str, step_id: int) -> list[str]:
+    """Detect common JWT/JSON polyglot construction errors that cause exploit failure.
+
+    These are *semantic* errors that pass syntax checks but are guaranteed to fail
+    against python_jwt / jwcrypto due to key ordering requirements.
+
+    Returns a list of warning strings (empty = no issues found).
+    """
+    warnings: list[str] = []
+    step_label = f"step[{step_id}]"
+
+    # Pattern 1: json.dumps() used to construct a polyglot — key order is wrong
+    if re.search(r'json\.dumps\s*\(\s*polyglot', code) or re.search(r'json\.dumps\s*\(\s*\{', code):
+        if re.search(r'(fake_payload|forged|polyglot|extra_key)', code, re.IGNORECASE):
+            warnings.append(
+                f"{step_label}: 检测到使用 json.dumps(dict) 构造 JWT/JSON polyglot。"
+                f"这会导致注入的 key 被排序到最后，python_jwt 先解析正经字段再解析伪造字段，从而产生 "
+                f"'Invalid base64-encoded string' 或 'Invalid JWS Object' 错误。"
+                f"【修复】：必须用字符串拼接 (f-string 或 +) 构造 polyglot，并将伪造 key 放在 JSON 对象的【第一个】位置。"
+                f"参考格式: '{{\" ' + header + '.' + fake_payload + '.\":\"\",\"protected\":\"' + ... + '\"}}'"
+            )
+
+    # Pattern 2: .rstrip('=') on base64url-encoded strings — breaks python_jwt internal decoder
+    if re.search(r'\.rstrip\s*\(\s*[\'\"]=\s*[\'\"]\s*\)', code):
+        if re.search(r'(base64|urlsafe_b64encode|b64encode)', code, re.IGNORECASE):
+            warnings.append(
+                f"{step_label}: 检测到 base64 编码后调用了 .rstrip('=')。"
+                f"python_jwt 内部的 jwcrypto 解码器要求完整 padding，去掉 '=' 会导致 "
+                f"'Incorrect padding' 或 'Invalid base64-encoded string' 错误。"
+                f"【修复】：删除 .rstrip('=') 调用，保留 base64url 编码的完整输出。"
+            )
+
+    # Pattern 3: alg:none used — python_jwt 3.3.3 explicitly rejects it
+    if re.search(r'"alg"\s*:\s*"none"', code, re.IGNORECASE):
+        warnings.append(
+            f"{step_label}: 检测到使用 alg:none 的 JWT 攻击。"
+            f"python_jwt 3.3.3 及更高版本明确拒绝 alg:none 令牌，此攻击无效。"
+            f"【修复】：使用 JSON Polyglot 攻击 (CVE-2022-39227) 替代 alg:none。"
+        )
+
+    return warnings
+
+
 def _syntax_hint(msg: str, line: str) -> str:
     """根据常见语法错误给出修复建议。"""
     m = msg.lower()
@@ -301,7 +344,192 @@ def _normalize_plan(plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return fixed, warnings
 
 
-def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
+def _check_broken_dependency_chain(
+    steps: list[dict[str, Any]],
+    prior_feedback: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Detect plans that build on steps whose preconditions are already known to have failed.
+
+    Scans for:
+    1. Steps whose ``depends_on`` references a step that FAILED in the prior run
+    2. Steps whose command reads ``/tmp/`` files that a FAILED step was supposed to create
+    3. High-id steps (>=5) when early steps (1-3) all failed — "castle on sand" pattern
+
+    Returns (is_clean, list_of_violations).
+    """
+    if not prior_feedback or not steps:
+        return True, []
+
+    # Gather failed step IDs from the prior feedback
+    failed_step_ids: set[int] = set()
+    memory_patch = prior_feedback.get("memory_patch", {})
+    strategy_patch = memory_patch.get("strategy", {})
+    add_failures = strategy_patch.get("add_failures", [])
+    for af in add_failures:
+        sid = af.get("step_id")
+        if isinstance(sid, int):
+            failed_step_ids.add(sid)
+
+    # Also check for FileNotFoundError mentions in the feedback analysis
+    analysis = prior_feedback.get("analysis", {})
+    what_happened = analysis.get("what_happened", "")
+    # Extract step IDs that failed due to FileNotFoundError
+    import re as _re
+    for match in _re.finditer(
+        r"Step (\d+): Failed with FileNotFoundError",
+        what_happened,
+    ):
+        failed_step_ids.add(int(match.group(1)))
+
+    if not failed_step_ids:
+        return True, []
+
+    violations: list[str] = []
+
+    # Build a map from step id to step index
+    id_to_idx: dict[int, int] = {}
+    id_to_step: dict[int, dict[str, Any]] = {}
+    for i, st in enumerate(steps):
+        if isinstance(st, dict):
+            sid = st.get("id")
+            if isinstance(sid, int):
+                id_to_idx[sid] = i
+                id_to_step[sid] = st
+
+    # Map of "file → creating step id" for /tmp/ files mentioned in commands
+    file_producer: dict[str, int] = {}
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        sid = st.get("id")
+        cmd = st.get("command", "")
+        if not isinstance(cmd, str):
+            continue
+        # Steps that WRITE to /tmp/ files
+        for match in _re.finditer(
+            r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
+            cmd,
+        ):
+            fname = match.group(1)
+            if isinstance(sid, int):
+                file_producer[f"/tmp/{fname}"] = sid
+
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        sid = st.get("id")
+        if not isinstance(sid, int):
+            continue
+        step_label = f"step[{sid}]"
+
+        # Check 1: explicit depends_on
+        depends_raw = st.get("depends_on")
+        if isinstance(depends_raw, (int, float)):
+            depends_raw = int(depends_raw)
+            if depends_raw in failed_step_ids:
+                violations.append(
+                    f"{step_label}: 依赖的前置 step[{depends_raw}] 在上轮已失败，"
+                    f"本轮若无替代方案则此步骤不可执行。"
+                    f"请在 plan 中删除此步骤或增加一个能补齐缺失产物的替代步骤。"
+                )
+
+        # Check 2: command reads /tmp/ files that a FAILED step produced
+        cmd = st.get("command", "")
+        if not isinstance(cmd, str):
+            continue
+        for match in _re.finditer(
+            r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
+            cmd,
+        ):
+            fname = match.group(1)
+            fpath = f"/tmp/{fname}"
+            # Check if this file was supposed to be created by a FAILED step
+            creator = file_producer.get(fpath)
+            if creator is not None and creator in failed_step_ids:
+                violations.append(
+                    f"{step_label}: 需要读取 `{fpath}`，但该文件应由 step[{creator}] 生成，"
+                    f"而 step[{creator}] 在上轮已失败。"
+                    f"禁止在缺失前置产物的条件下构造后续步骤。"
+                )
+                break  # One violation per step is enough
+
+    # Check 3: "castle on sand" — multiple early critical steps failed, plan still sprawling
+    #    Two variants:
+    #    (a) ALL early steps 1-3 failed → plan of 5+ steps rejected
+    #    (b) Steps in the 2-4 "bypass/exploit" range all failed AND late steps exist
+    early_ids = [
+        s.get("id") for s in steps
+        if isinstance(s, dict) and isinstance(s.get("id"), int) and s.get("id") <= 4
+    ]
+    critical_range_ids = [eid for eid in early_ids if 2 <= eid <= 4]  # bypass/exploit phase
+    if early_ids and all(eid in failed_step_ids for eid in early_ids):
+        late_steps = [
+            s for s in steps
+            if isinstance(s, dict) and isinstance(s.get("id"), int) and s.get("id", 0) >= 5
+        ]
+        if len(late_steps) >= 2:
+            late_ids = [s.get("id") for s in late_steps]
+            violations.append(
+                f"前序步骤{early_ids}已全部失败，但计划仍包含 {len(late_steps)} 个后续步骤 "
+                f"（step {late_ids}）。这是典型的'沙滩建城堡'模式。"
+                f"Validator 拒绝此计划。请缩减到 3-4 步以内，集中精力攻克前置 bypass/认证问题。"
+            )
+    elif critical_range_ids and all(eid in failed_step_ids for eid in critical_range_ids):
+        # Steps 2-4 (bypass/exploit phase) all failed
+        late_steps = [
+            s for s in steps
+            if isinstance(s, dict) and isinstance(s.get("id"), int) and s.get("id", 0) >= 4
+        ]
+        if len(late_steps) >= 3:
+            late_ids = [s.get("id") for s in late_steps]
+            violations.append(
+                f"关键 bypass/利用步骤 {critical_range_ids} 已全部失败，"
+                f"但计划仍包含 {len(late_steps)} 个后续步骤（step {late_ids}）。"
+                f"这属于无效的'空中楼阁'计划。"
+                f"请将计划缩减到最多 4 步以内，只包含 bypass 探测本身，"
+                f"拿到 token 后再考虑后续攻击链。"
+            )
+
+    # Check 4: "orphan consumer" — step reads a /tmp/ file that NO step produces
+    all_cmds = "\n".join(
+        st.get("command", "") for st in steps if isinstance(st, dict)
+    )
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        sid = st.get("id")
+        cmd = st.get("command", "")
+        if not isinstance(cmd, str):
+            continue
+        for match in _re.finditer(
+            r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
+            cmd,
+        ):
+            fname = match.group(1)
+            fpath = f"/tmp/{fname}"
+            producer = file_producer.get(fpath)
+            # The file is "open for reading" if the step reads it but doesn't produce it
+            if producer is None:
+                # Is this step trying to read the file (not create/write it)?
+                if fpath not in cmd.replace(fpath, ""):  # crude: the file path appears
+                    is_reading = any(
+                        pattern in cmd.lower()
+                        for pattern in ("open(", "with open", "read()", "load(", "json.load")
+                    )
+                    if is_reading:
+                        violations.append(
+                            f"step[{sid}]: 尝试读取 `{fpath}`，但没有任何步骤负责生成该文件。"
+                            f"这是死依赖——请增加一个前置步骤来创建此文件，或在拿到数据之前删除此步骤。"
+                        )
+                        break  # One orphan per step is enough
+
+    return len(violations) == 0, violations
+
+
+def validate_plan(
+    plan: dict[str, Any],
+    prior_feedback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     errors: list[str] = []
     syntax_warnings: list[str] = []
 
@@ -312,6 +540,12 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(steps, list) or not steps:
         errors.append("`steps` 必须是非空数组")
     else:
+        # ── 步数依赖熔断 — 必须先于其他检查 ──
+        chain_ok, chain_violations = _check_broken_dependency_chain(steps, prior_feedback)
+        if not chain_ok:
+            errors.extend(chain_violations)
+            # Don't short-circuit; still run other structural checks to give full picture
+
         for i, st in enumerate(steps):
             step_label = f"step[{i}]（id={st.get('id', '?')}）" if isinstance(st, dict) else f"step[{i}]"
 
@@ -341,6 +575,13 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
                 if not import_ok:
                     errors.append(f"{step_label}: {import_err}")
 
+                # 3. JWT/JSON polyglot 正确性检查（语义级反模式检测）
+                polyglot_warnings = _check_polyglot_correctness(cmd, st.get("id", 0))
+                for pw in polyglot_warnings:
+                    print(f"[validator] [POLYGLOT] {pw}")
+                    # Polyglot warnings cause the step to be skipped, not the whole plan rejected
+                    syntax_warnings.append(pw)
+
     passed = len(errors) == 0
     result: dict[str, Any] = {"passed": passed, "errors": errors}
     if syntax_warnings:
@@ -352,10 +593,14 @@ def validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def run_validator(plan_path: Path, validated_path: Path) -> dict[str, Any]:
+def run_validator(
+    plan_path: Path,
+    validated_path: Path,
+    prior_feedback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     raw_plan = json.loads(plan_path.read_text(encoding="utf-8"))
     normalized_plan, norm_warnings = _normalize_plan(raw_plan)
-    result = validate_plan(normalized_plan)
+    result = validate_plan(normalized_plan, prior_feedback=prior_feedback)
     payload = {
         "version": 1,
         "validation": result,

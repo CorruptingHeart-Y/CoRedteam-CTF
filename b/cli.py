@@ -114,24 +114,44 @@ def cmd_exploit(args: argparse.Namespace) -> int:
     _render_exploit_banner(args.url, vuln_arg, challenge)
     render_target_lock(target)
 
-    # --vuln overrides --confirmed for clarity; both accepted
-    confirmed_path: Path | None = None
+    # Resolve vuln file: --vuln > --confirmed > default data/confirmed_vuln.json
     raw_path = vuln_arg or getattr(args, "confirmed", None)
     if raw_path:
         confirmed_path = Path(raw_path)
-        if not confirmed_path.exists():
-            fail(f"Vuln file not found: {confirmed_path}")
-            return 1
+    else:
+        confirmed_path = _B_ROOT / "data" / "confirmed_vuln.json"
+
+    if not confirmed_path.exists():
+        fail(
+            f"[!] 找不到漏洞报告: {confirmed_path}\n"
+            "    请先运行 Phase 1: python cli.py audit --target <TARGET_DIR>"
+        )
+        return 1
 
     import core.adapters  # noqa: F401
     from coordinator import run_pipeline
 
-    stage("CLI", f"Starting Phase 2 pipeline (challenge={challenge})...")
-    return run_pipeline(
-        confirmed_path=confirmed_path,
-        challenge_name=challenge,
-        target=target,
-    )
+    max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "3"))
+    stage("CLI", f"Starting Phase 2 pipeline (challenge={challenge}, max_runs={max_runs})...")
+
+    best_result = 3
+    for run_idx in range(1, max_runs + 1):
+        console.print(f"\n[bold cyan]========== OUTER RUN {run_idx}/{max_runs} ==========[/bold cyan]")
+        result = run_pipeline(
+            confirmed_path=confirmed_path,
+            challenge_name=challenge,
+            target=target,
+        )
+        best_result = result
+        if result == 0:
+            ok(f"SUCCESS on outer run {run_idx}/{max_runs}! Flag captured.")
+            return 0
+        else:
+            if run_idx < max_runs:
+                warn(f"Run {run_idx}/{max_runs} ended without flag. Retrying with updated memory...")
+
+    fail(f"All {max_runs} outer runs exhausted without confirmed success.")
+    return best_result
 
 
 # ---------------------------------------------------------------------------

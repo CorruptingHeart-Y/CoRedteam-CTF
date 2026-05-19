@@ -26,14 +26,16 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 # ==========================================
-# 2. 初始化 LLM (DeepSeek-V3)
+# 2. 初始化 LLM (OpenAI-compatible, controlled by .env)
 # ==========================================
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 llm = ChatOpenAI(
-    model="deepseek-chat",
+    model=DEEPSEEK_MODEL,
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com",
+    base_url=DEEPSEEK_BASE_URL,
     temperature=0.1,
 )
 
@@ -105,7 +107,7 @@ def analysis_node(state: CoRedteamState):
         parts = []
 
         # [1] 查询 vulnerability_patterns (历史经验)
-        pattern_collection = chroma_client.get_collection(name="vulnerability_patterns")
+        pattern_collection = chroma_client.get_or_create_collection(name="vulnerability_patterns")
         pat_results = pattern_collection.query(
             query_texts=["越权访问, 逻辑漏洞, 注入攻击, 混淆绕过, 认证缺陷, 业务状态机, CSRF"],
             n_results=5
@@ -117,7 +119,7 @@ def analysis_node(state: CoRedteamState):
             parts.append(("历史经验", pattern_texts))
 
         # [2] 查询 vulnerability_docs (CWE 知识库) - 补充代码型 RAG 可能遗漏的逻辑漏洞
-        docs_collection = chroma_client.get_collection(name="vulnerability_docs")
+        docs_collection = chroma_client.get_or_create_collection(name="vulnerability_docs")
         cwe_results = docs_collection.query(
             query_texts=["CSRF 跨站请求伪造, 认证绕过, 逻辑缺陷, 权限绕过, 业务越权, 状态机篡改"],
             n_results=6

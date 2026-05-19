@@ -19,6 +19,7 @@ class Settings:
     deepseek_model: str
     mock_llm: bool
     max_iterations: int
+    max_iterations_cap: int
     workspace_dir: Path
     memory_dir: Path
     confirmed_vuln_path: Path
@@ -27,9 +28,12 @@ class Settings:
     docker_timeout: int
     docker_memory_limit: str
     docker_cpu_quota: int
+    json_mode: bool
+    max_runs: int
 
 
 def get_settings() -> Settings:
+    json_mode = os.getenv("CO_REDTEAM_JSON_MODE", "true").lower() in ("1", "true", "yes")
     mock = os.getenv("CO_REDTEAM_MOCK_LLM", "false").lower() in ("1", "true", "yes")
     docker_enabled = os.getenv("CO_REDTEAM_DOCKER_ENABLED", "true").lower() in ("1", "true", "yes")
     return Settings(
@@ -39,12 +43,15 @@ def get_settings() -> Settings:
         deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
         mock_llm=mock,
         max_iterations=int(os.getenv("CO_REDTEAM_MAX_ITER", "8")),
+        max_iterations_cap=int(os.getenv("CO_REDTEAM_MAX_ITER_CAP", "20")),
         workspace_dir=ROOT / "workspace",
         memory_dir=ROOT,
-        confirmed_vuln_path=ROOT.parent / "reports" / "vulnerability_proposal_latest.json",
+        confirmed_vuln_path=ROOT / "data" / "confirmed_vuln.json",
         docker_enabled=docker_enabled,
         docker_image=os.getenv("CO_REDTEAM_DOCKER_IMAGE", "co-redteam-sandbox:latest"),
         docker_timeout=int(os.getenv("CO_REDTEAM_DOCKER_TIMEOUT", "300")),
         docker_memory_limit=os.getenv("CO_REDTEAM_DOCKER_MEMORY", "512m"),
         docker_cpu_quota=int(os.getenv("CO_REDTEAM_DOCKER_CPU_QUOTA", "100000")),
+        json_mode=json_mode,
+        max_runs=int(os.getenv("CO_REDTEAM_MAX_RUNS", "3")),
     )

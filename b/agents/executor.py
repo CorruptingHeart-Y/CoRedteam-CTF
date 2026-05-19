@@ -31,11 +31,14 @@ _SDK_SOURCE = """\
 import base64
 import json
 import re
+import socket
+import ssl
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -44,8 +47,38 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 _WORKSPACE    = "/workspace"
 _TMP_DIR      = "/workspace/tmp"
-_CONTEXT_PATH = f"{_WORKSPACE}/context.json"
+_CONTEXT_PATH = f"{_TMP_DIR}/context.json"
 _SESSION_PATH = f"{_TMP_DIR}/session.json"
+
+_CRLF = chr(13) + chr(10)
+_CRLF2 = _CRLF * 2
+
+
+# ── RawResponse ──────────────────────────────────
+
+class RawResponse:
+    \"\"\"HTTP response parsed from raw socket bytes for raw_request().\"\"\"
+
+    def __init__(self, raw: str):
+        self._raw = raw
+        parts = raw.split(_CRLF2, 1)
+        self._body = parts[1] if len(parts) > 1 else ""
+        header_block = parts[0]
+        lines = header_block.split(_CRLF)
+        status_line = lines[0]
+        status_parts = status_line.split(" ", 2)
+        self.status_code = int(status_parts[1]) if len(status_parts) > 1 else 0
+        self.text = self._body
+
+        self.headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                self.headers[k.strip().lower()] = v.strip()
+
+    def json(self) -> dict:
+        import json as _json
+        return _json.loads(self._body)
 
 
 # ── HttpClient ──────────────────────────────────
@@ -72,6 +105,61 @@ class HttpClient(requests.Session):
     def post(self, url, *a, **kw):   return self.request("POST",   url, *a, **kw)
     def put(self, url, *a, **kw):    return self.request("PUT",    url, *a, **kw)
     def delete(self, url, *a, **kw): return self.request("DELETE", url, *a, **kw)
+
+    def raw_request(self, method: str, path: str, headers: dict | None = None,
+                    body: str = "") -> "RawResponse":
+        \"\"\"Send a raw HTTP request via socket, bypassing URL normalization.
+
+        Use this when requests.Session strips characters like '#', '%00', '..;'
+        that are essential for HAProxy / WAF bypass. The path is sent verbatim.
+
+        Returns a RawResponse with .status_code, .text, .headers, .json().
+        \"\"\"
+        parsed = urlparse(self.base_url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        use_tls = parsed.scheme == "https"
+
+        hdr_lines = [f"{method} {path} HTTP/1.1", f"Host: {host}"]
+        if headers:
+            for k, v in headers.items():
+                hdr_lines.append(f"{k}: {v}")
+        else:
+            hdr_lines.append("Connection: close")
+        if body:
+            if not headers or "Content-Length" not in {k.lower() for k in headers}:
+                hdr_lines.append(f"Content-Length: {len(body)}")
+        hdr_lines.append("")
+        if body:
+            hdr_lines.append(body)
+        hdr_lines.append("")
+        raw = _CRLF.join(hdr_lines)
+
+        # create_connection iterates ALL getaddrinfo results (cf. Docker
+        # extra_hosts where localhost resolves to both 127.0.0.1 and the
+        # target container IP). Plain socket.connect() only tries the first.
+        sock = socket.create_connection((host, port), timeout=15)
+        try:
+            if use_tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                sock = ctx.wrap_socket(sock, server_hostname=host, do_handshake_on_connect=False)
+                sock.do_handshake()
+            sock.sendall(raw.encode())
+            resp_data = b""
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    resp_data += chunk
+                except socket.timeout:
+                    break
+        finally:
+            sock.close()
+
+        return RawResponse(resp_data.decode("utf-8", errors="replace"))
 
     @property
     def last_response(self):
@@ -366,8 +454,27 @@ def _deser(value: Any) -> Any:
 """
 
 # ──────────────────────────────────────────────
-#  安全规则集
+#  物理硬截断（防上下文爆满 / 注意力涣散）
 # ──────────────────────────────────────────────
+
+_HARD_TRUNC_THRESHOLD = 3000
+_HARD_TRUNC_HEAD      = 1000
+_HARD_TRUNC_TAIL      = 1500
+
+
+def _hard_truncate(text: str, threshold: int = _HARD_TRUNC_THRESHOLD,
+                   head: int = _HARD_TRUNC_HEAD, tail: int = _HARD_TRUNC_TAIL) -> str:
+    """Physical head+tail truncation — never summarize, always preserve raw bytes.
+
+    When output exceeds *threshold* chars, keep the first *head* chars (usually
+    request/command context) and the last *tail* chars (usually error / stack
+    trace / flag), replacing the middle with a marker.  The result is always
+    raw, verbatim substrings — no LLM summarization, no semantic compression.
+    """
+    if len(text) <= threshold:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n...[TRUNCATED {omitted} chars]...\n{text[-tail:]}"
 PYTHON_BLOCKED_PATTERNS = [
     (r"\bos\.system\s*\(", "os_system_exec"),
     (r"\bos\.popen\s*\(", "os_popen_exec"),
@@ -427,6 +534,34 @@ class SecurityViolationError(Exception):
 # ──────────────────────────────────────────────
 #  网络隔离辅助
 # ──────────────────────────────────────────────
+
+def _find_target_container_network(client: docker.DockerClient, host: str, port: int) -> str | None:
+    """Auto-detect the Docker network of the target container by its host port binding.
+
+    Returns the network name (e.g. 'shared_net') so sandbox can join it directly,
+    or None if no container publishes the given port — fall back to bridge+host-gateway.
+    """
+    try:
+        for c in client.containers.list():
+            ports = (c.attrs.get("NetworkSettings", {}) or {}).get("Ports", {}) or {}
+            for container_port, bindings in (ports or {}).items():
+                if not bindings:
+                    continue
+                for b in bindings:
+                    if b and str(b.get("HostPort")) == str(port):
+                        nets = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+                        if nets:
+                            net_name = next(iter(nets.keys()))
+                            target_ip = nets[net_name].get("IPAddress", "")
+                            _audit_log.info(
+                                f"[NETWORK] 发现目标容器 {c.name} 在 {net_name} (IP={target_ip})"
+                            )
+                            return net_name
+        return None
+    except Exception as e:
+        _audit_log.warning(f"[NETWORK] 扫描目标网络失败: {e}")
+        return None
+
 
 def _resolve_target(target_url: str) -> tuple[str, int, str]:
     """Resolve raw target URL → (ip, port, hostname); empty strings on failure.
@@ -504,29 +639,35 @@ def _check_python_safety(code: str, step_id: int) -> list[str]:
 #  工作区准备：SDK + context.json + tmp 目录
 # ──────────────────────────────────────────────
 
-def _prepare_exec_workspace(base_workdir: Path) -> Path:
+def _prepare_exec_workspace(base_workdir: Path, target_context: dict | None = None) -> Path:
     """
     准备执行工作区：
     - exec_workspace/          → 只读挂载到 /workspace
     - exec_workspace/tmp/      → 可写挂载到 /workspace/tmp
     - exec_workspace/redteam_sdk.py  → 注入 SDK
-    - exec_workspace/context.json    → 步骤间通信文件
+    - exec_workspace/context.json    → 步骤间通信文件（预注入 target_context）
     """
     ws = base_workdir / "co_redteam_exec"
     ws.mkdir(parents=True, exist_ok=True)
 
-    # 写入 SDK
+    # 写入 SDK（二进制模式避免 Windows \\n→\\r\\n 转换破坏字符串字面量）
     sdk_path = ws / "redteam_sdk.py"
-    sdk_path.write_text(_SDK_SOURCE, encoding="utf-8")
+    sdk_path.write_bytes(_SDK_SOURCE.encode("utf-8"))
 
-    # 初始化 context
+    # 初始化 context — 预注入 target_context 以便 LLM 脚本读取 base_url
+    # 同时写入 ro 区（供脚本初始读取）和 tmp（供 save_context 写入）
     ctx_file = ws / "context.json"
-    if not ctx_file.exists():
-        ctx_file.write_text("{}", encoding="utf-8")
+    initial: dict[str, Any] = {}
+    if target_context:
+        initial["target_context"] = target_context
+    ctx_file.write_text(json.dumps(initial, ensure_ascii=False), encoding="utf-8")
 
     # 创建可写 tmp 目录
     tmp_dir = ws / "tmp"
     tmp_dir.mkdir(exist_ok=True)
+    # 同时写入可写区，让 save_context 有初始数据可以追加
+    tmp_ctx = tmp_dir / "context.json"
+    tmp_ctx.write_text(json.dumps(initial, ensure_ascii=False), encoding="utf-8")
 
     return ws
 
@@ -625,8 +766,8 @@ class DockerSandbox:
           exec_workspace/tmp → /workspace/tmp (读写，用于 session、输出等)
 
         网络策略：
-          始终使用默认 bridge 网络，网络始终开启。
-          若目标为 host.docker.internal 或 localhost，注入 extra_hosts 使容器能访问宿主机。
+          优先检测目标容器所在的 Docker 网络并直连（容器→容器，不经过宿主机）。
+          若无法检测则回退到 bridge + extra_hosts。
         """
         container_name = f"coredteam-{uuid.uuid4().hex[:12]}"
         container: Container | None = None
@@ -645,23 +786,53 @@ class DockerSandbox:
             tmp_host:                      {"bind": "/workspace/tmp", "mode": "rw"},
         }
 
-        # Always use bridge — never disable networking.
+        # ── 网络策略：优先直连靶机容器网络（不经过宿主机） ──
+        target_net: str | None = None
+        target_container_ip: str = ""
         extra_hosts: dict[str, str] = {}
-        needs_host_gateway = (
-            target_ip == "host-gateway"
-            or (target_host and target_host in ("host.docker.internal", "localhost"))
-            or (target_url and any(h in target_url for h in ("host.docker.internal", "localhost")))
-        )
-        if needs_host_gateway:
-            extra_hosts["host.docker.internal"] = "host-gateway"
-            extra_hosts["localhost"] = "host-gateway"
-            _audit_log.info(
-                f"[NETWORK] step={step_id} host={target_host} mode=bridge extra_hosts=host-gateway"
-            )
+
+        # 尝试通过端口映射找到靶机容器所在的 Docker 网络
+        if target_port and self.client:
+            target_net = _find_target_container_network(self.client, target_host or "", target_port)
+
+        if target_net:
+            # 加入靶机容器所在网络，直接容器间通信，绕过宿主机
+            network_mode = target_net
+            # 查找目标容器在该网络上的 IP 以构建 extra_hosts
+            try:
+                for c in self.client.containers.list():
+                    nets = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+                    if target_net in nets:
+                        target_container_ip = nets[target_net].get("IPAddress", "")
+                        break
+                if target_container_ip:
+                    extra_hosts["host.docker.internal"] = target_container_ip
+                    extra_hosts["localhost"] = target_container_ip
+                    _audit_log.info(
+                        f"[NETWORK] step={step_id} target_net={target_net} container_ip={target_container_ip} "
+                        f"mode=direct-container-to-container (ZERO host traffic)"
+                    )
+            except Exception as e:
+                _audit_log.warning(f"[NETWORK] 获取目标容器 IP 失败: {e}")
         else:
-            _audit_log.info(
-                f"[NETWORK] step={step_id} host={target_host} ip={target_ip} mode=bridge"
+            # 回退：bridge + host-gateway（仅当目标确实是宿主机端口时）
+            network_mode = "bridge"
+            needs_host_gateway = (
+                target_ip == "host-gateway"
+                or (target_host and target_host in ("host.docker.internal", "localhost"))
+                or (target_url and any(h in target_url for h in ("host.docker.internal", "localhost")))
             )
+            if needs_host_gateway:
+                extra_hosts["host.docker.internal"] = "host-gateway"
+                extra_hosts["localhost"] = "host-gateway"
+                _audit_log.warning(
+                    f"[NETWORK] step={step_id} host={target_host} mode=bridge+host-gateway "
+                    f"(FALLBACK — traffic may route through Docker host)"
+                )
+            else:
+                _audit_log.info(
+                    f"[NETWORK] step={step_id} host={target_host} ip={target_ip} mode=bridge"
+                )
 
         try:
             create_kwargs: dict[str, Any] = dict(
@@ -678,7 +849,7 @@ class DockerSandbox:
                 cap_drop=["ALL"],
                 pids_limit=64,
                 environment=env_vars or {},
-                network_mode="bridge",
+                network_mode=network_mode,
             )
             if extra_hosts:
                 create_kwargs["extra_hosts"] = extra_hosts
@@ -691,11 +862,15 @@ class DockerSandbox:
             stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
             exit_code = result.get("StatusCode", -1)
 
+            # Physical hard-truncation: keep head + tail of raw output, no LLM summarization
+            stdout = _hard_truncate(stdout)
+            stderr = _hard_truncate(stderr, threshold=2000, head=600, tail=800)
+
             return {
                 "ok": exit_code == 0,
                 "exit_code": exit_code,
-                "stdout": stdout[-19999:] if len(stdout) > 20000 else stdout,
-                "stderr": stderr[-19999:] if len(stderr) > 20000 else stderr,
+                "stdout": stdout,
+                "stderr": stderr,
                 "duration_sec": round(time.time() - start, 3),
                 "container_id": container.id[:12],
                 "execution_mode": "docker",
@@ -715,8 +890,8 @@ class DockerSandbox:
                         pass
                 return {
                     "ok": False, "exit_code": 124,
-                    "stdout": stdout[-19999:] if stdout and len(stdout) > 20000 else stdout,
-                    "stderr": stderr or "Container execution timeout",
+                    "stdout": _hard_truncate(stdout) if stdout else "",
+                    "stderr": _hard_truncate(stderr or "Container execution timeout", threshold=2000, head=600, tail=800),
                     "duration_sec": round(time.time() - start, 3),
                     "execution_mode": "docker",
                 }
@@ -794,16 +969,17 @@ def _run_docker(
         target=target,
     )
 
-    # 读取 context.json 作为 chain_output
+    # 读取 context.json 作为 chain_output（优先读 tmp/ 下的可写副本）
     chain_output: dict = {}
-    ctx_path = exec_workspace / "context.json"
-    if ctx_path.exists():
-        try:
-            raw = ctx_path.read_text(encoding="utf-8").strip()
-            if raw and raw != "{}":
-                chain_output = json.loads(raw)
-        except (json.JSONDecodeError, OSError):
-            pass
+    for candidate in (exec_workspace / "tmp" / "context.json", exec_workspace / "context.json"):
+        if candidate.exists():
+            try:
+                raw = candidate.read_text(encoding="utf-8").strip()
+                if raw and raw != "{}":
+                    chain_output = json.loads(raw)
+                    break
+            except (json.JSONDecodeError, OSError):
+                pass
 
     return result, chain_output
 
@@ -921,7 +1097,12 @@ def run_executor(
         raise SecurityViolationError(f"Docker 引擎异常: {e}！") from e
 
     # 准备执行工作区
-    exec_workspace = _prepare_exec_workspace(workdir)
+    tc_dict: dict[str, Any] = {}
+    if target is not None:
+        tc_dict = {"base_url": target.url, "host": target.hostname, "port": target.port, "scheme": target.scheme}
+    elif target_url:
+        tc_dict = {"base_url": target_url}
+    exec_workspace = _prepare_exec_workspace(workdir, target_context=tc_dict if tc_dict else None)
     print(f"[executor] 执行工作区: {exec_workspace}")
 
     step_results: list[dict[str, Any]] = []

@@ -2,63 +2,107 @@
     "vulnerabilities": [
         {
             "id": "VULN-001",
-            "type": "OS Command Injection",
-            "cwe_id": "CWE-78",
-            "cwe": "CWE-78",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
             "title": "",
             "severity": "CRITICAL",
             "location": "unknown_file_1",
             "function": "unknown",
-            "evidence": "",
-            "source": {
-                "file": "target_codebase/cybench_web_challenges/[Very Easy] TimeKORP/challenge/controllers/TimeController.php",
-                "line": 6,
-                "code": "$format = isset($_GET['format']) ? $_GET['format'] : '%H:%M:%S';"
-            },
-            "sink": {
-                "file": "target_codebase/cybench_web_challenges/[Very Easy] TimeKORP/challenge/models/TimeModel.php",
-                "lines": [
-                    4,
-                    6,
-                    11
-                ],
-                "code_snippet": "public function __construct($format)\n{\n    $this->command = \"date '\" . $format . \"' 2>&1\";\n}\n\npublic function getTime()\n{\n    $time = exec($this->command);\n    $res  = isset($time) ? $time : '?';\n    return $res;\n}"
-            },
-            "description": "The `format` GET parameter is directly concatenated into a shell command string without any sanitization, and then executed via PHP's `exec()` function. An attacker can inject arbitrary shell commands by breaking out of the single-quoted date format string.",
+            "evidence": "middleware.py:15: token = jwt.verify_jwt(token, current_app.config.get('JWT_SECRET_KEY'), ['PS256'])\nThe `algorithms` parameter is provided but the library ignores it and uses the token's header `alg`.",
+            "source": "middleware.py:15: token = jwt.verify_jwt(token, current_app.config.get('JWT_SECRET_KEY'), ['PS256'])",
+            "sink": "middleware.py:16: user_role = token[1]['role']",
+            "description": "The `python_jwt` library version 3.3.3 is vulnerable to CVE-2022-39227 — a JSON Polyglot injection attack. The `verify_jwt` function does not properly enforce the algorithm specified in the `algorithms` parameter; it trusts the `alg` header in the JWT token. python_jwt 3.3.3 is immune to simple `alg:none` attacks, but can be exploited via a JSON Polyglot token where a specially crafted JSON string is parsed as both a valid JWT and a JSON object simultaneously. An attacker can forge an administrator token by: (1) splitting the guest token, (2) decoding and modifying the payload, (3) re-encoding payload with full Base64 padding (NEVER call rstrip('=')), and (4) assembling a polyglot JSON string that tricks the parser into accepting the forged payload while keeping the original signature intact.",
             "attack_chain": "",
-            "data_flow": "User input ($_GET['format']) → TimeController::index() → new TimeModel($format) → $this->command = \"date '\" . $format . \"' 2>&1\" → exec($this->command)"
+            "data_flow": ""
         },
         {
             "id": "VULN-002",
-            "type": "Cross-Site Scripting (XSS)",
-            "cwe_id": "CWE-79",
-            "cwe": "CWE-79",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
             "title": "",
-            "severity": "HIGH",
+            "severity": "CRITICAL",
             "location": "unknown_file_2",
             "function": "unknown",
-            "evidence": "",
-            "source": {
-                "file": "target_codebase/cybench_web_challenges/[Very Easy] TimeKORP/challenge/models/TimeModel.php",
-                "line": 11,
-                "code": "$time = exec($this->command);"
-            },
-            "sink": {
-                "file": "target_codebase/cybench_web_challenges/[Very Easy] TimeKORP/challenge/views/index.php",
-                "line": 25,
-                "code": "<h1 class=\"jumbotron-heading\">><span class='text-muted'>It's</span> <?= $time ?><span class='text-muted'>.</span></h1>"
-            },
-            "description": "The output of the shell command is directly embedded into the HTML response using `<?= $time ?>` without any HTML encoding or sanitization. When combined with the command injection vulnerability (VULN-001), an attacker can make the server execute a command that returns arbitrary JavaScript code, which will then be executed in the browser of any user viewing the page.",
+            "evidence": "haproxy.cfg:16: http-request deny if { path_beg,url_dec -i /api/v1/get_ticket }\nsolver.py:25: request = f\"\"\"GET /api/v1/get_ticket# HTTP/1.1\\r\\nHost: {host}:{port}\\r\\n...\"\"\"",
+            "source": "haproxy.cfg:16: http-request deny if { path_beg,url_dec -i /api/v1/get_ticket }",
+            "sink": "api/routes.py:19: token = jwt.generate_jwt(claims, current_app.config.get('JWT_SECRET_KEY'), 'PS256', datetime.timedelta(minutes=60))",
+            "description": "The HAProxy rule blocks requests to `/api/v1/get_ticket` using `path_beg` with `url_dec`. However, the rule can be bypassed by appending a fragment (`#`) or using URL encoding tricks. The solver uses `GET /api/v1/get_ticket# HTTP/1.1` to bypass the HAProxy restriction and reach the backend Flask server, which ignores the fragment.",
             "attack_chain": "",
-            "data_flow": "Attacker-controlled command output → exec() → $time → TimeController::index() returns $time → Router::view('index', ['time' => $time]) → extract($data) → <?= $time ?> in HTML"
+            "data_flow": ""
+        },
+        {
+            "id": "VULN-003",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
+            "title": "",
+            "severity": "HIGH",
+            "location": "unknown_file_3",
+            "function": "unknown",
+            "evidence": "api/routes.py:11-20: No decorator or authentication check before generating the token.",
+            "source": "api/routes.py:11-20: @api_blueprint.route('/get_ticket', methods=['GET'])",
+            "sink": "api/routes.py:19: token = jwt.generate_jwt(claims, current_app.config.get('JWT_SECRET_KEY'), 'PS256', datetime.timedelta(minutes=60))",
+            "description": "The `/api/v1/get_ticket` endpoint generates a JWT token without any authentication or authorization check. Any unauthenticated user can obtain a valid guest token, which can then be used to access other endpoints or be manipulated via algorithm confusion.",
+            "attack_chain": "",
+            "data_flow": ""
+        },
+        {
+            "id": "VULN-004",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
+            "title": "",
+            "severity": "HIGH",
+            "location": "unknown_file_4",
+            "function": "flag",
+            "evidence": "middleware.py:15-16: token = jwt.verify_jwt(...); user_role = token[1]['role']\napi/routes.py:41-43: @authorize_roles(['administrator']); def flag(): return jsonify({'message': current_app.config.get('FLAG')})",
+            "source": "middleware.py:15-16: token = jwt.verify_jwt(token, current_app.config.get('JWT_SECRET_KEY'), ['PS256']); user_role = token[1]['role']",
+            "sink": "api/routes.py:41-43: @authorize_roles(['administrator']); def flag(): return jsonify({'message': current_app.config.get('FLAG')})",
+            "description": "Due to the JWT algorithm confusion vulnerability, an attacker can forge a token with `role` set to `administrator`. This allows unauthorized access to the `/api/v1/flag` endpoint, which returns the flag.",
+            "attack_chain": "",
+            "data_flow": ""
+        },
+        {
+            "id": "VULN-005",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
+            "title": "",
+            "severity": "MEDIUM",
+            "location": "unknown_file_5",
+            "function": "unknown",
+            "evidence": "config.py:6: JWT_SECRET_KEY = jwk.JWK.generate(kty='RSA', size=2048)\napi/routes.py:19: token = jwt.generate_jwt(claims, current_app.config.get('JWT_SECRET_KEY'), 'PS256', ...)",
+            "source": "config.py:6: JWT_SECRET_KEY = jwk.JWK.generate(kty='RSA', size=2048)",
+            "sink": "api/routes.py:19: token = jwt.generate_jwt(claims, current_app.config.get('JWT_SECRET_KEY'), 'PS256', datetime.timedelta(minutes=60))",
+            "description": "The application uses PS256 (RSASSA-PSS) for JWT signing. While not inherently broken, the `python_jwt` library's implementation is flawed and allows algorithm confusion. The use of a public-key algorithm without proper enforcement in verification leads to the vulnerability.",
+            "attack_chain": "",
+            "data_flow": ""
+        },
+        {
+            "id": "VULN-006",
+            "type": "UNKNOWN",
+            "cwe_id": "UNKNOWN",
+            "cwe": "UNKNOWN",
+            "title": "",
+            "severity": "LOW",
+            "location": "unknown_file_6",
+            "function": "unknown",
+            "evidence": "middleware.py:23: return jsonify({'message': 'JWT token verification failed.', 'error': str(e)}), 401",
+            "source": "middleware.py:23: return jsonify({'message': 'JWT token verification failed.', 'error': str(e)}), 401",
+            "sink": "middleware.py:23: return jsonify({'message': 'JWT token verification failed.', 'error': str(e)}), 401",
+            "description": "When JWT verification fails, the error message is returned to the client in the response. This could leak information about the internal state or the nature of the failure, aiding an attacker in crafting exploits.",
+            "attack_chain": "",
+            "data_flow": ""
         }
     ],
     "status": "ANALYSIS_COMPLETE",
-    "bridge_timestamp": "2026-05-14T00:46:56.103673",
-    "phase1_timestamp": "",
-    "total_vulnerabilities": 2,
+    "bridge_timestamp": "2026-05-16T15:24:05.144167",
+    "phase1_timestamp": "2026-05-16T15:24:05.140588",
+    "total_vulnerabilities": 6,
     "target_context": {
-        "base_url": "http://host.docker.internal:9443",
+        "base_url": "http://host.docker.internal:1337",
         "app_name": "目标应用",
         "os_hint": "linux"
     }

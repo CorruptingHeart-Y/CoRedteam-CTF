@@ -133,18 +133,36 @@ class TemplateManager:
         self.ensure_loaded()
         vulns = confirmed_vuln.get("vulnerabilities", [])
         cwe_set = {v.get("cwe_id", "") for v in vulns}
-        
+
         matched = []
         for cwe_id in cwe_set:
             matched.extend(self.query_templates(cwe_id=cwe_id))
-        
+
+        # 关键词回退: 当 CWE 为 UNKNOWN 时, 从 vuln 文本匹配模板 tag
+        if len(matched) == 0:
+            text_parts = []
+            for v in vulns:
+                for key in ("title", "description", "evidence", "source", "sink", "attack_chain"):
+                    val = v.get(key, "")
+                    if isinstance(val, str):
+                        text_parts.append(val.lower())
+                    elif isinstance(val, dict):
+                        text_parts.append(str(val.get("code_snippet", "")).lower())
+            vuln_text = " ".join(text_parts)
+            for t in self.templates.values():
+                for tag in t.tags:
+                    normalized = tag.lower().replace("_", " ").replace("-", " ")
+                    if normalized in vuln_text or tag.lower() in vuln_text:
+                        matched.append(t)
+                        break
+
         seen = set()
         unique = []
         for t in matched:
             if t.id not in seen:
                 seen.add(t.id)
                 unique.append(t)
-        
+
         if unique:
             sections = [f"【Attack Templates — {len(unique)} available for CWEs: {', '.join(sorted(cwe_set))}】"]
             for t in unique:

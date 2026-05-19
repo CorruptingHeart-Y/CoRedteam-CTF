@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
+import openai
 from openai import OpenAI
 
 from core.settings import Settings
@@ -48,30 +50,37 @@ class DeepSeekClient:
             system += "\n\n请严格输出合法的 JSON 格式数据。"
             
         max_retries = 3  # 最大重试次数
-        last_exception = None
+        last_exception: Exception | None = None
 
         for attempt in range(max_retries):
             try:
-                resp = self._client.chat.completions.create(
+                kwargs: dict[str, Any] = dict(
                     model=self._settings.deepseek_model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
-                    # 每次重试稍微增加一点温度（随机性），防止它钻牛角尖每次都犯同样的语法错误
-                    temperature=0.2 + (attempt * 0.1), 
+                    temperature=0.2 + (attempt * 0.1),
                     max_tokens=8192,
-                    response_format={"type": "json_object"}
+                    timeout=120.0,
                 )
+                if self._settings.json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                resp = self._client.chat.completions.create(**kwargs)
                 content = resp.choices[0].message.content or ""
                 return _extract_json_object(content)
-                
+
             except (json.JSONDecodeError, ValueError) as e:
                 last_exception = e
-                print(f"\n[llm] ⚠️ 触发自动重试 (JSON 嵌套解析失败): {e} (尝试 {attempt + 1}/{max_retries})")
-                # 捕获异常继续下一次循环
-                continue
-                
+                print(f"\n[llm] 触发自动重试 (JSON 解析失败): {e} (尝试 {attempt + 1}/{max_retries})")
+
+            except (openai.APITimeoutError, openai.APIConnectionError,
+                    openai.RateLimitError, openai.InternalServerError) as e:
+                last_exception = e
+                wait = 2 ** attempt  # 指数退避: 1s, 2s, 4s
+                print(f"\n[llm] API 网络层错误，{wait}s 后重试 (尝试 {attempt + 1}/{max_retries}): {e}")
+                time.sleep(wait)
+
         # 如果 3 次全部失败，再抛出异常
-        print(f"\n[llm] 🚨 连续 {max_retries} 次 JSON 解析失败，大模型可能陷入了格式死锁。")
+        print(f"\n[llm] 连续 {max_retries} 次失败，LLM 调用彻底不可用。")
         raise last_exception

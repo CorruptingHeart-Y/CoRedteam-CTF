@@ -57,19 +57,13 @@ def _load_confirmed(path: Path) -> dict[str, Any]:
         )
 
     if not target.exists():
-        fallback = _ROOT / "data" / "confirmed_vuln.json"
-        if fallback.exists():
-            print(f"[coordinator] 主路径不存在，回退到: {fallback}")
-            target = fallback
-        else:
-            data_dir = _ROOT / "data"
-            available = _list_json_files(data_dir)
-            raise FileNotFoundError(
-                "缺少输入文件。\n"
-                f"当前尝试路径: {path}\n"
-                f"回退路径: {fallback} 也不存在\n"
-                f"data 目录可用 JSON 文件: {available if available else '无'}"
-            )
+        data_dir = _ROOT / "data"
+        available = _list_json_files(data_dir)
+        raise FileNotFoundError(
+            "[!] 找不到漏洞报告，请先运行 Phase 1（python cli.py audit）\n"
+            f"当前尝试路径: {path}\n"
+            f"data 目录可用 JSON 文件: {available if available else '无'}"
+        )
 
     confirmed = json.loads(target.read_text(encoding="utf-8"))
 
@@ -329,12 +323,30 @@ def _build_breaker_memory_context(
 
     # ── 技术操作层 ────────────────────────────────
     try:
-        tech = memory.query_tech(query, n_results=3)
+        tech = memory.query_tech_payloads(query, n_results=8)
         if tech:
-            parts.append("\n【�� 长期记忆 — 可复用技术操作】：")
+            parts.append("\n【长期记忆 — 可复用 Payload / 命令 / 脚本】：")
+            _payload_seen_coord: set[str] = set()
             for i, item in enumerate(tech):
-                ttype = item.get("metadata", {}).get("tech_type", "unknown")
-                parts.append(f"  技术{i + 1} [{ttype}]: {item['content']}")
+                payload = item.get("payload") or ""
+                cmd = item.get("command") or ""
+                script = item.get("script") or ""
+                meta = item.get("metadata", {})
+                name = meta.get("name", "") or meta.get("context", "") or ""
+                source = meta.get("source", "")
+                source_tag = f" [来源:{source}]" if source else ""
+
+                if payload and payload not in _payload_seen_coord:
+                    _payload_seen_coord.add(payload)
+                    parts.append(f"  Payload({name}){source_tag}: {payload[:400]}")
+                elif cmd and cmd not in _payload_seen_coord:
+                    _payload_seen_coord.add(cmd)
+                    parts.append(f"  Command{source_tag}: {cmd[:300]}")
+                elif script and script not in _payload_seen_coord:
+                    _payload_seen_coord.add(script)
+                    parts.append(f"  Script({name}):\n{script[:600]}")
+                else:
+                    parts.append(f"  {item['content'][:250]}")
     except Exception:
         pass
 
@@ -511,8 +523,24 @@ def run_pipeline(
     _rotator = _VulnRotator(confirmed)
     _rotator.mark_attempted(_rotator.current_vuln_id())
 
-    for iteration in range(1, settings.max_iterations + 1):
-        render_iteration_header(iteration, settings.max_iterations)
+    # ── 衰减式动态迭代引擎 ────────────────────────────────
+    # 初始预算 5，每次质变里程碑奖励 max(1, 5-milestone_count) 次，
+    # 硬性上限 MAX_HARD_LIMIT（settings.max_iterations_cap，默认 20）。
+    _MAX_HARD_LIMIT   = settings.max_iterations_cap
+    _iter_budget      = settings.max_iterations        # current_budget，动态增长
+    _milestone_count  = 0                              # 累计质变次数（用于衰减）
+    _no_progress_streak = 0                            # 连续无任何进展计数
+    _NO_PROGRESS_ABORT  = 4                            # 连续 N 次无进展则主动放弃
+
+    # ── 滑动窗口上下文（防上下文爆炸）────────────────────
+    # 保留最近 3 轮的完整执行摘要；更早的只保留 summary 一行。
+    _CONTEXT_WINDOW   = 3
+    _iter_history: list[dict[str, Any]] = []           # [{iteration, summary, guidance, ok_count}]
+
+    iteration = 0
+    while iteration < _iter_budget and iteration < _MAX_HARD_LIMIT:
+        iteration += 1
+        render_iteration_header(iteration, _iter_budget)
 
         # ── Planner ────────────────────────────────────────────────────────
         _print_agent_header("planner")
@@ -540,7 +568,7 @@ def run_pipeline(
         # ── Validator ──────────────────────────────────────────────────────
         _print_agent_header("validator")
         stage("Validator", "校验计划安全策略与语法...")
-        v = run_validator(plan_path, validated_path)
+        v = run_validator(plan_path, validated_path, prior_feedback=feedback)
         val = v.get("validation", {})
         warnings = v.get("warnings") or []
         muted(
@@ -616,7 +644,21 @@ def run_pipeline(
                     http_feedback_parts.append(
                         f"• step[{hf['step_id']}] {hf['pattern']} → {hf['fix_hint']}"
                     )
-            print(f"[coordinator] �� 检测到 {len(http_failures)} 个HTTP语义错误")
+            print(f"[coordinator] HTTP semantic errors detected: {len(http_failures)}")
+
+        polyglot_errors = []
+        for r in step_results:
+            rr = r.get("result") or {}
+            stdout_all = (rr.get("stdout") or "") + (rr.get("stderr") or "")
+            step_id = r.get("step_id", "?")
+            if "Invalid base64-encoded string" in stdout_all:
+                polyglot_errors.append(f"step[{step_id}]: Base64 decode failure in JWT polyglot. FIX: use string concat, injected key FIRST")
+            elif "Invalid JWS Object" in stdout_all:
+                polyglot_errors.append(f"step[{step_id}]: JWT format rejected. Use VERBATIM template forge function.")
+        if polyglot_errors:
+            err_msg = "; ".join(polyglot_errors)
+            http_feedback_parts.append(f"POLYGLOT: {err_msg}")
+            print(f"[coordinator] POLYGLOT construction errors: {len(polyglot_errors)} detected")
 
         fb = run_evaluator(
             settings=settings,
@@ -630,6 +672,53 @@ def run_pipeline(
         )
         feedback = fb
         render_evaluator_feedback(fb)
+
+        # ── AI 主动熔断（suggest_abort）────────────────────────────────────
+        if fb.get("suggest_abort"):
+            fail("[coordinator] AI 判断已无利用可能，主动终止迭代。")
+            break
+
+        # ── 滑动窗口：记录本轮摘要，裁剪旧历史 ──────────────────────────
+        cur_ok_count = sum(
+            1 for r in step_results if (r.get("result") or {}).get("ok")
+        )
+        _iter_history.append({
+            "iteration":  iteration,
+            "summary":    fb.get("summary", ""),
+            "guidance":   (fb.get("analysis") or {}).get("guidance", ""),
+            "ok_count":   cur_ok_count,
+            "confidence": float(fb.get("confidence") or 0.0),
+        })
+        # 将滑动窗口摘要注入 feedback，供 Planner 参考（替代原始 stdout 堆积）
+        if len(_iter_history) > _CONTEXT_WINDOW:
+            old_entries = _iter_history[:-_CONTEXT_WINDOW]
+            collapsed = "\n".join(
+                f"  [iter{e['iteration']}] {e['summary']}"
+                for e in old_entries
+            )
+            fb["_collapsed_history"] = collapsed
+            print(f"[coordinator] 📦 上下文折叠：{len(old_entries)} 轮旧历史已压缩为摘要")
+
+        # ── 衰减式里程碑奖励（Decaying Extension）────────────────────────
+        if fb.get("is_milestone"):
+            _milestone_count += 1
+            extension = max(1, 5 - _milestone_count)
+            old_budget = _iter_budget
+            _iter_budget = min(_iter_budget + extension, _MAX_HARD_LIMIT)
+            _no_progress_streak = 0
+            stage(
+                "CLI",
+                f"质变里程碑 #{_milestone_count}！奖励 +{extension} 次迭代。"
+                f"预算 {old_budget}→{_iter_budget}（上限 {_MAX_HARD_LIMIT}）",
+            )
+        else:
+            _no_progress_streak += 1
+            print(f"[coordinator] ⏳ 无质变进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
+
+        # ── 连续无进展主动放弃 ────────────────────────────────────────────
+        if _no_progress_streak >= _NO_PROGRESS_ABORT:
+            fail(f"[coordinator] 连续 {_NO_PROGRESS_ABORT} 轮无质变进展，主动终止迭代。")
+            break
 
         # ── 熔断器逻辑（论文 §3.3 Long-Term Memory & 纠偏机制）────────────
         if fb.get("repro_success"):
@@ -784,7 +873,7 @@ def run_pipeline(
             if conf >= 0.65:
                 failures = _count_execution_failures(exec_out)
                 has_failures = any(v for v in failures.values())
-                if has_failures and not _retry_iteration_done and iteration < settings.max_iterations:
+                if has_failures and not _retry_iteration_done and iteration < _iter_budget:
                     _retry_iteration_done = True
                     warn(
                         f"置信度达标但存在失败步骤: "
@@ -813,10 +902,27 @@ def run_pipeline(
 
         if fb.get("should_continue") is False:
             warn("评估建议终止迭代。")
-            return 2
+            break
 
-    # ── 迭代上限退出（论文 §3.3 Max Iterations）──────────────────────────
-    warn(f"已达最大迭代次数 {settings.max_iterations}，安全退出。")
+    # ── 迭代循环结束 — 唤醒全局复盘导师 ───────────────────────────
+    final_is_success = len(success_log) > 0
+    final_max_iter = iteration >= _iter_budget or iteration >= _MAX_HARD_LIMIT
+
+    print("\n[Consolidator] 🏁 迭代任务结束，正在唤醒高级复盘导师进行全局经验提炼...")
+    try:
+        from agents.consolidator import run_global_consolidation
+        run_global_consolidation(
+            workdir=ws,
+            max_iter_reached=final_max_iter,
+            is_success=final_is_success,
+        )
+        print("[Consolidator] ✅ 全局经验已成功提炼并写入永久记忆库 (patterns.json / tech.json)。")
+    except Exception as e:
+        print(f"[Consolidator] ⚠️ 复盘过程发生异常，但不影响本次任务结果: {e}")
+
+    # ── 退出状态处理 ────────────────────────────────────────
+    if final_max_iter:
+        warn(f"已达迭代上限（budget={_iter_budget}, hard_limit={_MAX_HARD_LIMIT}），安全退出。")
     _cleanup_sandbox_workspace(ws)
 
     if success_log:

