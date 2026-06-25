@@ -54,39 +54,62 @@ def _list_json_files(folder: Path) -> list[str]:
     return sorted([p.name for p in folder.glob("*.json") if p.is_file()])
 
 
-def _classify_observation(exec_out, fb):
+def _signal_observer_has_evidence(stdout_text: str, evaluator_primitives: list, expected_signals: list) -> bool:
+    """Check if any expected signal is confirmed in execution output or evaluator detection."""
+    if not expected_signals:
+        return False
+    stdout_lower = stdout_text.lower()
+    detected_set = {p.lower() for p in (evaluator_primitives or [])}
+    for sig in expected_signals:
+        sig_lower = sig.lower().replace("_", " ")
+        if sig_lower in stdout_lower or sig in detected_set:
+            return True
+    # legacy positive-evidence keywords as fallback
+    for kw in ("49", "uid=", "root:", "flag{", "command output"):
+        if kw in stdout_lower:
+            return True
+    return False
+
+
+def _classify_observation(exec_out, fb, expected_signals=None):
     """Return (request_sent, observation_status, failure_class).
 
+    Uses the selected route's expected_signals contract to distinguish
+    observation_unknown from no_positive_evidence.
+
     Categories:
-      A. request_not_sent       → no strategy/surface update
-      B. observation_unknown    → diagnostic only, no surface decay
-      C. positive_evidence      → strategy success
-      D. no_positive_evidence   → strategy failure, surface candidate
+      A. request_not_sent       → no update
+      B. observation_unknown    → no observer, or evidence insufficient
+      C. positive_evidence      → signal confirmed
+      D. no_positive_evidence   → signal observer available, signal absent
     """
+    expected_signals = list(expected_signals or [])
     step_results = exec_out.get("step_results") or []
     if not step_results:
         return False, "request_not_sent", None
     sent = False
+    all_stdout = ""
     for r in step_results:
         http_resps = r.get("http_responses") or []
         if http_resps:
             sent = True
         rr = r.get("result") or {}
-        stdout = str(rr.get("_stdout") or rr.get("stdout") or "")
-        if any(kw in stdout.lower() for kw in ("49", "uid=", "root:", "flag{", "command output")):
-            return True, "positive_evidence", None
+        all_stdout += str(rr.get("_stdout") or rr.get("stdout") or "") + " "
     if not sent:
         return False, "request_not_sent", None
-    # sent but no known signal
-    summary = str(fb.get("summary") or "").lower()
-    if "no reflection" in summary or "未触发" in summary or "payload 未" in summary:
-        return True, "no_positive_evidence", "expected_signal_missing"
+
+    detected = fb.get("detected_primitives") or []
+    has_evidence = _signal_observer_has_evidence(all_stdout, detected, expected_signals)
+    if has_evidence:
+        return True, "positive_evidence", None
     if fb.get("repro_success"):
         return True, "positive_evidence", None
-    detected = fb.get("detected_primitives") or []
-    if detected:
-        return True, "positive_evidence", None
-    return True, "no_positive_evidence", "no_reflection"
+
+    if expected_signals:
+        # observer available, signal absent → no_positive_evidence
+        return True, "no_positive_evidence", "expected_signal_missing"
+    # no expected_signals defined → cannot classify as failure
+    return True, "observation_unknown", None
 
 
 def _compute_decision_fingerprint(exec_out, fb, selected_sid):
@@ -115,12 +138,16 @@ def _record_strategy_attempt_if_executed(
     exec_out: dict[str, Any],
     feedback: dict[str, Any],
     round_number: int = 0,
+    expected_signals: list | None = None,
 ) -> None:
     if not selected_canonical_strategy_id or not should_record_strategy_attempt(exec_out):
         return
-    sent, obs, fail_cls = _classify_observation(exec_out, feedback)
+    sent, obs, fail_cls = _classify_observation(exec_out, feedback, expected_signals=expected_signals)
     if obs == "request_not_sent":
         print(f"[coordinator] strategy attempt not recorded: request_not_sent for {selected_canonical_strategy_id}")
+        return
+    if obs == "observation_unknown":
+        print(f"[coordinator] observation_unknown for {selected_canonical_strategy_id}: no evidence, no strategy update")
         return
     success = bool(feedback.get("repro_success")) or obs == "positive_evidence"
     failure_stage = "" if success else str(feedback.get("error_fingerprint") or "runtime_failure")
@@ -977,12 +1004,17 @@ def run_pipeline(
             adapter=adapter,
         )
         feedback = fb
+        _expected_signals = (
+            template_selection.strategy_descriptors.get(selected_canonical_strategy_id, {})
+            .get("expected_signals", []) if hasattr(template_selection, 'strategy_descriptors') else []
+        )
         _record_strategy_attempt_if_executed(
             _hypothesis_tracker,
             selected_canonical_strategy_id,
             exec_out,
             fb,
             round_number=iteration,
+            expected_signals=_expected_signals,
         )
         render_evaluator_feedback(fb)
 

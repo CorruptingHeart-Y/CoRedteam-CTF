@@ -33,6 +33,7 @@ class TemplateSelectionResult:
     fallback_strategy_ids: list[str] = field(default_factory=list)
     blocked_strategy_ids: list[str] = field(default_factory=list)
     why_not_selected: dict[str, str] = field(default_factory=dict)
+    strategy_descriptors: dict[str, dict[str, Any]] = field(default_factory=dict)
     strategy_health: dict[str, dict[str, Any]] = field(default_factory=dict)
     degraded_strategy_ids: list[str] = field(default_factory=list)
     hard_rejected_strategy_ids: list[str] = field(default_factory=list)
@@ -419,6 +420,21 @@ class TemplateManager:
         for sid in blocked_strategy_ids:
             why_not_selected[sid] = "rejected_or_hard_rejected"
 
+        # ── Strategy descriptors: preserve family→route mapping ──
+        strategy_descriptors: dict[str, dict[str, Any]] = {}
+        for t in unique:
+            for sid in t.strategy_ids:
+                strategy_descriptors[sid] = {
+                    "family_id": t.id,
+                    "template_id": t.id,
+                    "stage": t.strategy_stage.get(sid, ""),
+                    "activation_state": t.strategy_activation.get(sid, ""),
+                    "requires_signals": t.strategy_requires_signals.get(sid, []),
+                    "expected_signals": t.strategy_expected_signals.get(sid, []),
+                    "max_attempts": t.strategy_max_attempts.get(sid, 1),
+                    "timeout_seconds": t.strategy_timeout.get(sid, 30),
+                }
+
         if unique:
             print("[template_manager] === strategy selection report ===")
             print(f"[template_manager]   matched templates: {len(unique)}")
@@ -448,6 +464,7 @@ class TemplateManager:
                 fallback_strategy_ids=fallback_strategy_ids,
                 blocked_strategy_ids=blocked_strategy_ids,
                 why_not_selected=why_not_selected,
+                strategy_descriptors=strategy_descriptors,
                 rejected_strategy_ids=rejected_for_surface,
                 strategy_health=strategy_health,
                 degraded_strategy_ids=degraded_strategy_ids,
@@ -471,6 +488,7 @@ class TemplateManager:
                 fallback_strategy_ids=[],
                 blocked_strategy_ids=blocked_strategy_ids,
                 why_not_selected=why_not_selected,
+                strategy_descriptors=strategy_descriptors,
                 rejected_strategy_ids=rejected_for_surface,
                 strategy_health=strategy_health,
                 degraded_strategy_ids=degraded_strategy_ids,
@@ -489,6 +507,7 @@ class TemplateManager:
             matched_template_count=len(unique),
             matched_strategy_ids=matched_strategy_ids,
             available_strategy_ids=available_strategy_ids,
+            strategy_descriptors=strategy_descriptors,
             rejected_strategy_ids=rejected_for_surface,
                 strategy_health=strategy_health,
                 degraded_strategy_ids=degraded_strategy_ids,

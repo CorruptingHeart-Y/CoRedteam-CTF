@@ -22,6 +22,7 @@ from agents.planner import run_planner
 from agents.validator import run_validator, validate_plan
 from control.hypothesis_tracker import HypothesisTracker, get_hypothesis_tracker, reset_hypothesis_tracker
 from coordinator import (
+    _classify_observation,
     _record_strategy_attempt_if_executed,
     evaluate_pre_execution_gate,
     get_hypothesis_tracker as coordinator_get_hypothesis_tracker,
@@ -320,12 +321,13 @@ class StrategyIdentityClosedLoopTests(unittest.TestCase):
         self.assertTrue(validated["validation"]["passed"], validated["validation"].get("errors"))
         self.assertEqual(evaluate_pre_execution_gate(plan, trusted, tracker), [])
 
-        exec_out = {"executed": True, "step_results": [{"step_id": "s1", "result": {"ok": False}}]}
+        exec_out = {"executed": True, "step_results": [{"step_id": "s1", "result": {"ok": False}, "http_responses": [{"status_code": 200, "url": "/"}]}]}
         _record_strategy_attempt_if_executed(
             tracker,
             "strategy*allowed",
             exec_out,
             {"repro_success": False, "error_fingerprint": "runtime_failure", "summary": "failed"},
+            expected_signals=["arithmetic_reflection_confirmed"],
         )
         self.assertEqual(tracker.evaluate_strategy_health("strategy*allowed").attempts, 1)
         self.assertEqual(tracker.evaluate_strategy_health("observed*runtime_failure").attempts, 0)
@@ -599,6 +601,13 @@ class DryRunTests(unittest.TestCase):
             fallback_strategy_ids=[],
             blocked_strategy_ids=[],
             why_not_selected={},
+            strategy_descriptors={
+                sid: {"family_id": "test-family", "template_id": "test-family",
+                      "stage": "discovery", "activation_state": "active",
+                      "requires_signals": [], "expected_signals": ["arithmetic_reflection_confirmed"],
+                      "max_attempts": 2, "timeout_seconds": 15}
+                for sid in canonical_ids
+            },
             rejected_strategy_ids=[],
             strategy_health={},
             degraded_strategy_ids=[],
@@ -838,6 +847,47 @@ class SchemaTests(unittest.TestCase):
             for k in ("CO_REDTEAM_DRY_RUN", "CO_REDTEAM_MOCK_LLM", "CO_REDTEAM_MAX_ITER",
                        "CO_REDTEAM_MAX_RUNS", "CONSOLIDATOR_AUTO_EVOLVE_YAML"):
                 os.environ.pop(k, None)
+
+
+class ObservationClassificationTests(unittest.TestCase):
+    def test_validator_reject_is_request_not_sent(self):
+        exec_out = {"executed": False, "step_results": []}
+        fb = {}
+        sent, obs, fail = _classify_observation(exec_out, fb)
+        self.assertFalse(sent)
+        self.assertEqual(obs, "request_not_sent")
+
+    def test_http_ok_no_signal_with_observer_is_no_positive_evidence(self):
+        exec_out = {"executed": True, "step_results": [
+            {"http_responses": [{"status_code": 200, "url": "/"}],
+             "result": {"ok": True, "_stdout": "<!doctype html><form method=post>..."}}
+        ]}
+        fb = {"summary": "no reflection detected", "detected_primitives": []}
+        sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=["arithmetic_reflection_confirmed"])
+        self.assertTrue(sent)
+        self.assertEqual(obs, "no_positive_evidence")
+        self.assertEqual(fail, "expected_signal_missing")
+
+    def test_http_ok_no_observer_is_observation_unknown(self):
+        exec_out = {"executed": True, "step_results": [
+            {"http_responses": [{"status_code": 200, "url": "/"}],
+             "result": {"ok": True, "_stdout": "<!doctype html>..."}}
+        ]}
+        fb = {"summary": "", "detected_primitives": []}
+        sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=[])
+        self.assertTrue(sent)
+        self.assertEqual(obs, "observation_unknown")
+        self.assertIsNone(fail)
+
+    def test_http_ok_with_expected_signal_is_positive_evidence(self):
+        exec_out = {"executed": True, "step_results": [
+            {"http_responses": [{"status_code": 200, "url": "/"}],
+             "result": {"ok": True, "_stdout": "49"}}
+        ]}
+        fb = {"summary": "", "detected_primitives": []}
+        sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=["arithmetic_reflection_confirmed"])
+        self.assertTrue(sent)
+        self.assertEqual(obs, "positive_evidence")
 
 
 if __name__ == "__main__":
