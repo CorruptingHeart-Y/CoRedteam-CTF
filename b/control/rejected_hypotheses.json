@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-25T16:39:21.261673+00:00",
+  "updated_at": "2026-06-25T16:42:49.118531+00:00",
   "hypotheses": {
     "crlf*memcached*pickle_rce": {
       "fingerprint": "crlf*memcached*pickle_rce",
@@ -258,20 +258,20 @@
     },
     "unit:http:rejected": {
       "fingerprint": "unit:http:rejected",
-      "attempts": 121,
+      "attempts": 132,
       "successes": 0,
       "failure_stages": {
-        "exec": 121
+        "exec": 132
       },
       "last_evidence": [],
       "first_seen": "2026-06-25T14:23:37.175199+00:00",
-      "last_seen": "2026-06-25T16:39:21.261673+00:00",
+      "last_seen": "2026-06-25T16:42:49.118531+00:00",
       "rejected": true,
       "rejected_at": "2026-06-25T14:23:37.179075+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: exec (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
       "migration_version": 0,
-      "consecutive_failures": 55,
+      "consecutive_failures": 66,
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
@@ -305,26 +305,29 @@
     },
     "cwe-1336:discovery:set-calc-probe": {
       "fingerprint": "cwe-1336:discovery:set-calc-probe",
-      "attempts": 1,
+      "attempts": 2,
       "successes": 0,
       "failure_stages": {
-        "NoError": 1
+        "NoError": 2
       },
       "last_evidence": [
-        "[FAILED] SSTI探测未触发，payload未在响应中回显，需改用POST方式提交。"
+        "[FAILED] SSTI探测未触发，payload未在响应中回显，需改用POST方式提交。",
+        "[FAILED] 未检测到 SSTI 回显，payload 可能因请求方法错误未被处理。"
       ],
       "first_seen": "2026-06-25T15:44:01.574975+00:00",
-      "last_seen": "2026-06-25T15:44:01.574975+00:00",
+      "last_seen": "2026-06-25T16:42:35.514159+00:00",
       "rejected": false,
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
       "migration_version": 0,
-      "consecutive_failures": 0,
-      "failure_classes": {},
-      "last_attempt_round": null,
+      "consecutive_failures": 1,
+      "failure_classes": {
+        "expected_signal_missing": 1
+      },
+      "last_attempt_round": 1,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": "no_positive_evidence"
     }
   }
 }

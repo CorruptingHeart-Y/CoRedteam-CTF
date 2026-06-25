@@ -850,6 +850,16 @@ class SchemaTests(unittest.TestCase):
 
 
 class ObservationClassificationTests(unittest.TestCase):
+    def setUp(self):
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.id())
+        self.tmpdir = Path("strategy_identity_test_workspace") / safe_name
+        if self.tmpdir.exists():
+            shutil.rmtree(self.tmpdir)
+        self.tmpdir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
     def test_validator_reject_is_request_not_sent(self):
         exec_out = {"executed": False, "step_results": []}
         fb = {}
@@ -882,12 +892,55 @@ class ObservationClassificationTests(unittest.TestCase):
     def test_http_ok_with_expected_signal_is_positive_evidence(self):
         exec_out = {"executed": True, "step_results": [
             {"http_responses": [{"status_code": 200, "url": "/"}],
-             "result": {"ok": True, "_stdout": "49"}}
+             "result": {"ok": True, "_stdout": "arithmetic reflection confirmed"}}
         ]}
         fb = {"summary": "", "detected_primitives": []}
         sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=["arithmetic_reflection_confirmed"])
         self.assertTrue(sent)
         self.assertEqual(obs, "positive_evidence")
+
+    def test_no_observer_with_summary_no_reflection_is_observation_unknown(self):
+        """expected_signals=[] + summary='no reflection' → observation_unknown, NOT no_positive_evidence"""
+        exec_out = {"executed": True, "step_results": [
+            {"http_responses": [{"status_code": 200, "url": "/"}],
+             "result": {"ok": True, "_stdout": "<!doctype html>..."}}
+        ]}
+        fb = {"summary": "no reflection detected in response", "detected_primitives": []}
+        sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=[])
+        self.assertTrue(sent)
+        self.assertEqual(obs, "observation_unknown")
+
+    def test_plain_49_does_not_bypass_observer(self):
+        """Plain '49' in stdout without observer contract → observation_unknown, NOT positive"""
+        exec_out = {"executed": True, "step_results": [
+            {"http_responses": [{"status_code": 200, "url": "/"}],
+             "result": {"ok": True, "_stdout": "some random 49 in page"}}
+        ]}
+        fb = {"summary": "", "detected_primitives": []}
+        sent, obs, fail = _classify_observation(exec_out, fb, expected_signals=[])
+        self.assertTrue(sent)
+        self.assertEqual(obs, "observation_unknown")
+
+    def test_canonical_strategy_id_collision_detected(self):
+        """Two templates with same canonical_strategy_id → ValueError on load."""
+        tmpl_dir = self.tmpdir / "collision_templates"
+        tmpl_dir.mkdir(parents=True, exist_ok=True)
+        # Write two YAMLs with colliding canonical_strategy_id
+        for name in ("a", "b"):
+            (tmpl_dir / f"cwe-test-{name}.yaml").write_text(json.dumps({
+                "metadata": {"id": f"cwe-test-{name}", "name": f"test-{name}",
+                             "cwe_ids": ["CWE-TEST"], "tags": ["test"], "severity": "low"},
+                "content": f"test template {name}",
+                "payload_templates": [{"canonical_strategy_id": "collision:id:duplicate",
+                                        "stage": "discovery", "activation_state": "active"}],
+            }), encoding="utf-8")
+        from core.template_manager import TemplateManager
+        try:
+            mgr = TemplateManager(tmpl_dir)
+            mgr.ensure_loaded()
+            self.fail("Expected ValueError for collision")
+        except ValueError as e:
+            self.assertIn("collision", str(e))
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ def build_trusted_selection(
             set(template_selection.get("rejected_strategy_ids") or [])
         ),
         "strategy_health": template_selection.get("strategy_health") or {},
+        "strategy_descriptors": template_selection.get("strategy_descriptors") or {},
         "template_health": template_selection.get("template_health") or {},
         "migration_report": template_selection.get("migration_report") or [],
         "non_executable_templates": template_selection.get("non_executable_templates") or [],

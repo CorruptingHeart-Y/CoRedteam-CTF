@@ -201,6 +201,17 @@ class TemplateManager:
             except Exception as e:
                 print(f"[template_manager] Failed to load {json_file}: {e}")
         
+        # ── Collision check: canonical_strategy_id must be globally unique ──
+        _global_ids: dict[str, str] = {}
+        for tid, t in self.templates.items():
+            for sid in t.strategy_ids:
+                if sid in _global_ids:
+                    raise ValueError(
+                        f"[template_manager] canonical_strategy_id collision: "
+                        f"'{sid}' in both '{_global_ids[sid]}' and '{tid}'"
+                    )
+                _global_ids[sid] = tid
+
         self._loaded = True
         print(f"[template_manager] Loaded {count} templates from {self.templates_dir}")
         return count

@@ -54,8 +54,13 @@ def _list_json_files(folder: Path) -> list[str]:
     return sorted([p.name for p in folder.glob("*.json") if p.is_file()])
 
 
-def _signal_observer_has_evidence(stdout_text: str, evaluator_primitives: list, expected_signals: list) -> bool:
-    """Check if any expected signal is confirmed in execution output or evaluator detection."""
+def _signal_observer_available(expected_signals: list) -> bool:
+    """True only if this route has explicit expected_signals that can be checked."""
+    return bool(expected_signals)
+
+
+def _signal_observer_confirm(expected_signals: list, stdout_text: str, evaluator_primitives: list) -> bool:
+    """Check if any expected signal is confirmed. No generic keyword fallback."""
     if not expected_signals:
         return False
     stdout_lower = stdout_text.lower()
@@ -64,24 +69,18 @@ def _signal_observer_has_evidence(stdout_text: str, evaluator_primitives: list, 
         sig_lower = sig.lower().replace("_", " ")
         if sig_lower in stdout_lower or sig in detected_set:
             return True
-    # legacy positive-evidence keywords as fallback
-    for kw in ("49", "uid=", "root:", "flag{", "command output"):
-        if kw in stdout_lower:
-            return True
+    # repro_success flag from evaluator is the only external confirmation
     return False
 
 
 def _classify_observation(exec_out, fb, expected_signals=None):
     """Return (request_sent, observation_status, failure_class).
 
-    Uses the selected route's expected_signals contract to distinguish
-    observation_unknown from no_positive_evidence.
-
-    Categories:
-      A. request_not_sent       → no update
-      B. observation_unknown    → no observer, or evidence insufficient
-      C. positive_evidence      → signal confirmed
-      D. no_positive_evidence   → signal observer available, signal absent
+    Strict ordering:
+      1. request_not_sent
+      2. no observer contract → observation_unknown (never downgrade by summary)
+      3. observer confirms signal → positive_evidence
+      4. observer confirms signal absent → no_positive_evidence
     """
     expected_signals = list(expected_signals or [])
     step_results = exec_out.get("step_results") or []
@@ -98,18 +97,19 @@ def _classify_observation(exec_out, fb, expected_signals=None):
     if not sent:
         return False, "request_not_sent", None
 
+    # ── Step 2: no observer → observation_unknown ──
+    if not _signal_observer_available(expected_signals):
+        return True, "observation_unknown", None
+
+    # ── Step 3: observer confirms signal ──
     detected = fb.get("detected_primitives") or []
-    has_evidence = _signal_observer_has_evidence(all_stdout, detected, expected_signals)
-    if has_evidence:
+    if _signal_observer_confirm(expected_signals, all_stdout, detected):
         return True, "positive_evidence", None
     if fb.get("repro_success"):
         return True, "positive_evidence", None
 
-    if expected_signals:
-        # observer available, signal absent → no_positive_evidence
-        return True, "no_positive_evidence", "expected_signal_missing"
-    # no expected_signals defined → cannot classify as failure
-    return True, "observation_unknown", None
+    # ── Step 4: observer confirms signal absent ──
+    return True, "no_positive_evidence", "expected_signal_missing"
 
 
 def _compute_decision_fingerprint(exec_out, fb, selected_sid):
