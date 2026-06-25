@@ -411,5 +411,36 @@ class StrategyIdentityClosedLoopTests(unittest.TestCase):
         self.assertNotIn("7*7", serialized)
 
 
+    def test_health_does_not_canonicalize_aliases(self):
+        """Exact-key only: an old fingerprint or alias must not read canonical history."""
+        with self._tmp_dir() as tmp:
+            tracker = HypothesisTracker(Path(tmp) / "hyp.json")
+            # record under exact canonical key
+            tracker.record_attempt("ssti:velocity:reflection-rce", success=False, failure_stage="exec")
+            # query with alias / legacy fingerprint — must return no_runtime_history
+            for alias in ("ssti*velocity*exec", "ssti*velocity*reflection_exec", "old-name", ""):
+                health = tracker.evaluate_strategy_health(alias)
+                self.assertEqual(health.reason, "no_runtime_history", f"alias={alias!r} leaked history")
+                self.assertEqual(health.attempts, 0, f"alias={alias!r} leaked attempts")
+            # exact canonical key must still work
+            health = tracker.evaluate_strategy_health("ssti:velocity:reflection-rce")
+            self.assertEqual(health.attempts, 1)
+            self.assertEqual(health.reason, "healthy_or_unproven")
+
+    def test_hard_reject_key_matches_record_attempt_key(self):
+        """record_attempt key must be the same string as evaluate_strategy_health input."""
+        with self._tmp_dir() as tmp:
+            tracker = HypothesisTracker(Path(tmp) / "hyp.json")
+            sid = "exact*canonical*key"
+            with patch("builtins.print"):
+                for _ in range(11):
+                    tracker.record_attempt(sid, success=False, failure_stage="exec")
+            health = tracker.evaluate_strategy_health(sid)
+            self.assertEqual(health.decision, "HARD_REJECT")
+            # same key with different whitespace -> still exact match (strip)
+            health2 = tracker.evaluate_strategy_health(f" {sid} ")
+            self.assertEqual(health2.decision, "HARD_REJECT")
+
+
 if __name__ == "__main__":
     unittest.main()
