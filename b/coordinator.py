@@ -611,6 +611,10 @@ def run_pipeline(
     _hypothesis_tracker = get_hypothesis_tracker()
     _retry_iteration_done = False
 
+    # ── Per-run lifecycle: reset evidence ledger ──
+    from core.evidence_ledger import reset_ledger, load_confirmed_signals
+    reset_ledger(ws, run_id=run_id)
+
     # ── 熔断器状态（论文 §3.3 防死循环机制）──────────────
     _consecutive_failures  = 0
     _BREAKER_THRESHOLD     = 3
@@ -648,6 +652,7 @@ def run_pipeline(
             state=(feedback or {}).get("current_exploit_state", ""),
             rejected_strategy_ids=_hypothesis_tracker.get_rejected_strategy_ids(),
             strategy_health_resolver=lambda sid: _hypothesis_tracker.evaluate_strategy_health(sid).to_dict(),
+            confirmed_signals=load_confirmed_signals(ws),
         )
         trusted_selection = build_trusted_selection(
             run_id=run_id,
@@ -836,6 +841,30 @@ def run_pipeline(
             fb,
         )
         render_evaluator_feedback(fb)
+
+        # ── Evidence Ledger: write confirmed signals from evaluator output ──
+        _primitive_to_signal = {
+            "ssti_reflection": "arithmetic_reflection_confirmed",
+            "template_injection": "template_directive_parsed",
+            "command_execution": "command_execution_confirmed",
+            "arbitrary_file_read": "file_read_confirmed",
+        }
+        _new_signals: list[dict] = []
+        for _prim in (fb.get("detected_primitives") or []):
+            _sig = _primitive_to_signal.get(str(_prim))
+            if _sig and fb.get("primitive_confidence", {}).get(_prim, 0) >= 0.5:
+                _new_signals.append({
+                    "signal_id": _sig,
+                    "run_id": run_id,
+                    "round": iteration,
+                    "source_strategy_id": selected_canonical_strategy_id,
+                    "evidence_reference": f"evaluator detected primitive: {_prim}",
+                    "confidence": float(fb.get("primitive_confidence", {}).get(_prim, 0)),
+                })
+        if _new_signals:
+            from core.evidence_ledger import write_signals
+            write_signals(ws, _new_signals)
+            print(f"[evidence_ledger] {len(_new_signals)} new signals: {[s['signal_id'] for s in _new_signals]}")
 
         # ── AI 主动熔断（suggest_abort）────────────────────────────────────
         if fb.get("suggest_abort"):

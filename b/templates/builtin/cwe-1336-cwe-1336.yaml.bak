@@ -57,19 +57,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v1
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-arithmetic-confirmation
   description: 为 CWE-1336（模板注入）新建 Velocity 专项武器库文件，包含算术确认和反射 RCE 两类 payload 模板，并标记适用场景与白名单模块约束。
   lang: python
@@ -101,18 +88,6 @@ payload_templates:
   tags: []
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:escalation:arithmetic-to-rce
-  stage: escalation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:arithmetic-detection
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  expected_signals:
-  - object_access_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: high
 - name: velocity-java-reflection-rce
   description: 基于Velocity模板注入的Java反射RCE手法，适用于Apache Velocity引擎。通过#set和getClass()链绕过对象引用限制，执行任意系统命令。
   lang: python
@@ -137,19 +112,6 @@ payload_templates:
   tags: []
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflection-rce
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:validation:evaluate-directive
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-ssti-rce-simple
   description: 创建针对 Velocity SSTI 导致远程代码执行的武器化 YAML 模板，包含极简的 Runtime.exec + BufferedReader
     载荷。
@@ -184,19 +146,6 @@ payload_templates:
   tags: []
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:processbuilder-rce
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -230,19 +179,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v2
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -297,19 +233,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v3
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -346,19 +269,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v4
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -394,19 +304,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v5
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: evaluate-directive-rce
   description: 'Alternative Velocity RCE via #evaluate directive — bypasses JVM reflection
     when $class.forName() is blocked. Uses template_internal surface.'
@@ -436,18 +333,6 @@ payload_templates:
   - evaluate
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:validation:evaluate-directive
-  stage: validation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:arithmetic-detection
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  expected_signals:
-  - template_directive_parsed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: medium
 - name: file-read-scanner-nocommand
   description: Velocity file read via Java I/O only (no Runtime.exec) — uses FileInputStream
     + Scanner chain, bypasses command execution restrictions.
@@ -475,19 +360,6 @@ payload_templates:
   - file-read-only
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:fileinputstream-read
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:validation:evaluate-directive
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - file_read_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: string-class-chain-instance
   description: JVM reflection bypass using $s.class (instance) instead of $class (static)
     — alternative entry point when global $class is blocked.
@@ -523,18 +395,6 @@ payload_templates:
   - bypass
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:escalation:string-instance-chain
-  stage: escalation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:arithmetic-detection
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  expected_signals:
-  - object_access_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: high
 - name: macro-recursion-probe
   description: 'Velocity #macro recursion probe — uses template_internal surface to
     explore engine internals and trigger error-based information disclosure.'
@@ -571,16 +431,6 @@ payload_templates:
   - macro
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:discovery:macro-recursion
-  stage: discovery
-  activation_state: draft
-  requires_strategy_ids: []
-  requires_signals: []
-  expected_signals:
-  - template_directive_parsed
-  max_attempts: 2
-  timeout_seconds: 15
-  risk_level: low
 - name: resource-loader-probe
   description: Velocity ResourceLoader probe — uses template engine's own file loading
     mechanism to read local files as templates, bypassing JVM reflection entirely.
@@ -616,18 +466,6 @@ payload_templates:
   - resource-loader
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:escalation:resource-loader
-  stage: escalation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  expected_signals:
-  - file_read_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: high
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -668,19 +506,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v6
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-double-quote-echo-rce
   description: 全新的 Velocity 模板注入漏洞检测与利用模板，强制使用双引号语法，基于空字符串反射获取 Runtime 并实现回显。
   lang: python
@@ -706,19 +531,6 @@ payload_templates:
   tags: []
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:double-quote-echo
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-ssti-rce-backdoor
   description: 新增 Velocity SSTI 利用模板，包含基于反射链的 RCE payload，适用于 text 参数直接注入的场景。
   lang: python
@@ -747,19 +559,6 @@ payload_templates:
   tags: []
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:base64-rce-backdoor
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: seed-warmup-cwe-1336-template
   description: '预热生成的可执行攻击模板: Server-Side Template Injection (SSTI) via Apache Velocity
     leading to Remote Code Execution'
@@ -795,19 +594,6 @@ payload_templates:
   - seed
   source: warmup
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:warmup-v7
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-runtime-exec-with-output
   description: 基于 java.lang.Runtime 和 BufferedReader 的完整命令输出捕获手法，适用于 Apache Velocity
     模板注入，Payload 回显命令执行结果。
@@ -816,19 +602,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:runtime-exec-output
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-post-ssti-multigrammar
   description: 新建 CWE-1336 武器库条目，收录 POST 方法下的 Velocity SSTI 多语法探测 payload，解决 GET 反射无效的通用问题。
   lang: python
@@ -836,18 +609,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:validation:post-multigrammar
-  stage: validation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:basic-probe
-  requires_signals:
-  - template_directive_parsed
-  expected_signals:
-  - template_directive_parsed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: medium
 - name: ssti-detection-arithmetic
   description: '为 Velocity 模板注入漏洞创建基础武器库模板，包含最终探测载荷 #set($x=7*7)$x，用于在利用前确认模板求值存在，避免复杂载荷被盲目发送。'
   lang: python
@@ -855,16 +616,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:discovery:arithmetic-detection
-  stage: discovery
-  activation_state: active
-  requires_strategy_ids: []
-  requires_signals: []
-  expected_signals:
-  - arithmetic_reflection_confirmed
-  max_attempts: 2
-  timeout_seconds: 15
-  risk_level: low
 - name: velocity-reflect-rce-with-oob
   description: 基于 Velocity 反射链的命令执行 payload，配合 HTTP OOB 回传，适用于 CWE-1336 模板注入场景
   lang: python
@@ -872,18 +623,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:post-execution:reflect-oob
-  stage: post_execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:execution:reflection-rce
-  requires_signals:
-  - command_execution_confirmed
-  expected_signals:
-  - oob_callback_received
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-ssti-detection-via-arithmetic
   description: 面向 Velocity 模板引擎的 SSTI 探测与利用 Payload 模板，包含最小化探测表达式 ${7*7} 及基于反射链的 RCE
     骨架，避免未来特工因跳过探测步骤而陷入永久阻塞。
@@ -892,18 +631,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:escalation:arithmetic-to-inspection
-  stage: escalation
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:discovery:arithmetic-detection
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  expected_signals:
-  - object_access_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: high
 - name: velocity-ssti-rce-via-reflection-chain
   description: 基于反射链的 Velocity SSTI RCE Payload，通过 '' 实例获取 ClassLoader 并调用 Runtime.exec，适用于确认注入后的命令执行阶段。
   lang: python
@@ -911,19 +638,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-chain
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:string-instance-chain
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-reflect-runtime-exec
   description: 针对Velocity模板引擎的反射RCE payload，通过Runtime.exec回显命令输出
   lang: python
@@ -931,19 +645,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-exec
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:string-instance-chain
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-detection-set-calc
   description: 基于#set指令的数学运算检测模板注入
   lang: python
@@ -951,16 +652,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:discovery:set-calc-probe
-  stage: discovery
-  activation_state: active
-  requires_strategy_ids: []
-  requires_signals: []
-  expected_signals:
-  - arithmetic_reflection_confirmed
-  max_attempts: 2
-  timeout_seconds: 15
-  risk_level: low
 - name: velocity-rce-reflection-inline
   description: 通过反射Runtime.exec获取命令输出并在模板中直接回显
   lang: python
@@ -968,19 +659,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-inline
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-rce-reflection-oob
   description: 通过反射执行命令并将结果通过HTTP带外传出，适用于无回显场景
   lang: python
@@ -988,18 +666,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:post-execution:reflect-oob-v2
-  stage: post_execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:execution:reflection-rce
-  requires_signals:
-  - command_execution_confirmed
-  expected_signals:
-  - oob_callback_received
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-ssti-basic-probe
   description: '针对 Apache Velocity 模板注入的基本探测 payload，使用 #set 指令测试算术求值，验证模板引擎是否执行用户输入。'
   lang: python
@@ -1007,16 +673,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:discovery:basic-probe
-  stage: discovery
-  activation_state: draft
-  requires_strategy_ids: []
-  requires_signals: []
-  expected_signals:
-  - template_directive_parsed
-  max_attempts: 2
-  timeout_seconds: 15
-  risk_level: low
 - name: velocity-rce-via-reflection
   description: Velocity 模板注入下通过 Java 反射链实现 RCE 的 payload，适用于未启用 SecureUberspector
     的场景。
@@ -1025,19 +681,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-v3
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:string-instance-chain
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-rce-via-reflection-oob
   description: 利用 Velocity 反射链调用 Runtime.exec 并通过 OOB 接收器验证的沙箱安全手法，适用于无回显/过滤严格的场景。
   lang: python
@@ -1045,18 +688,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:post-execution:reflect-oob-v3
-  stage: post_execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:execution:reflect-v3
-  requires_signals:
-  - command_execution_confirmed
-  expected_signals:
-  - oob_callback_received
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-reflection-rce-chain
   description: 基于 Java 反射的 Velocity 模板注入 RCE 载荷，支持直接命令执行和回显检测。
   lang: python
@@ -1064,19 +695,6 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-chain-v2
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical
 - name: velocity-reflection-rce
   description: '基于 Java 反射的 Velocity 模板注入通用 RCE payload，通过 #set 链执行系统命令并回显结果，适配沙箱安全约束下的全
     HTTP 投递策略。'
@@ -1085,16 +703,3 @@ payload_templates:
   tags: []
   source: consolidator
   severity: critical
-  canonical_strategy_id: cwe-1336:execution:reflect-v4
-  stage: execution
-  activation_state: draft
-  requires_strategy_ids:
-  - cwe-1336:escalation:arithmetic-to-rce
-  requires_signals:
-  - arithmetic_reflection_confirmed
-  - object_access_confirmed
-  expected_signals:
-  - command_execution_confirmed
-  max_attempts: 3
-  timeout_seconds: 30
-  risk_level: critical

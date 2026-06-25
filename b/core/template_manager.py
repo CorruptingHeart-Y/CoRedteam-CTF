@@ -69,6 +69,12 @@ class AttackTemplate:
         # Only canonical_strategy_id is executable. strategy_id is accepted as
         # legacy schema; name/metadata.id are migration hints, never identities.
         self.strategy_ids: list[str] = []
+        self.strategy_activation: dict[str, str] = {}        # sid → active|draft|disabled
+        self.strategy_stage: dict[str, str] = {}             # sid → discovery|validation|...
+        self.strategy_requires_signals: dict[str, list[str]] = {}  # sid → [signal_id]
+        self.strategy_expected_signals: dict[str, list[str]] = {}  # sid → [signal_id]
+        self.strategy_max_attempts: dict[str, int] = {}      # sid → int
+        self.strategy_timeout: dict[str, int] = {}           # sid → seconds
         self.migration_report: list[dict[str, Any]] = []
         self.auto_executable = True
         schema_location = metadata.get("_payload_templates_schema_location", "metadata")
@@ -85,14 +91,21 @@ class AttackTemplate:
             for idx, pt in enumerate(_pts):
                 sid = pt.get("canonical_strategy_id") or pt.get("strategy_id")
                 if sid:
-                    self.strategy_ids.append(str(sid))
+                    sid = str(sid)
+                    self.strategy_ids.append(sid)
+                    self.strategy_activation[sid] = str(pt.get("activation_state", "draft"))
+                    self.strategy_stage[sid] = str(pt.get("stage", "discovery"))
+                    self.strategy_requires_signals[sid] = list(pt.get("requires_signals") or [])
+                    self.strategy_expected_signals[sid] = list(pt.get("expected_signals") or [])
+                    self.strategy_max_attempts[sid] = int(pt.get("max_attempts", 0)) or 1
+                    self.strategy_timeout[sid] = int(pt.get("timeout_seconds", 0)) or 30
                     if not pt.get("canonical_strategy_id"):
                         self.migration_report.append({
                             "template_id": self.id,
                             "payload_index": idx,
-                            "legacy_strategy_id": str(sid),
+                            "legacy_strategy_id": sid,
                             "needs_canonical_strategy_id": True,
-                            "auto_executable": True,
+                            "auto_executable": bool(self.strategy_activation.get(sid) == "active"),
                         })
                 else:
                     self.migration_report.append({
@@ -257,10 +270,12 @@ class TemplateManager:
         state: str = "",
         rejected_strategy_ids: set[str] | None = None,
         strategy_health_resolver: Callable[[str], dict[str, Any]] | None = None,
+        confirmed_signals: set[str] | None = None,
     ) -> TemplateSelectionResult:
         """Return matched template text plus structured strategy availability status."""
         self.ensure_loaded()
         rejected_strategy_ids = rejected_strategy_ids or set()
+        confirmed_signals = confirmed_signals or set()
         vulns = confirmed_vuln.get("vulnerabilities", [])
         cwe_set = {v.get("cwe_id", "") for v in vulns}
 
@@ -285,48 +300,43 @@ class TemplateManager:
                         matched.append(t)
                         break
 
-        _LATE_STAGE_KEYWORDS = [
-            "flag", "cat /", "head /", "tail /", "strings /", "base64 /",
-            "type c:", "type d:", "type e:",
-            "fileinputstream", "open('/flag", 'open("/flag', "read('/flag", 'read("/flag',
-            "readfilesync", "fs.readfile", "file_get_contents", "load_file", "pg_read_file",
-            "file://", "php://filter", "../flag", "..\\flag", "passwd", "shadow",
-            "exfiltrat", "file_read", "file-read",
-        ]
         state_order = {"init": 0, "probe_success": 1, "payload_injected": 2,
                        "gadget_triggered": 3, "oob_received": 4}
         current_idx = state_order.get(state, 0)
-        in_late_stage = current_idx >= 3
 
-        stage_filtered: list[AttackTemplate] = []
-        for t in matched:
-            text = (t.name + " " + " ".join(t.tags) + " " + t.content).lower()
-            for pt in t.metadata.get("payload_templates", []):
-                text += " " + (pt.get("name") or "").lower()
-                text += " " + (pt.get("description") or "").lower()
-                text += " " + (pt.get("template") or "").lower()
-            is_late = any(kw in text for kw in _LATE_STAGE_KEYWORDS)
-            if in_late_stage:
-                if is_late:
-                    stage_filtered.append(t)
-            elif not is_late:
-                stage_filtered.append(t)
-
-        print(
-            f"[template_manager] stage filter: {len(matched)} -> {len(stage_filtered)} "
-            f"templates (state={state or 'init'}, late_stage={in_late_stage})"
-        )
+        def _strategy_eligible_for_state(sid: str, t: AttackTemplate) -> bool:
+            """Explicit field filter; no payload text scanning."""
+            if t.strategy_activation.get(sid) != "active":
+                return False
+            stage = t.strategy_stage.get(sid, "discovery")
+            if stage in ("execution", "post_execution"):
+                return False
+            if current_idx == 0:
+                if stage != "discovery":
+                    return False
+            elif current_idx == 1:
+                if stage not in ("discovery", "validation"):
+                    return False
+            elif current_idx == 2:
+                if stage not in ("discovery", "validation", "escalation"):
+                    return False
+            required = set(t.strategy_requires_signals.get(sid, []))
+            if required and not required.issubset(confirmed_signals):
+                return False
+            return True
 
         seen: set[str] = set()
         unique: list[AttackTemplate] = []
-        for t in stage_filtered:
+        for t in matched:
             if t.id not in seen:
                 seen.add(t.id)
                 unique.append(t)
 
+        # Per-strategy stage filter: collect only eligible SIDs
         migration_report = [item for t in unique for item in getattr(t, "migration_report", [])]
         non_executable_templates = [t.id for t in unique if not getattr(t, "auto_executable", True)]
-        matched_strategy_ids = sorted({sid for t in unique for sid in t.strategy_ids if sid})
+        matched_strategy_ids = sorted({sid for t in unique for sid in t.strategy_ids
+                                       if _strategy_eligible_for_state(sid, t)})
         strategy_health: dict[str, dict[str, Any]] = {}
         if strategy_health_resolver is not None:
             for sid in matched_strategy_ids:
@@ -405,7 +415,7 @@ class TemplateManager:
                 print(f"[template_manager]   filtered template [{tid}]: all strategies rejected {rj}")
 
         if available_templates:
-            stage_label = "late (file_read / flag_exfil)" if in_late_stage else "early (probe / RCE establish)"
+            stage_label = "late (file_read / flag_exfil)" if current_idx >= 3 else "early (probe / RCE establish)"
             sections = [
                 f"[Attack Templates - {len(available_templates)} available for CWEs: "
                 f"{', '.join(sorted(cwe_set))} | stage: {stage_label}]"

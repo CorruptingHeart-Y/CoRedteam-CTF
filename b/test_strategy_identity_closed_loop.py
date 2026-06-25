@@ -35,7 +35,7 @@ from core.strategy_identity import (
 from core.template_manager import TemplateManager, TemplateSelectionResult
 
 
-def _write_template(root: Path, template_id: str, strategies: list[dict]) -> None:
+def _write_template(root: Path, template_id: str, strategies: list) -> None:
     payloads = []
     for idx, strategy in enumerate(strategies):
         payload = {
@@ -46,9 +46,16 @@ def _write_template(root: Path, template_id: str, strategies: list[dict]) -> Non
             "tags": ["unit"],
             "source": "unit",
             "severity": "low",
+            "canonical_strategy_id": strategy.get("canonical_strategy_id", ""),
+            "stage": strategy.get("stage", "discovery"),
+            "activation_state": strategy.get("activation_state", "active"),
+            "requires_strategy_ids": strategy.get("requires_strategy_ids", []),
+            "requires_signals": strategy.get("requires_signals", []),
+            "expected_signals": strategy.get("expected_signals", []),
+            "max_attempts": strategy.get("max_attempts", 2),
+            "timeout_seconds": strategy.get("timeout_seconds", 15),
+            "risk_level": strategy.get("risk_level", "low"),
         }
-        if "canonical_strategy_id" in strategy:
-            payload["canonical_strategy_id"] = strategy["canonical_strategy_id"]
         if "strategy_id" in strategy:
             payload["strategy_id"] = strategy["strategy_id"]
         payloads.append(payload)
@@ -676,6 +683,157 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(os.environ.get("CO_REDTEAM_MAX_ITER"), "1")
         self.assertEqual(os.environ.get("CO_REDTEAM_MAX_RUNS"), "1")
         self.assertEqual(os.environ.get("CONSOLIDATOR_AUTO_EVOLVE_YAML"), "0")
+
+
+class SchemaTests(unittest.TestCase):
+    """Tests for explicit YAML schema: stage, activation_state, requires_signals."""
+    def setUp(self):
+        faulthandler.dump_traceback_later(15, repeat=False, exit=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.id())
+        self.tmpdir = Path("strategy_identity_test_workspace") / safe_name
+        if self.tmpdir.exists():
+            shutil.rmtree(self.tmpdir)
+        self.tmpdir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        faulthandler.cancel_dump_traceback_later()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_active_discovery_visible_in_init(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-cwe1336", [
+            {"canonical_strategy_id": "cwe-1336:discovery:probe-a", "stage": "discovery", "activation_state": "active"},
+            {"canonical_strategy_id": "cwe-1336:discovery:probe-b", "stage": "discovery", "activation_state": "active"},
+            {"canonical_strategy_id": "cwe-1336:execution:rce", "stage": "execution", "activation_state": "draft"},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]},
+            state="init", confirmed_signals=set(),
+        )
+        self.assertEqual(set(sel.available_strategy_ids), {"cwe-1336:discovery:probe-a", "cwe-1336:discovery:probe-b"})
+        self.assertNotIn("cwe-1336:execution:rce", sel.available_strategy_ids)
+
+    def test_draft_strategy_excluded_from_init(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-draft", [
+            {"canonical_strategy_id": "cwe-1336:validation:check", "stage": "validation", "activation_state": "draft"},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]}, state="init", confirmed_signals=set(),
+        )
+        self.assertEqual(sel.available_strategy_ids, [])
+
+    def test_requires_signals_not_met_excludes_escalation(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-signal", [
+            {"canonical_strategy_id": "cwe-1336:escalation:next", "stage": "escalation",
+             "activation_state": "active", "requires_signals": ["arithmetic_reflection_confirmed"]},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]}, state="probe_success", confirmed_signals=set(),
+        )
+        self.assertEqual(sel.available_strategy_ids, [])
+
+    def test_signal_present_allows_escalation(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-signal-ok", [
+            {"canonical_strategy_id": "cwe-1336:escalation:next", "stage": "escalation",
+             "activation_state": "active", "requires_signals": ["arithmetic_reflection_confirmed"]},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]}, state="payload_injected",
+            confirmed_signals={"arithmetic_reflection_confirmed"},
+        )
+        self.assertEqual(sel.available_strategy_ids, ["cwe-1336:escalation:next"])
+
+    def test_execution_stage_blocked_even_with_signals_and_active(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-exec-blocked", [
+            {"canonical_strategy_id": "cwe-1336:execution:rce", "stage": "execution",
+             "activation_state": "active", "requires_signals": ["arithmetic_reflection_confirmed"]},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]}, state="gadget_triggered",
+            confirmed_signals={"arithmetic_reflection_confirmed"},
+        )
+        self.assertEqual(sel.available_strategy_ids, [])
+
+    def test_disabled_strategy_never_allowed(self):
+        tmpl = self.tmpdir / "templates"
+        _write_template(tmpl, "test-disabled", [
+            {"canonical_strategy_id": "cwe-1336:discovery:probe", "stage": "discovery", "activation_state": "disabled"},
+        ])
+        sel = TemplateManager(tmpl).select_templates_for_target(
+            {"vulnerabilities": [{"cwe_id": "CWE-1336"}]}, state="init", confirmed_signals=set(),
+        )
+        self.assertEqual(sel.available_strategy_ids, [])
+
+    def test_dry_run_all_gates_pass_with_active_discovery_cwe1336(self):
+        """Full dry-run with CWE-1336 YAML containing active discovery strategies."""
+        os.environ["CO_REDTEAM_DRY_RUN"] = "1"
+        os.environ["CO_REDTEAM_MOCK_LLM"] = "true"
+        os.environ["CO_REDTEAM_MAX_ITER"] = "1"
+        os.environ["CO_REDTEAM_MAX_RUNS"] = "1"
+        os.environ["CONSOLIDATOR_AUTO_EVOLVE_YAML"] = "0"
+        try:
+            ws = self.tmpdir / "ws"
+            ws.mkdir(parents=True, exist_ok=True)
+            tmpl = self.tmpdir / "templates"
+            _write_template(tmpl, "cwe-1336-test", [
+                {"canonical_strategy_id": "cwe-1336:discovery:probe-a", "stage": "discovery", "activation_state": "active"},
+                {"canonical_strategy_id": "cwe-1336:execution:rce", "stage": "execution", "activation_state": "draft"},
+            ])
+            # patch TemplateManager to use test templates
+            mgr = TemplateManager(tmpl)
+            mgr.ensure_loaded()
+            from core.settings import Settings
+            ROOT = Path(__file__).resolve().parent
+            stub = Settings(
+                project_root=ROOT, deepseek_api_key=None, deepseek_base_url="",
+                deepseek_model="stub", mock_llm=True, max_iterations=1, max_iterations_cap=20,
+                workspace_dir=ws, memory_dir=ws, confirmed_vuln_path=ws / "confirmed.json",
+                docker_enabled=False, docker_image="stub", docker_timeout=10,
+                docker_memory_limit="64m", docker_cpu_quota=10000, dry_run=True, json_mode=False,
+            )
+            vuln_path = self.tmpdir / "confirmed.json"
+            vuln_path.write_text(json.dumps({
+                "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+                "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+            }), encoding="utf-8")
+            with patch("core.template_manager.TemplateManager",
+                       return_value=mgr), \
+                 patch("coordinator.get_settings", return_value=stub), \
+                 patch("coordinator.run_executor") as mock_exec, \
+                 patch("coordinator.run_evaluator") as mock_eval, \
+                 patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+                 patch("control.hypothesis_tracker.HypothesisTracker.record_attempt") as mock_rec, \
+                 patch.object(planner, "_build_memory_context", return_value=""), \
+                 patch("core.ui.ok"), patch("core.ui.warn"), patch("core.ui.muted"), \
+                 patch("builtins.print"):
+                from coordinator import run_pipeline
+                from core.target_context import TargetContext
+                result = run_pipeline(
+                    confirmed_path=vuln_path, challenge_name="generic",
+                    target=TargetContext(url="http://127.0.0.1:1", hostname="127.0.0.1",
+                                         ip="127.0.0.1", port=1, scheme="http"),
+                )
+                self.assertEqual(result["status"], "dry_run_complete")
+                fb = json.loads((ws / "feedback.json").read_text(encoding="utf-8"))
+                self.assertTrue(fb["validator_passed"])
+                self.assertTrue(fb["dry_run_gate_passed"])
+                self.assertIn(
+                    fb["selected_canonical_strategy_id"],
+                    ("cwe-1336:discovery:arithmetic-detection", "cwe-1336:discovery:set-calc-probe"),
+                )
+                self.assertFalse((ws / "execution_result.json").exists())
+                mock_exec.assert_not_called()
+                mock_eval.assert_not_called()
+                mock_cons.assert_not_called()
+                mock_rec.assert_not_called()
+        finally:
+            for k in ("CO_REDTEAM_DRY_RUN", "CO_REDTEAM_MOCK_LLM", "CO_REDTEAM_MAX_ITER",
+                       "CO_REDTEAM_MAX_RUNS", "CONSOLIDATOR_AUTO_EVOLVE_YAML"):
+                os.environ.pop(k, None)
 
 
 if __name__ == "__main__":
