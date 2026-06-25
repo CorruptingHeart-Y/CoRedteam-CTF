@@ -71,6 +71,15 @@ class AttackTemplate:
         self.strategy_ids: list[str] = []
         self.migration_report: list[dict[str, Any]] = []
         self.auto_executable = True
+        schema_location = metadata.get("_payload_templates_schema_location", "metadata")
+        if schema_location == "top_level":
+            self.migration_report.append({
+                "template_id": self.id,
+                "schema": "top_level_payload_templates",
+                "recommended_schema": "metadata.payload_templates",
+                "needs_schema_migration": True,
+                "auto_executable": True,
+            })
         _pts = metadata.get("payload_templates")
         if _pts is not None:
             for idx, pt in enumerate(_pts):
@@ -96,7 +105,7 @@ class AttackTemplate:
                     })
             self.auto_executable = bool(self.strategy_ids)
         else:
-            _legacy_sid = metadata.get("strategy_id")
+            _legacy_sid = metadata.get("canonical_strategy_id") or metadata.get("strategy_id")
             if _legacy_sid:
                 self.strategy_ids.append(str(_legacy_sid))
                 self.migration_report.append({
@@ -183,7 +192,12 @@ class TemplateManager:
             data = yaml.safe_load(f)
         if not isinstance(data, dict):
             return None
-        metadata = data.get("metadata", {})
+        metadata = dict(data.get("metadata", {}) or {})
+        if "payload_templates" not in metadata and "payload_templates" in data:
+            metadata["payload_templates"] = data.get("payload_templates") or []
+            metadata["_payload_templates_schema_location"] = "top_level"
+        elif "payload_templates" in metadata:
+            metadata["_payload_templates_schema_location"] = "metadata"
         content = data.get("content", "")
         if not metadata.get("id") or not content:
             return None
@@ -194,7 +208,12 @@ class TemplateManager:
             data = json.load(f)
         if not isinstance(data, dict):
             return None
-        metadata = data.get("metadata", {})
+        metadata = dict(data.get("metadata", {}) or {})
+        if "payload_templates" not in metadata and "payload_templates" in data:
+            metadata["payload_templates"] = data.get("payload_templates") or []
+            metadata["_payload_templates_schema_location"] = "top_level"
+        elif "payload_templates" in metadata:
+            metadata["_payload_templates_schema_location"] = "metadata"
         content = data.get("content", "")
         if not metadata.get("id") or not content:
             return None

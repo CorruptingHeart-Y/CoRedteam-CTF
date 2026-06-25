@@ -15,7 +15,7 @@ from agents.evaluator import run_evaluator
 from agents.executor import run_executor
 from agents.planner import run_planner
 from agents.validator import run_validator
-from control.hypothesis_tracker import HypothesisTracker
+from control.hypothesis_tracker import HypothesisTracker, get_hypothesis_tracker
 from core.challenge_adapter import ChallengeAdapter, get_adapter, list_adapters
 from core.strategy_identity import (
     TRUSTED_SELECTION_FILENAME,
@@ -80,6 +80,24 @@ def _record_strategy_attempt_if_executed(
         failure_stage=failure_stage,
         evidence=evidence,
     )
+
+
+def evaluate_pre_execution_gate(
+    plan: dict[str, Any],
+    trusted_selection: dict[str, Any],
+    tracker: HypothesisTracker,
+) -> list[str]:
+    """Return blocking reasons before Executor/Docker is allowed to start."""
+    trusted_ok, trusted_errors = validate_plan_against_trusted_selection(plan, trusted_selection)
+    pre_gate_errors = list(trusted_errors) if not trusted_ok else []
+    selected_canonical_strategy_id = str(plan.get("selected_canonical_strategy_id") or "").strip()
+    if selected_canonical_strategy_id:
+        health = tracker.evaluate_strategy_health(selected_canonical_strategy_id)
+        if health.decision in ("REJECT", "HARD_REJECT"):
+            pre_gate_errors.append(
+                f"STRATEGY_REJECTED: {selected_canonical_strategy_id} decision={health.decision}"
+            )
+    return pre_gate_errors
 
 
 def _load_confirmed(path: Path) -> dict[str, Any]:
@@ -550,7 +568,7 @@ def run_pipeline(
     last_plan: dict[str, Any] | None = None
     success_log: list[dict[str, Any]] = []
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S%fZ")
-    _hypothesis_tracker = HypothesisTracker()
+    _hypothesis_tracker = get_hypothesis_tracker()
     _retry_iteration_done = False
 
     # ── 熔断器状态（论文 §3.3 防死循环机制）──────────────
@@ -649,14 +667,7 @@ def run_pipeline(
 
         # ── Executor ───────────────────────────────────────────────────────
         selected_canonical_strategy_id = str(last_plan.get("selected_canonical_strategy_id") or "").strip()
-        trusted_ok, trusted_errors = validate_plan_against_trusted_selection(last_plan, trusted_selection)
-        pre_gate_errors = list(trusted_errors) if not trusted_ok else []
-        if selected_canonical_strategy_id:
-            health = _hypothesis_tracker.evaluate_strategy_health(selected_canonical_strategy_id)
-            if health.decision in ("REJECT", "HARD_REJECT"):
-                pre_gate_errors.append(
-                    f"STRATEGY_REJECTED: {selected_canonical_strategy_id} decision={health.decision}"
-                )
+        pre_gate_errors = evaluate_pre_execution_gate(last_plan, trusted_selection, _hypothesis_tracker)
         if pre_gate_errors:
             feedback = {
                 "from": "coordinator_pre_exec_gate",

