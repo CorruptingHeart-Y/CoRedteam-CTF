@@ -160,6 +160,13 @@ def cmd_exploit(args: argparse.Namespace) -> int:
         os.environ["CO_REDTEAM_MAX_ITER"] = str(args.max_iter)
     if getattr(args, "max_runs", None) is not None:
         os.environ["CO_REDTEAM_MAX_RUNS"] = str(args.max_runs)
+    if getattr(args, "dry_run", False):
+        os.environ["CO_REDTEAM_DRY_RUN"] = "1"
+        os.environ["CO_REDTEAM_MOCK_LLM"] = "true"
+        os.environ["CO_REDTEAM_MAX_ITER"] = "1"
+        os.environ["CO_REDTEAM_MAX_RUNS"] = "1"
+        os.environ["CONSOLIDATOR_AUTO_EVOLVE_YAML"] = "0"
+        muted("dry-run: Planner→Validator→gate only. No Executor/Docker/LLM/YAML write.")
 
     try:
         target = lock_target(args.url)
@@ -886,6 +893,8 @@ Examples:
                            help="Max exploit iterations per run (default: 8, overrides CO_REDTEAM_MAX_ITER)")
     p_exploit.add_argument("--max-runs", type=int, default=None, metavar="N",
                            help="Max outer retry runs (default: 5, overrides CO_REDTEAM_MAX_RUNS)")
+    p_exploit.add_argument("--dry-run", action="store_true",
+                           help="Planner->Validator->gate only. Stop before Executor. Forces mock LLM.")
     p_exploit.set_defaults(func=cmd_exploit)
 
     # -- memory --------------------------------------------------------------

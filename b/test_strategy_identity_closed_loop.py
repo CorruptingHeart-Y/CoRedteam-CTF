@@ -442,5 +442,175 @@ class StrategyIdentityClosedLoopTests(unittest.TestCase):
             self.assertEqual(health2.decision, "HARD_REJECT")
 
 
+class DryRunTests(unittest.TestCase):
+    def setUp(self):
+        faulthandler.dump_traceback_later(15, repeat=False, exit=True)
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", self.id())
+        self.tmpdir = Path("strategy_identity_test_workspace") / safe_name
+        if self.tmpdir.exists():
+            shutil.rmtree(self.tmpdir)
+        self.tmpdir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        faulthandler.cancel_dump_traceback_later()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for k in ("CO_REDTEAM_DRY_RUN", "CO_REDTEAM_MOCK_LLM",
+                   "CO_REDTEAM_MAX_ITER", "CO_REDTEAM_MAX_RUNS",
+                   "CONSOLIDATOR_AUTO_EVOLVE_YAML"):
+            os.environ.pop(k, None)
+
+    def _make_dry_run_env(self):
+        for k, v in {
+            "CO_REDTEAM_DRY_RUN": "1",
+            "CO_REDTEAM_MOCK_LLM": "true",
+            "CO_REDTEAM_MAX_ITER": "1",
+            "CO_REDTEAM_MAX_RUNS": "1",
+            "CONSOLIDATOR_AUTO_EVOLVE_YAML": "0",
+        }.items():
+            os.environ[k] = v
+
+    def _make_target(self):
+        from core.target_context import TargetContext
+        return TargetContext(url="http://127.0.0.1:1", hostname="127.0.0.1", ip="127.0.0.1", port=1, scheme="http")
+
+    def test_dry_run_stops_before_executor_all_gates_pass(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        from core.settings import get_settings
+        ws = self.tmpdir / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        with patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.evaluator.run_evaluator") as mock_eval, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch("control.hypothesis_tracker.HypothesisTracker.record_attempt") as mock_rec, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            settings = get_settings()
+            settings = SimpleNamespace(**{k: getattr(settings, k) for k in settings.__dataclass_fields__})
+            from coordinator import run_pipeline as rp
+            result = rp(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            self.assertEqual(result["status"], "dry_run_complete")
+            fb = result["feedback"]
+            self.assertTrue(fb["dry_run"])
+            self.assertFalse(fb["executor_called"])
+            self.assertFalse(fb["attempt_recorded"])
+            mock_exec.assert_not_called()
+            mock_eval.assert_not_called()
+            mock_cons.assert_not_called()
+            mock_rec.assert_not_called()
+
+    def test_dry_run_produces_feedback_on_validator_failure(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-999999", "title": "no-match", "severity": "low"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        with patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch("control.hypothesis_tracker.HypothesisTracker.record_attempt") as mock_rec, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            result = run_pipeline(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            self.assertEqual(result["status"], "dry_run_complete")
+            fb = result["feedback"]
+            self.assertFalse(fb["validator_passed"])
+            self.assertFalse(fb["dry_run_gate_passed"])
+            self.assertFalse(fb["executor_called"])
+            self.assertTrue(any("VALIDATOR_REJECTED" in e for e in fb["pre_gate_errors"]))
+            mock_exec.assert_not_called()
+            mock_cons.assert_not_called()
+            mock_rec.assert_not_called()
+
+    def test_dry_run_no_execution_result_json(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        ws = self.tmpdir / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        exec_json = ws / "execution_result.json"
+        with patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            run_pipeline(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            self.assertFalse(exec_json.exists())
+            mock_exec.assert_not_called()
+            mock_cons.assert_not_called()
+
+    def test_dry_run_feedback_json_always_written(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        from core.settings import get_settings
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        with patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            result = run_pipeline(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            self.assertEqual(result["status"], "dry_run_complete")
+            fb = result["feedback"]
+            self.assertIn("dry_run_gate_passed", fb)
+            self.assertTrue(fb["dry_run"])
+            mock_exec.assert_not_called()
+            mock_cons.assert_not_called()
+
+    def test_dry_run_no_network_calls(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        with patch("requests.Session.request") as mock_req, \
+             patch("httpx.Client.request") as mock_httpx, \
+             patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            run_pipeline(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            mock_req.assert_not_called()
+            mock_httpx.assert_not_called()
+            mock_exec.assert_not_called()
+            mock_cons.assert_not_called()
+
+    def test_dry_run_selected_field_name_consistent(self):
+        self._make_dry_run_env()
+        from coordinator import run_pipeline
+        from core.settings import get_settings
+        vuln_path = self.tmpdir / "confirmed.json"
+        vuln_path.write_text(json.dumps({
+            "vulnerabilities": [{"cwe_id": "CWE-1336", "title": "unit", "severity": "high"}],
+            "target_context": {"base_url": "http://127.0.0.1:1", "app_name": "unit"},
+        }), encoding="utf-8")
+        with patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            result = run_pipeline(confirmed_path=vuln_path, challenge_name="generic", target=self._make_target())
+            fb = result["feedback"]
+            self.assertIn("selected_canonical_strategy_id", fb)
+            # check real workspace for plan.json (settings.workspace_dir)
+            plan_path = get_settings().workspace_dir / "plan.json"
+            self.assertTrue(plan_path.exists())
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertIn("selected_canonical_strategy_id", plan)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -100,6 +100,46 @@ def evaluate_pre_execution_gate(
     return pre_gate_errors
 
 
+def _dry_run_return(
+    ws: Path,
+    feedback_path: Path,
+    validation_passed: bool,
+    validation_errors: list[str],
+    selected_canonical_strategy_id: str,
+    trusted_selection: dict[str, Any],
+    extra_gate_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    """Unified dry-run exit: write structured feedback; return immediately.
+    Guarantees no Executor, Evaluator, attempt recording, or Consolidator."""
+    pre_gate_errors = list(extra_gate_errors or [])
+    if not validation_passed:
+        pre_gate_errors = ["VALIDATOR_REJECTED"] + validation_errors
+    fb = {
+        "from": "coordinator_dry_run",
+        "dry_run": True,
+        "dry_run_gate_passed": not pre_gate_errors,
+        "validator_passed": validation_passed,
+        "selected_canonical_strategy_id": selected_canonical_strategy_id,
+        "trusted_selection_status": trusted_selection.get("status"),
+        "pre_gate_errors": pre_gate_errors,
+        "executor_called": False,
+        "evaluator_called": False,
+        "attempt_recorded": False,
+        "consolidator_called": False,
+        "yaml_mutation": False,
+    }
+    feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
+    if fb["dry_run_gate_passed"]:
+        ok("[dry-run] Planner→Validator→gate PASSED. Stopping before Executor.")
+    else:
+        warn(f"[dry-run] gate BLOCKED: {pre_gate_errors}")
+    return {
+        "status": "dry_run_complete",
+        "workspace": str(ws),
+        "feedback": fb,
+    }
+
+
 def _load_confirmed(path: Path) -> dict[str, Any]:
     target = path.expanduser().resolve()
     if target.is_dir():
@@ -663,6 +703,14 @@ def run_pipeline(
                 "hint": "根据校验错误修订 plan.json 结构与安全策略",
             }
             warn(f"验证未通过，反馈规划智能体: {v['validation']['errors']}")
+            if settings.dry_run:
+                return _dry_run_return(
+                    ws, feedback_path,
+                    validation_passed=False,
+                    validation_errors=list(val.get("errors") or []),
+                    selected_canonical_strategy_id=str(last_plan.get("selected_canonical_strategy_id") or "").strip(),
+                    trusted_selection=trusted_selection,
+                )
             continue
 
         # ── Executor ───────────────────────────────────────────────────────
@@ -679,7 +727,25 @@ def run_pipeline(
             }
             feedback_path.write_text(json.dumps(feedback, ensure_ascii=False, indent=2), encoding="utf-8")
             warn(f"pre-exec gate blocked execution: {pre_gate_errors}")
+            if settings.dry_run:
+                return _dry_run_return(
+                    ws, feedback_path,
+                    validation_passed=True,
+                    validation_errors=[],
+                    selected_canonical_strategy_id=selected_canonical_strategy_id,
+                    trusted_selection=trusted_selection,
+                    extra_gate_errors=pre_gate_errors,
+                )
             continue
+
+        if settings.dry_run:
+            return _dry_run_return(
+                ws, feedback_path,
+                validation_passed=True,
+                validation_errors=[],
+                selected_canonical_strategy_id=selected_canonical_strategy_id,
+                trusted_selection=trusted_selection,
+            )
 
         _print_agent_header("executor")
         stage("Executor", "执行沙箱脚本...")

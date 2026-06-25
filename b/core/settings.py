@@ -28,6 +28,7 @@ class Settings:
     docker_timeout: int
     docker_memory_limit: str
     docker_cpu_quota: int
+    dry_run: bool
     json_mode: bool
 
 
@@ -35,6 +36,7 @@ def get_settings() -> Settings:
     json_mode = os.getenv("CO_REDTEAM_JSON_MODE", "true").lower() in ("1", "true", "yes")
     mock = os.getenv("CO_REDTEAM_MOCK_LLM", "false").lower() in ("1", "true", "yes")
     docker_enabled = os.getenv("CO_REDTEAM_DOCKER_ENABLED", "true").lower() in ("1", "true", "yes")
+    dry_run = os.getenv("CO_REDTEAM_DRY_RUN", "0").strip() in ("1", "true", "yes")
     return Settings(
         project_root=ROOT,
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY") or None,
@@ -52,4 +54,5 @@ def get_settings() -> Settings:
         docker_memory_limit=os.getenv("CO_REDTEAM_DOCKER_MEMORY", "512m"),
         docker_cpu_quota=int(os.getenv("CO_REDTEAM_DOCKER_CPU_QUOTA", "100000")),
         json_mode=json_mode,
+        dry_run=dry_run,
     )
