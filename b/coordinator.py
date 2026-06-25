@@ -720,6 +720,8 @@ def run_pipeline(
     # ── Per-run lifecycle: reset evidence ledger ──
     from core.evidence_ledger import reset_ledger, load_confirmed_signals
     reset_ledger(ws, run_id=run_id)
+    from control.surface_state import build_surface_key, reset_surface_state
+    reset_surface_state(ws, build_surface_key(confirmed))
 
     # ── 熔断器状态（论文 §3.3 防死循环机制）──────────────
     _consecutive_failures  = 0
@@ -763,6 +765,27 @@ def run_pipeline(
                     print(f"[coordinator] preflight discovered: method={_preflight_method} endpoint=/ parameter=text")
                 else:
                     warn("[coordinator] preflight: could not determine form method from target root")
+
+        # ── Surface hard gate ──
+        from control.surface_state import build_surface_key, is_surface_blocked
+        _surface_key = build_surface_key(confirmed)
+        if is_surface_blocked(ws, _surface_key):
+            fb_block = {
+                "from": "coordinator_surface_gate",
+                "iteration": iteration,
+                "surface_key": _surface_key,
+                "surface_blocked": True,
+                "why_blocked": "surface_confidence_below_threshold",
+                "required_action": "alternate_surface_or_discovery",
+                "feedback_for_planner": (
+                    f"Surface {_surface_key} is blocked. "
+                    "All distinct strategies on this surface produced no positive evidence. "
+                    "Switch to a different CWE/endpoint/parameter or run discovery."
+                ),
+            }
+            feedback_path.write_text(json.dumps(fb_block, ensure_ascii=False, indent=2), encoding="utf-8")
+            warn(f"[coordinator] surface hard gate blocked: {_surface_key}")
+            break
 
         # ── Planner ────────────────────────────────────────────────────────
         _print_agent_header("planner")
@@ -986,6 +1009,19 @@ def run_pipeline(
             from core.evidence_ledger import write_signals
             write_signals(ws, _new_signals)
             print(f"[evidence_ledger] {len(_new_signals)} new signals: {[s['signal_id'] for s in _new_signals]}")
+
+        # ── Surface State update ──
+        from control.surface_state import (
+            build_surface_key, update_surface_after_strategy_failure, boost_surface_after_positive_evidence
+        )
+        _surface_key = build_surface_key(confirmed)
+        _sent, _obs, _fail_cls = _classify_observation(exec_out, fb)
+        if _sent and _obs == "no_positive_evidence":
+            update_surface_after_strategy_failure(ws, _surface_key, selected_canonical_strategy_id, iteration)
+            print(f"[surface_state] negative evidence: {selected_canonical_strategy_id} on {_surface_key}")
+        elif _sent and _obs == "positive_evidence":
+            boost_surface_after_positive_evidence(ws, _surface_key, iteration)
+            print(f"[surface_state] positive evidence on {_surface_key}")
 
         # ── AI 主动熔断（suggest_abort）────────────────────────────────────
         if fb.get("suggest_abort"):
