@@ -1,190 +1,226 @@
 {
-    "version":  1,
-    "updated_at":  "2026-06-25T08:33:06.075093+00:00",
-    "hypotheses":  {
-                       "crlf*memcached*pickle_rce":  {
-                                                         "fingerprint":  "crlf*memcached*pickle_rce",
-                                                         "attempts":  121,
-                                                         "successes":  0,
-                                                         "failure_stages":  {
-                                                                                "crlf_injection":  114,
-                                                                                "reflection":  7
-                                                                            },
-                                                         "last_evidence":  [
-                                                                               "[FAILED] 命令注入探测失败，响应为正常页面，未触发任何漏洞。且唯一已知攻击路径已被证伪，本轮无进展。",
-                                                                               "[FAILED] All common paths returned 404 - no flag or info disclosure achieved. Must discover valid endpoints first.",
-                                                                               "[FAILED] 本轮未进行任何漏洞利用尝试，仅获取主页，无进展。",
-                                                                               "test",
-                                                                               "test2"
-                                                                           ],
-                                                         "first_seen":  "2026-06-16T15:27:56.873416+00:00",
-                                                         "last_seen":  "2026-06-24T14:57:38.020493+00:00",
-                                                         "rejected":  true,
-                                                         "rejected_at":  "2026-06-16T15:39:49.943839+00:00",
-                                                         "rejected_reason":  "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: reflection (4/5 = 80%). Exploitation path is falsified — forced exploration required."
-                                                     },
-                       "ssti*generic*exec":  {
-                                                 "fingerprint":  "ssti*generic*exec",
-                                                 "attempts":  6,
-                                                 "successes":  0,
-                                                 "failure_stages":  {
-                                                                        "crlf_injection":  6
-                                                                    },
-                                                 "last_evidence":  [
-                                                                       "[FAILED] SSTI 注入不成功，payload 被反射但未执行，目标不存在 SSTI 漏洞",
-                                                                       "[FAILED] 本轮未触发任何漏洞。路径遍历无效，需转换策略为session cookie CRLF注入。",
-                                                                       "[FAILED] SSTI payloads were reflected but not executed; no flag or command output obtained. The true vulnerability is CRLF+pickle, not SSTI.",
-                                                                       "[FAILED] SSTI payload 未被解析执行，仅被反射到页面中；目标漏洞为 CRLF+pickle 反序列化，需切换攻击策略。",
-                                                                       "[FAILED] SSTI attempts failed; payloads reflected but not executed. The application is vulnerable to CRLF injection + pickle deserialization, not SSTI."
-                                                                   ],
-                                                 "first_seen":  "2026-06-21T14:25:46.962890+00:00",
-                                                 "last_seen":  "2026-06-21T14:40:26.200908+00:00",
-                                                 "rejected":  true,
-                                                 "rejected_at":  "2026-06-21T14:37:43.295189+00:00",
-                                                 "rejected_reason":  "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required."
-                                             },
-                       "path_traversal*fs*read":  {
-                                                      "fingerprint":  "path_traversal*fs*read",
-                                                      "attempts":  2,
-                                                      "successes":  0,
-                                                      "failure_stages":  {
-                                                                             "reflection":  2
-                                                                         },
-                                                      "last_evidence":  [
-                                                                            "[FAILED] 路径遍历探测返回404，未发现flag文件；建议转向已知CRLF注入+pickle RCE漏洞。",
-                                                                            "[FAILED] step-1 因代码错误 AttributeError 失败，未能进行任何有效探测。"
-                                                                        ],
-                                                      "first_seen":  "2026-06-21T14:26:34.403968+00:00",
-                                                      "last_seen":  "2026-06-24T13:16:55.108263+00:00",
-                                                      "rejected":  false,
-                                                      "rejected_at":  "",
-                                                      "rejected_reason":  ""
-                                                  },
-                       "ssti*jinja2*exec":  {
-                                                "fingerprint":  "ssti*jinja2*exec",
-                                                "attempts":  10,
-                                                "successes":  0,
-                                                "failure_stages":  {
-                                                                       "crlf_injection":  10
-                                                                   },
-                                                "last_evidence":  [
-                                                                      "[FAILED] SSTI 不存在，所有步骤未触发任何漏洞，收到 HTTP 200 但无执行证据。",
-                                                                      "[FAILED] SSTI探测失败，payload {{7*7}}未被解析为49，未触发SSTI。建议转向memcached CRLF注入+pickle反序列化攻击路径。",
-                                                                      "[FAILED] SSTI 探测未返回预期结果，无任何漏洞证据。",
-                                                                      "[FAILED] SSTI探测未成功，响应中无49，应用不解析SSTI",
-                                                                      "test3"
-                                                                  ],
-                                                "first_seen":  "2026-06-21T14:30:10.265670+00:00",
-                                                "last_seen":  "2026-06-24T14:57:38.021743+00:00",
-                                                "rejected":  true,
-                                                "rejected_at":  "2026-06-21T14:50:32.950282+00:00",
-                                                "rejected_reason":  "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required."
-                                            },
-                       "no_reflection*fake*goal":  {
-                                                       "fingerprint":  "no_reflection*fake*goal",
-                                                       "attempts":  1,
-                                                       "successes":  0,
-                                                       "failure_stages":  {
-                                                                              "unknown":  1
-                                                                          },
-                                                       "last_evidence":  [
-                                                                             "unparsed"
-                                                                         ],
-                                                       "first_seen":  "2026-06-24T14:57:38.021743+00:00",
-                                                       "last_seen":  "2026-06-24T14:57:38.021743+00:00",
-                                                       "rejected":  false,
-                                                       "rejected_at":  "",
-                                                       "rejected_reason":  ""
-                                                   },
-                       "ssti*velocity*exec":  {
-                                                  "fingerprint":  "ssti*velocity*exec",
-                                                  "attempts":  53,
-                                                  "successes":  1,
-                                                  "failure_stages":  {
-                                                                         "crlf_injection":  52
-                                                                     },
-                                                  "last_evidence":  [
-                                                                        "[FAILED] 未获取到 flag 字符串，但已确认 Velocity SSTI 算术运算成功（49），攻击取得进展，需继续利用 RCE。",
-                                                                        "[FAILED] [SUCCESS] 成功触发 SSTI 求值（49），确认 Velocity 模板注入存在。尚未获得 flag，需继续注入命令执行 payload。",
-                                                                        "[FAILED] 端点可达但 SSTI 未触发，payload 原样输出，需改用计算 payload 验证。",
-                                                                        "[FAILED] 步骤1的 POST 请求未触发 SSTI，响应未包含 payload 计算结果。",
-                                                                        "[FAILED] 探测失败：payload未在响应中反射，无法确认SSTI注入点存在。"
-                                                                    ],
-                                                  "first_seen":  "2026-06-24T15:33:07.982908+00:00",
-                                                  "last_seen":  "2026-06-25T06:58:36.420517+00:00",
-                                                  "rejected":  false,
-                                                  "rejected_at":  "",
-                                                  "rejected_reason":  ""
-                                              },
-                       "ssti*mako*exec":  {
-                                              "fingerprint":  "ssti*mako*exec",
-                                              "attempts":  7,
-                                              "successes":  0,
-                                              "failure_stages":  {
-                                                                     "crlf_injection":  7
-                                                                 },
-                                              "last_evidence":  [
-                                                                    "[FAILED] payload \u0027${7*7}\u0027 未被模板引擎解析，SSTI 探测失败",
-                                                                    "[FAILED] payload ${7*7} 未触发任意运算结果，需要尝试 Velocity 标准语法",
-                                                                    "[FAILED] 本轮未检测到任何SSTI触发迹象，payload不生效",
-                                                                    "[FAILED] 探测SSTI失败：payload ${7*7}未被Velocity执行，仅反射原文，未检测到计算。",
-                                                                    "[FAILED] SSTI 探测未返回值 49，payload 未被解析。"
-                                                                ],
-                                              "first_seen":  "2026-06-24T16:21:16.115273+00:00",
-                                              "last_seen":  "2026-06-25T06:40:56.445785+00:00",
-                                              "rejected":  true,
-                                              "rejected_at":  "2026-06-24T16:32:56.304640+00:00",
-                                              "rejected_reason":  "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required."
-                                          },
-                       "cwe-79-cwe-79":  {
-                                             "fingerprint":  "cwe-79-cwe-79",
-                                             "attempts":  3,
-                                             "successes":  0,
-                                             "failure_stages":  {
-                                                                    "payload_delivery":  3
-                                                                },
-                                             "last_evidence":  [
-                                                                   "[FAILED] 所有步骤因 Docker 镜像缺失未能执行。",
-                                                                   "[FAILED] 沙箱环境不可用，无法执行攻击代码。",
-                                                                   "[FAILED] 执行被安全阻止，Docker 镜像不存在，无任何攻击输出"
-                                                               ],
-                                             "first_seen":  "2026-06-25T07:36:30.317733+00:00",
-                                             "last_seen":  "2026-06-25T07:37:12.191983+00:00",
-                                             "rejected":  false,
-                                             "rejected_at":  "",
-                                             "rejected_reason":  ""
-                                         },
-                       "ssti*velocity*reflection_exec":  {
-                                                             "fingerprint":  "ssti*velocity*reflection_exec",
-                                                             "attempts":  1,
-                                                             "successes":  0,
-                                                             "failure_stages":  {
-                                                                                    "payload_delivery":  1
-                                                                                },
-                                                             "last_evidence":  [
-                                                                                   "[FAILED] 由于 Docker 镜像缺失，攻击代码未执行。"
-                                                                               ],
-                                                             "first_seen":  "2026-06-25T08:32:24.369523+00:00",
-                                                             "last_seen":  "2026-06-25T08:32:24.369523+00:00",
-                                                             "rejected":  false,
-                                                             "rejected_at":  "",
-                                                             "rejected_reason":  ""
-                                                         },
-                       "ssti*generic*arithmetic_probe":  {
-                                                             "fingerprint":  "ssti*generic*arithmetic_probe",
-                                                             "attempts":  1,
-                                                             "successes":  0,
-                                                             "failure_stages":  {
-                                                                                    "payload_delivery":  1
-                                                                                },
-                                                             "last_evidence":  [
-                                                                                   "[FAILED] 执行被基础设施问题阻止：Docker镜像不存在。"
-                                                                               ],
-                                                             "first_seen":  "2026-06-25T08:32:42.012483+00:00",
-                                                             "last_seen":  "2026-06-25T08:32:42.012483+00:00",
-                                                             "rejected":  false,
-                                                             "rejected_at":  "",
-                                                             "rejected_reason":  ""
-                                                         }
-                   }
+  "version": 1,
+  "updated_at": "2026-06-25T14:23:37.184483+00:00",
+  "hypotheses": {
+    "crlf*memcached*pickle_rce": {
+      "fingerprint": "crlf*memcached*pickle_rce",
+      "attempts": 121,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 114,
+        "reflection": 7
+      },
+      "last_evidence": [
+        "[FAILED] 命令注入探测失败，响应为正常页面，未触发任何漏洞。且唯一已知攻击路径已被证伪，本轮无进展。",
+        "[FAILED] All common paths returned 404 - no flag or info disclosure achieved. Must discover valid endpoints first.",
+        "[FAILED] 本轮未进行任何漏洞利用尝试，仅获取主页，无进展。",
+        "test",
+        "test2"
+      ],
+      "first_seen": "2026-06-16T15:27:56.873416+00:00",
+      "last_seen": "2026-06-24T14:57:38.020493+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-16T15:39:49.943839+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: reflection (4/5 = 80%). Exploitation path is falsified — forced exploration required.",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*generic*exec": {
+      "fingerprint": "ssti*generic*exec",
+      "attempts": 6,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 6
+      },
+      "last_evidence": [
+        "[FAILED] SSTI 注入不成功，payload 被反射但未执行，目标不存在 SSTI 漏洞",
+        "[FAILED] 本轮未触发任何漏洞。路径遍历无效，需转换策略为session cookie CRLF注入。",
+        "[FAILED] SSTI payloads were reflected but not executed; no flag or command output obtained. The true vulnerability is CRLF+pickle, not SSTI.",
+        "[FAILED] SSTI payload 未被解析执行，仅被反射到页面中；目标漏洞为 CRLF+pickle 反序列化，需切换攻击策略。",
+        "[FAILED] SSTI attempts failed; payloads reflected but not executed. The application is vulnerable to CRLF injection + pickle deserialization, not SSTI."
+      ],
+      "first_seen": "2026-06-21T14:25:46.962890+00:00",
+      "last_seen": "2026-06-21T14:40:26.200908+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-21T14:37:43.295189+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "path_traversal*fs*read": {
+      "fingerprint": "path_traversal*fs*read",
+      "attempts": 2,
+      "successes": 0,
+      "failure_stages": {
+        "reflection": 2
+      },
+      "last_evidence": [
+        "[FAILED] 路径遍历探测返回404，未发现flag文件；建议转向已知CRLF注入+pickle RCE漏洞。",
+        "[FAILED] step-1 因代码错误 AttributeError 失败，未能进行任何有效探测。"
+      ],
+      "first_seen": "2026-06-21T14:26:34.403968+00:00",
+      "last_seen": "2026-06-24T13:16:55.108263+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*jinja2*exec": {
+      "fingerprint": "ssti*jinja2*exec",
+      "attempts": 10,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 10
+      },
+      "last_evidence": [
+        "[FAILED] SSTI 不存在，所有步骤未触发任何漏洞，收到 HTTP 200 但无执行证据。",
+        "[FAILED] SSTI探测失败，payload {{7*7}}未被解析为49，未触发SSTI。建议转向memcached CRLF注入+pickle反序列化攻击路径。",
+        "[FAILED] SSTI 探测未返回预期结果，无任何漏洞证据。",
+        "[FAILED] SSTI探测未成功，响应中无49，应用不解析SSTI",
+        "test3"
+      ],
+      "first_seen": "2026-06-21T14:30:10.265670+00:00",
+      "last_seen": "2026-06-24T14:57:38.021743+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-21T14:50:32.950282+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "no_reflection*fake*goal": {
+      "fingerprint": "no_reflection*fake*goal",
+      "attempts": 1,
+      "successes": 0,
+      "failure_stages": {
+        "unknown": 1
+      },
+      "last_evidence": [
+        "unparsed"
+      ],
+      "first_seen": "2026-06-24T14:57:38.021743+00:00",
+      "last_seen": "2026-06-24T14:57:38.021743+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*velocity*exec": {
+      "fingerprint": "ssti*velocity*exec",
+      "attempts": 53,
+      "successes": 1,
+      "failure_stages": {
+        "crlf_injection": 52
+      },
+      "last_evidence": [
+        "[FAILED] 未获取到 flag 字符串，但已确认 Velocity SSTI 算术运算成功（49），攻击取得进展，需继续利用 RCE。",
+        "[FAILED] [SUCCESS] 成功触发 SSTI 求值（49），确认 Velocity 模板注入存在。尚未获得 flag，需继续注入命令执行 payload。",
+        "[FAILED] 端点可达但 SSTI 未触发，payload 原样输出，需改用计算 payload 验证。",
+        "[FAILED] 步骤1的 POST 请求未触发 SSTI，响应未包含 payload 计算结果。",
+        "[FAILED] 探测失败：payload未在响应中反射，无法确认SSTI注入点存在。"
+      ],
+      "first_seen": "2026-06-24T15:33:07.982908+00:00",
+      "last_seen": "2026-06-25T06:58:36.420517+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*mako*exec": {
+      "fingerprint": "ssti*mako*exec",
+      "attempts": 7,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 7
+      },
+      "last_evidence": [
+        "[FAILED] payload '${7*7}' 未被模板引擎解析，SSTI 探测失败",
+        "[FAILED] payload ${7*7} 未触发任意运算结果，需要尝试 Velocity 标准语法",
+        "[FAILED] 本轮未检测到任何SSTI触发迹象，payload不生效",
+        "[FAILED] 探测SSTI失败：payload ${7*7}未被Velocity执行，仅反射原文，未检测到计算。",
+        "[FAILED] SSTI 探测未返回值 49，payload 未被解析。"
+      ],
+      "first_seen": "2026-06-24T16:21:16.115273+00:00",
+      "last_seen": "2026-06-25T06:40:56.445785+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-24T16:32:56.304640+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "cwe-79-cwe-79": {
+      "fingerprint": "cwe-79-cwe-79",
+      "attempts": 3,
+      "successes": 0,
+      "failure_stages": {
+        "payload_delivery": 3
+      },
+      "last_evidence": [
+        "[FAILED] 所有步骤因 Docker 镜像缺失未能执行。",
+        "[FAILED] 沙箱环境不可用，无法执行攻击代码。",
+        "[FAILED] 执行被安全阻止，Docker 镜像不存在，无任何攻击输出"
+      ],
+      "first_seen": "2026-06-25T07:36:30.317733+00:00",
+      "last_seen": "2026-06-25T07:37:12.191983+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*velocity*reflection_exec": {
+      "fingerprint": "ssti*velocity*reflection_exec",
+      "attempts": 1,
+      "successes": 0,
+      "failure_stages": {
+        "payload_delivery": 1
+      },
+      "last_evidence": [
+        "[FAILED] 由于 Docker 镜像缺失，攻击代码未执行。"
+      ],
+      "first_seen": "2026-06-25T08:32:24.369523+00:00",
+      "last_seen": "2026-06-25T08:32:24.369523+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "ssti*generic*arithmetic_probe": {
+      "fingerprint": "ssti*generic*arithmetic_probe",
+      "attempts": 1,
+      "successes": 0,
+      "failure_stages": {
+        "payload_delivery": 1
+      },
+      "last_evidence": [
+        "[FAILED] 执行被基础设施问题阻止：Docker镜像不存在。"
+      ],
+      "first_seen": "2026-06-25T08:32:42.012483+00:00",
+      "last_seen": "2026-06-25T08:32:42.012483+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0
+    },
+    "unit:http:rejected": {
+      "fingerprint": "unit:http:rejected",
+      "attempts": 11,
+      "successes": 0,
+      "failure_stages": {
+        "exec": 11
+      },
+      "last_evidence": [],
+      "first_seen": "2026-06-25T14:23:37.175199+00:00",
+      "last_seen": "2026-06-25T14:23:37.184483+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-25T14:23:37.179075+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: exec (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
+      "migrated_from": [],
+      "migration_version": 0
+    }
+  }
 }

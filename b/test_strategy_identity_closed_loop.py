@@ -32,7 +32,7 @@ from core.strategy_identity import (
     validate_plan_against_trusted_selection,
     write_trusted_selection,
 )
-from core.template_manager import TemplateManager
+from core.template_manager import TemplateManager, TemplateSelectionResult
 
 
 def _write_template(root: Path, template_id: str, strategies: list[dict]) -> None:
@@ -461,6 +461,7 @@ class DryRunTests(unittest.TestCase):
                    "CO_REDTEAM_MAX_ITER", "CO_REDTEAM_MAX_RUNS",
                    "CONSOLIDATOR_AUTO_EVOLVE_YAML"):
             os.environ.pop(k, None)
+        reset_hypothesis_tracker()
 
     def _make_dry_run_env(self):
         for k, v in {
@@ -579,19 +580,97 @@ class DryRunTests(unittest.TestCase):
             mock_exec.assert_not_called()
             mock_cons.assert_not_called()
 
+    def _make_fake_selection(self, canonical_ids=None, status="AVAILABLE_STRATEGY"):
+        canonical_ids = canonical_ids or ["unit:http:probe"]
+        return TemplateSelectionResult(
+            text="[dry-run test stub]",
+            status=status,
+            matched_template_count=1,
+            matched_strategy_ids=list(canonical_ids),
+            available_strategy_ids=list(canonical_ids),
+            rejected_strategy_ids=[],
+            strategy_health={},
+            degraded_strategy_ids=[],
+            hard_rejected_strategy_ids=[],
+            template_health={},
+            surface_still_valid=True,
+            strategy_exhausted=False,
+            needs_strategy_evolution=False,
+            migration_report=[],
+            non_executable_templates=[],
+        )
+
+    def test_dry_run_all_gates_pass(self):
+        """trusted selection has canonical → Planner returns matching plan → gate passes."""
+        self._make_dry_run_env()
+        fake = self._make_fake_selection(["unit:http:probe"])
+        with patch("core.template_manager.TemplateManager.select_templates_for_target",
+                   return_value=fake), \
+             patch("coordinator.get_settings", return_value=self._make_stub_settings()), \
+             patch("coordinator.run_executor") as mock_exec, \
+             patch("coordinator.run_evaluator") as mock_eval, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch("control.hypothesis_tracker.HypothesisTracker.record_attempt") as mock_rec, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            from coordinator import run_pipeline
+            result = run_pipeline(confirmed_path=self._make_vuln(),
+                                  challenge_name="generic", target=self._make_target())
+            fb = self._assert_artifacts(result, expect_gate_passed=True)
+            self.assertTrue(fb["validator_passed"])
+            self.assertEqual(fb["selected_canonical_strategy_id"], "unit:http:probe")
+            mock_exec.assert_not_called()
+            mock_eval.assert_not_called()
+            mock_cons.assert_not_called()
+            mock_rec.assert_not_called()
+
+    def test_dry_run_pre_gate_reject(self):
+        """StrategyHealth REJECT → gate blocks even with valid selection."""
+        self._make_dry_run_env()
+        fake = self._make_fake_selection(["unit:http:rejected"])
+        # pre-seed rejection in tracker BEFORE patching the pipeline path
+        from control.hypothesis_tracker import get_hypothesis_tracker
+        tracker = get_hypothesis_tracker()
+        with patch("builtins.print"):
+            for _ in range(11):
+                tracker.record_attempt("unit:http:rejected", success=False, failure_stage="exec")
+        health = tracker.evaluate_strategy_health("unit:http:rejected")
+        self.assertIn(health.decision, ("REJECT", "HARD_REJECT"))
+        with patch("core.template_manager.TemplateManager.select_templates_for_target",
+                   return_value=fake), \
+             patch("coordinator.get_settings", return_value=self._make_stub_settings()), \
+             patch("coordinator.run_executor") as mock_exec, \
+             patch("agents.consolidator.run_global_consolidation") as mock_cons, \
+             patch.object(planner, "_build_memory_context", return_value=""), \
+             patch("builtins.print"):
+            from coordinator import run_pipeline
+            result = run_pipeline(confirmed_path=self._make_vuln(),
+                                  challenge_name="generic", target=self._make_target())
+            fb = self._assert_artifacts(result, expect_gate_passed=False)
+            self.assertIn("STRATEGY_REJECTED", fb["pre_gate_errors"][0] if fb["pre_gate_errors"] else "")
+            mock_exec.assert_not_called()
+            mock_cons.assert_not_called()
+
     def test_dry_run_cli_flag_sets_env_only(self):
-        """--dry-run sets expected env vars; does not execute pipeline."""
+        """--dry-run sets 5 env vars; pipeline execution is stubbed out."""
+        from cli import cmd_exploit
         args = SimpleNamespace(dry_run=True, url="http://127.0.0.1:1",
                                max_iter=None, max_runs=None, challenge="generic",
                                vuln=None, confirmed=None)
-        from cli import cmd_exploit
-        try:
-            cmd_exploit(args)
-        except SystemExit:
-            pass  # pipeline returns non-zero exit for no-match CWE
-        except Exception:
-            pass  # may fail after settings init with missing files
-        # Env must be set
+        with patch("coordinator.run_pipeline", return_value=0), \
+             patch("cli._inject_static_warmup"), \
+             patch("core.target_context.lock_target", return_value=self._make_target()), \
+             patch("cli._render_exploit_banner"), \
+             patch("cli.render_target_lock"), \
+             patch("cli.stage"), patch("cli.ok"), \
+             patch("cli.fail"), patch("cli.muted"), \
+             patch("cli.console"), \
+             patch("builtins.print"):
+            try:
+                exit_code = cmd_exploit(args)
+                self.assertEqual(exit_code, 0)
+            except SystemExit as e:
+                self.assertIn(e.code, (0, 1))
         self.assertEqual(os.environ.get("CO_REDTEAM_DRY_RUN"), "1")
         self.assertEqual(os.environ.get("CO_REDTEAM_MOCK_LLM"), "true")
         self.assertEqual(os.environ.get("CO_REDTEAM_MAX_ITER"), "1")
