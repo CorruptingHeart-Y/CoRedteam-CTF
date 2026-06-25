@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -57,6 +58,57 @@ def _render_exploit_banner(url: str, vuln_path: str | None, challenge: str) -> N
         border_style="magenta",
         padding=(0, 2),
     ))
+
+
+def _inject_static_warmup(warmup: dict) -> None:
+    """Write static warmup payloads directly to tech.json — no LLM call.
+
+    通过 PayloadRegistry 指纹去重：相同 payload 只写入一次。
+    """
+    import json
+    from core.payload_registry import PayloadRegistry
+
+    tech_path = _B_ROOT / "memory" / "tech.json"
+    try:
+        if tech_path.exists():
+            tech_data = json.loads(tech_path.read_text(encoding="utf-8"))
+        else:
+            tech_data = {}
+    except (json.JSONDecodeError, OSError):
+        tech_data = {}
+
+    registry = PayloadRegistry(_B_ROOT / "memory")
+    entries = tech_data.get("payload_templates") or []
+    added = 0
+    skipped = 0
+
+    for cwe_id, payloads in warmup.items():
+        for payload in payloads:
+            entry = {
+                "name": f"static-warmup-{cwe_id.lower().replace('-', '')}",
+                "description": f"Static warmup payload for {cwe_id}",
+                "lang": "text",
+                "template": payload,
+                "tags": [cwe_id.lower().replace("-", ""), "warmup", "static"],
+                "source": "static-warmup",
+                "severity": "critical",
+                "payload": payload,
+                "cwe": cwe_id,
+            }
+            if registry.is_duplicate(entry):
+                skipped += 1
+                continue
+            registry.register(entry)
+            entries.append(entry)
+            added += 1
+
+    tech_data["payload_templates"] = entries
+    tech_path.write_text(json.dumps(tech_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if skipped > 0:
+        print(f"[warmup] [DEDUP] {skipped} 条重复 payload 已跳过（指纹命中）")
+    if added > 0:
+        print(f"[warmup] [OK] {added} 条新 warmup payload 已注入")
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +154,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 def cmd_exploit(args: argparse.Namespace) -> int:
     """Run Phase 2 exploitation pipeline with a mandatory target URL lock."""
+
+    # Set env vars BEFORE any b.* imports so Settings picks them up
+    if getattr(args, "max_iter", None) is not None:
+        os.environ["CO_REDTEAM_MAX_ITER"] = str(args.max_iter)
+    if getattr(args, "max_runs", None) is not None:
+        os.environ["CO_REDTEAM_MAX_RUNS"] = str(args.max_runs)
+
     try:
         target = lock_target(args.url)
     except TargetLockError as e:
@@ -131,7 +190,19 @@ def cmd_exploit(args: argparse.Namespace) -> int:
     import core.adapters  # noqa: F401
     from coordinator import run_pipeline
 
-    max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "3"))
+    # ── Phase 2 预热：adapter 驱动的种子注入 tech.json（不消耗 LLM）──
+    # 每个 ChallengeAdapter 自行声明适用于该挑战的 warmup payload。
+    # 无适配器或适配器未覆盖时，跳过 warmup 注入 — 不再有全局硬编码污染。
+    from core.challenge_adapter import get_adapter
+    adapter = get_adapter(challenge)
+    warmup = adapter.get_warmup_payloads()
+    if warmup:
+        _inject_static_warmup(warmup)
+        ok(f"Challenge-specific warmup injected {len(warmup)} CWE payload sets to tech.json")
+    else:
+        muted(f"No challenge-specific warmup for '{challenge}', skipping static injection")
+
+    max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "5"))
     stage("CLI", f"Starting Phase 2 pipeline (challenge={challenge}, max_runs={max_runs})...")
 
     best_result = 3
@@ -652,6 +723,96 @@ Exploitation scenarios:
 ]
 
 
+def cmd_memory_dedup(args: argparse.Namespace) -> int:
+    """清理 tech.json 中的指纹重复条目。"""
+    from core.payload_registry import dedup_tech_json
+
+    memory_dir = _B_ROOT / "memory"
+    before, after = dedup_tech_json(memory_dir)
+    removed = before - after
+
+    if removed > 0:
+        ok(f"Dedup complete: {before} -> {after} ({removed} duplicates removed)")
+    else:
+        ok(f"No duplicates found ({after} unique entries)")
+    return 0
+
+
+def cmd_memory_score(args: argparse.Namespace) -> int:
+    """显示 payload 评分排行榜，支持清理低分条目。"""
+    from core.payload_registry import get_scored_payloads, dedup_tech_json
+
+    memory_dir = _B_ROOT / "memory"
+
+    if args.prune is not None:
+        min_score = float(args.prune)
+        scored = get_scored_payloads(memory_dir, limit=1000)
+        keep = [e for e in scored if e.get("score", 0) >= min_score]
+        remove_count = len(scored) - len(keep)
+        if remove_count > 0:
+            tech_path = memory_dir / "tech.json"
+            data = json.loads(tech_path.read_text(encoding="utf-8"))
+            keep_fps = {e["_fingerprint"] for e in keep}
+            data["payload_templates"] = [
+                e for e in data.get("payload_templates", [])
+                if fingerprint_entry(e) in keep_fps
+            ]
+            tech_path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            ok(f"Pruned {remove_count} low-score payloads (threshold: {min_score})")
+        else:
+            ok(f"No payloads below score {min_score} to prune")
+        return 0
+
+    # 默认：显示评分排行榜
+    limit = getattr(args, "limit", 30)
+    min_score = getattr(args, "min_score", None)
+    if min_score is not None:
+        min_score = float(min_score)
+
+    scored = get_scored_payloads(memory_dir, min_score=min_score, limit=limit)
+
+    if not scored:
+        warn("No scored payloads found in tech.json")
+        return 0
+
+    from rich.table import Table
+
+    console.print(f"\n[bold]Payload Score Leaderboard[/bold] ({len(scored)} entries)\n")
+
+    table = Table(show_lines=False)
+    table.add_column("Fingerprint", style="cyan", no_wrap=True)
+    table.add_column("Name", max_width=50)
+    table.add_column("Score", style="magenta", justify="right")
+    table.add_column("Success", style="green", justify="right")
+    table.add_column("Failure", style="red", justify="right")
+    table.add_column("Last Used", style="grey50")
+    table.add_column("CWE", style="yellow")
+
+    for e in scored:
+        fp = e.get("_fingerprint", "?")[:12]
+        name = e.get("name", "?")[:48]
+        score = f"{e.get('score', 0):.1f}"
+        sc = str(e.get("success_count", 0))
+        fc = str(e.get("failure_count", 0))
+        last = e.get("last_used", 0)
+        if last > 0:
+            from datetime import datetime
+            last_str = datetime.fromtimestamp(last).strftime("%m-%d %H:%M")
+        else:
+            last_str = "-"
+        cwe = e.get("cwe", e.get("cwe_ids", ["?"]))
+        if isinstance(cwe, list):
+            cwe = ",".join(cwe)
+
+        table.add_row(fp, name, score, sc, fc, last_str, cwe)
+
+    console.print(table)
+    return 0
+
+
 def cmd_memory_init_builtin(args: argparse.Namespace) -> int:
     import yaml
     mgr = _get_mgr()
@@ -721,6 +882,10 @@ Examples:
                            help="Path to confirmed_vuln.json (default: data/confirmed_vuln.json)")
     p_exploit.add_argument("--challenge", default="generic", metavar="NAME",
                            help="Challenge adapter name (default: generic)")
+    p_exploit.add_argument("--max-iter", type=int, default=None, metavar="N",
+                           help="Max exploit iterations per run (default: 8, overrides CO_REDTEAM_MAX_ITER)")
+    p_exploit.add_argument("--max-runs", type=int, default=None, metavar="N",
+                           help="Max outer retry runs (default: 5, overrides CO_REDTEAM_MAX_RUNS)")
     p_exploit.set_defaults(func=cmd_exploit)
 
     # -- memory --------------------------------------------------------------
@@ -760,6 +925,15 @@ Examples:
     mem_sub.add_parser("init-builtin", help="Initialize built-in CWE templates").set_defaults(
         func=cmd_memory_init_builtin
     )
+
+    p_dedup = mem_sub.add_parser("dedup", help="Remove duplicate payloads from tech.json by fingerprint")
+    p_dedup.set_defaults(func=cmd_memory_dedup)
+
+    p_score = mem_sub.add_parser("score", help="Show payload score leaderboard")
+    p_score.add_argument("--limit", type=int, default=30, help="Max entries to show (default: 30)")
+    p_score.add_argument("--min-score", type=float, default=None, help="Filter by minimum score")
+    p_score.add_argument("--prune", type=float, default=None, help="Remove all payloads with score below this threshold")
+    p_score.set_defaults(func=cmd_memory_score)
 
     return parser
 

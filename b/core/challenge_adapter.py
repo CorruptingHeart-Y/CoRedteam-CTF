@@ -22,6 +22,21 @@ class ChallengeAdapter:
     def postprocess_step(self, command: str, step_type: str) -> str:
         return command
 
+    def get_warmup_payloads(self) -> dict[str, list[str]]:
+        """Return per-challenge warmup payloads keyed by CWE ID.
+
+        Each adapter that needs bootstrapping payloads overrides this.
+        Default: empty dict — no static warmup injection.
+        """
+        return {}
+
+    def get_exploit_progression(self) -> str | None:
+        """Return progression key for this challenge (maps to CHALLENGE_PROGRESSIONS).
+
+        Return None to use default ("ssti"). Override in adapters for non-SSTI challenges.
+        """
+        return None
+
 
 _registry: dict[str, type[ChallengeAdapter]] = {}
 

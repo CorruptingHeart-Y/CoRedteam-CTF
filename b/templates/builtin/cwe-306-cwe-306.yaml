@@ -1,0 +1,102 @@
+metadata:
+  id: cwe-306-cwe-306
+  name: CWE-306
+  cwe_ids:
+  - CWE-306
+  target_type: generic
+  tags:
+  - cwe-306
+  - cwe-306
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 利用 /api/monitor 端点缺乏认证直接获取 flag 的利用手法
+payload_templates:
+- name: api-monitor-no-auth-flag-retrieval
+  description: 利用 /api/monitor 端点缺乏认证直接获取 flag 的利用手法
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: api-monitor-auth-bypass
+  description: 通过POST请求/api/monitor端点并携带已知secret_phrase来绕过认证获取flag
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-monitor-secret-auth-bypass
+  description: 使用泄露的 secret_phrase 直接 POST 请求 /api/monitor 端点，绕过缺失的认证机制获取 flag
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-credential-from-info-disclosure
+  description: 利用信息泄露获取的凭证访问无认证API端点的链式利用手法
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-monitor-unauthorized-access
+  description: 利用从信息泄露获取的凭证，直接访问未受保护的 /api/monitor 端点
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: credential-leakage-to-bypass-authentication
+  description: 利用信息泄露获取的凭证直接访问未授权端点
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-monitor-secret-phrase-auth-bypass
+  description: 利用从信息泄露端点获取的 secret_phrase 绕过 /api/monitor 的认证检查
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-monitor-command-bypass
+  description: 利用从 CWE-200 泄漏的 secret_phrase 向无认证 /api/monitor 端点发送 POST 请求从而获取 flag
+    的 payload 模板。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: missing-auth-secret-phrase-command
+  description: Exploit missing authentication on an API endpoint that accepts a secret
+    command string leaked by another endpoint.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: info-leak-to-auth-bypass
+  description: Chain information leakage (CWE-200) with missing authentication (CWE-306)
+    to retrieve credentials and bypass auth in a single script. Ideal for environments
+    where step isolation breaks file-based handoffs.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: direct-command-injection-via-missing-auth
+  description: 新增 CWE-306 武器模板，包含从信息泄漏到未授权命令执行的组合利用 payload，避免未来再次出现 Planner 格式错误。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: flag-extraction-via-info-leak-noauth
+  description: 新增 payload 模板：结合 CWE-200 信息泄露获取秘钥，然后直接调用无认证的 CWE-306 端点获取 flag。仅使用
+    GET 和 POST 请求，所有依赖模块均在沙箱白名单中。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical

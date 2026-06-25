@@ -9,6 +9,162 @@ from core.challenge_adapter import ChallengeAdapter
 from core.llm_client import DeepSeekClient
 from core.memory_store import LayeredMemory
 from core.settings import Settings
+from memory.exploit_primitives import get_primitive_registry, ALL_PRIMITIVE_DEFINITIONS
+from control.hypothesis_tracker import get_hypothesis_tracker
+from control.eval_ablation import apply_ablation, record_ablation, get_mode, summarize as ablation_summary
+
+# ────────────────────────────────────────────────────────────────
+# 认知论守卫：推断性语言检测（Task 1 — Verified_Facts vs Hypothesis）
+# ────────────────────────────────────────────────────────────────
+
+_INFERENCE_MARKERS: list[str] = [
+    "should", "may", "likely", "probably", "therefore",
+    "因此", "应可", "应该", "可能", "推断", "说明",
+]
+
+_INFERENCE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"应可工作"),
+    re.compile(r"因此.*应该"),
+    re.compile(r"说明.*应可"),
+    re.compile(r"Java反射链应可"),
+    re.compile(r"should work", re.IGNORECASE),
+    re.compile(r"therefore.*should", re.IGNORECASE),
+    re.compile(r"proves.*will work", re.IGNORECASE),
+    re.compile(r"since.*should also", re.IGNORECASE),
+    re.compile(r"因为.*所以.*也应"),
+    re.compile(r"既然.*那么.*也应"),
+]
+
+
+def _strip_inference_from_fact(text: str) -> str:
+    """Strip inference language from an evidence string. Returns cleaned text
+    and flags whether inference was detected."""
+    if not text:
+        return text
+    for marker in _INFERENCE_MARKERS:
+        if marker in text.lower():
+            return ""
+    for pat in _INFERENCE_PATTERNS:
+        if pat.search(text):
+            return ""
+    return text
+
+
+def _sanitize_verified_facts(fb: dict[str, Any]) -> dict[str, Any]:
+    """Post-process evaluator output to enforce verified_facts vs hypothesis separation.
+
+    1. If verified_facts is missing/empty, extract from raw_evidence lines
+    2. Strip inference language from hard_evidence_found
+    3. Downgrade primitive_confidence for inferred primitives
+    """
+    # Ensure verified_facts exists
+    if not isinstance(fb.get("verified_facts"), list):
+        fb["verified_facts"] = []
+
+    # Strip inference from hard_evidence_found
+    hef = fb.get("hard_evidence_found", "")
+    if hef:
+        cleaned = _strip_inference_from_fact(hef)
+        if not cleaned and hef:
+            # hard_evidence contained inference — flag it
+            fb["_inference_stripped"] = True
+            fb["hard_evidence_found"] = "NONE"
+
+    # Scan primitive_evidence for inference markers and downgrade
+    pe = fb.get("primitive_evidence", {})
+    pc = fb.get("primitive_confidence", {})
+    if isinstance(pe, dict) and isinstance(pc, dict):
+        for pid, ev in list(pe.items()):
+            if isinstance(ev, str) and ev:
+                cleaned = _strip_inference_from_fact(ev)
+                if not cleaned:
+                    # evidence is purely inference — downgrade
+                    pc[pid] = min(pc.get(pid, 0.5) * 0.3, 0.35)
+                    pe[pid] = ""
+                    print(f"[evaluator] ⚠️ 推断性 primitive_evidence 已降级: {pid} -> conf={pc[pid]:.2f}")
+
+    return fb
+
+
+def _validate_hypothesis_anchoring(fb: dict[str, Any]) -> dict[str, Any]:
+    """Post-process evaluator output to enforce evidence anchoring.
+
+    Every hypothesis must cite specific evidence from raw_stdout.
+    Hypotheses without evidence anchoring are flagged or rejected.
+
+    Rules:
+    1. hypothesis must reference at least one specific observable from verified_facts
+       or hard_evidence_found or raw_evidence
+    2. If hypothesis contains inference language without citing physical evidence → flag
+    3. If hard_evidence_found is "NONE" but confidence > 0.5 → inconsistent → downgrade
+    """
+    hypothesis = fb.get("hypothesis", "")
+    verified_facts = fb.get("verified_facts", [])
+    hard_evidence = fb.get("hard_evidence_found", "")
+    raw_evidence = fb.get("raw_evidence", "")
+    confidence = fb.get("confidence", 0)
+
+    # Combine all available physical evidence text
+    evidence_pool = (
+        (hard_evidence or "") + " " +
+        (raw_evidence or "") + " " +
+        " ".join(str(f) for f in (verified_facts or []))
+    ).strip()
+
+    # ── Rule 1: hypothesis must have at least some evidence to anchor on ──
+    if hypothesis and hypothesis not in ("证据不足，无法推断", "N/A", ""):
+        if not evidence_pool or evidence_pool.isspace():
+            fb["_hypothesis_unanchored"] = True
+            fb["hypothesis"] = "证据不足，无法推断"
+            print("[evaluator] ⚠️ hypothesis 无任何证据锚定 — 已拒绝")
+            return fb
+
+    # ── Rule 2: if hard_evidence is NONE but confidence > 0.5 → inconsistency ──
+    if (not hard_evidence or hard_evidence.strip().upper() == "NONE") and confidence > 0.5:
+        fb["_confidence_downgraded_no_evidence"] = True
+        fb["confidence"] = min(confidence, 0.5)
+        print(
+            f"[evaluator] ⚠️ hard_evidence=NONE 但 confidence={confidence:.2f} > 0.5 "
+            f"— 已降级至 {fb['confidence']:.2f}"
+        )
+
+    # ── Rule 3: detect inference-only hypothesis (no specific fact cited) ──
+    if hypothesis and hypothesis not in ("证据不足，无法推断", "N/A", ""):
+        # Check if hypothesis cites any specific evidence from verified_facts or raw_evidence
+        # A well-anchored hypothesis should reference something observable:
+        # e.g., "响应体含 49" → anchored; "应该可以 RCE" → not anchored
+        has_anchor = False
+        # Check against verified_facts keywords
+        for fact in (verified_facts or []):
+            fact_str = str(fact).strip()
+            if len(fact_str) > 10 and any(
+                token in hypothesis.lower()
+                for token in fact_str.lower().split()[:5]
+            ):
+                has_anchor = True
+                break
+        # Check against hard_evidence keywords
+        if not has_anchor and hard_evidence and hard_evidence.strip().upper() != "NONE":
+            he_tokens = set(hard_evidence.lower().split())
+            hypothesis_tokens = set(hypothesis.lower().split())
+            if len(he_tokens & hypothesis_tokens) >= 2:
+                has_anchor = True
+
+        # Check for inference-only markers (speculation without facts)
+        inference_only_markers = [
+            "应可", "应该能", "应该可以", "推断应", "可能可以",
+            "should be able", "could be", "might work",
+            "既然.*那么.*也应", "因为.*所以.*也应",
+        ]
+        has_inference_only = any(m in hypothesis for m in inference_only_markers)
+
+        if has_inference_only and not has_anchor:
+            fb["_hypothesis_unanchored"] = True
+            fb["hypothesis"] = "证据不足，无法推断（原假设缺乏物理证据锚定）"
+            print("[evaluator] ⚠️ hypothesis 仅含推断性语言且无证据锚定 — 已拒绝")
+
+    return fb
+
 
 # ────────────────────────────────────────────────────────────────
 # 常量
@@ -18,14 +174,67 @@ _HEAD_TAIL_CHARS  = 1000          # chars kept from head when truncating
 _TAIL_CHARS       = 1500          # chars kept from tail (more: preserves stack traces / errors)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
 
+# ────────────────────────────────────────────────────────────────
+# 证据卫生层 — 从 stdout/stderr 中剔除框架运行时噪声
+# 确保 Planner 看到的 verified_facts 和 evidence 仅包含靶机真实回显
+# ────────────────────────────────────────────────────────────────
+
+FRAMEWORK_NOISE = [
+    "[normalize] empty command placeholder",
+    "[normalize]",
+    "empty command placeholder",
+    "print('STEP_OK')",
+    'print("STEP_OK")',
+    "STEP_OK",
+    "STEP_FAIL:",
+    "# EMPTY_STEP: no exploit code was provided for this step",
+]
+
+_FWK_NOISE_RE = re.compile(
+    r"(?:"
+    + "|".join(re.escape(token) for token in FRAMEWORK_NOISE)
+    + r")",
+    re.IGNORECASE,
+)
+
+
+def clean_framework_artifacts(text: str) -> str:
+    """Strip framework runtime noise from physical stdout/stderr.
+
+    Removes STEP_OK/STEP_FAIL markers, placeholder strings, and normalize
+    artifacts so that the Planner and Evaluator only see real target output.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    cleaned = _FWK_NOISE_RE.sub("", text)
+    # Collapse resulting blank lines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    return cleaned
+
 # Flag 格式白名单正则（CTF 常见格式）
+# NOTE: the generic pattern on the last line was matching <!DOCTYPE html>
+# because DOCTYPE is 7 uppercase chars + {html...} fits the bracket group.
+# Fixed: exclude known HTML/XML keywords, require non-trivial bracket content.
 _FLAG_PATTERNS: list[re.Pattern] = [
     re.compile(r"flag\{[^}]{1,200}\}", re.IGNORECASE),
     re.compile(r"CTF\{[^}]{1,200}\}", re.IGNORECASE),
     re.compile(r"DUCTF\{[^}]{1,200}\}", re.IGNORECASE),
     re.compile(r"HTB\{[^}]{1,200}\}", re.IGNORECASE),
     re.compile(r"picoCTF\{[^}]{1,200}\}", re.IGNORECASE),
-    re.compile(r"[A-Z0-9_]{2,10}\{[A-Za-z0-9_\-=+/]{8,200}\}", re.IGNORECASE),
+    # Generic uppercase prefix + bracket — but tightly constrained to avoid
+    # false positives on HTML doctypes, CSS, and other markup boilerplate.
+    # Blacklist: DOCTYPE, ENTITY, NOTATION, ATTLIST, ELEMENT, CDATA (SGML/XML).
+    # Requires at least one non-base64-alphabet char or known separator in the
+    # bracket body (underscore, hyphen, equals, plus, slash) — HTML/CSS inside
+    # braces won't match because they're mostly lowercase letters and semicolons.
+    re.compile(
+        r"(?<![A-Za-z])(?!DOCTYPE\b)(?!ENTITY\b)(?!NOTATION\b)(?!ATTLIST\b)"
+        r"(?!ELEMENT\b)(?!CDATA\b)"
+        r"[A-Z][A-Z0-9_]{1,9}"
+        r"\{[A-Za-z0-9_\-=+/]{8,200}\}",
+        re.IGNORECASE,
+    ),
 ]
 
 # 强攻击成功信号（非 flag 但明确表示攻击成功）
@@ -63,7 +272,55 @@ EVAL_SYSTEM = """你是 Co-RedTeam 评估智能体（Evaluation Agent），对�
 
 你是一个极其严苛、疑罪从有的裁判。你的默认立场是"攻击失败，直到看见铁证"。
 
-【绝对禁止】以下幻觉陷阱：
+【🔄 攻击状态机（Exploit State Machine）— 状态推断规则】
+
+你必须根据 raw_stdout 中的实际证据，判定当前攻击处于以下哪个状态（按推进顺序排列）：
+
+  init — 初始状态，尚未证实任何攻击面可达
+    判定条件：所有步骤均失败（连接错误/认证失败/语法错误），无任何有效探测结果
+    典型证据：[HTTP_ERR] Connection refused, [HTTP] 403/401, NameError, SyntaxError
+
+  probe_success — 探测成功，确认漏洞触发点存在且可达
+    判定条件：至少一个步骤收到目标正常响应（HTTP 200），响应内容与预期业务逻辑吻合
+    典型证据：[HTTP] 200 + 正常业务JSON/HTML，确认端点/参数/注入点可达
+    ⚠️ 仅有 HTTP 200 不能判定为 payload_injected！
+
+  payload_injected — Payload 已成功注入并被目标系统接受/处理
+    判定条件：HTTP 响应中出现 payload 被处理/反射/存储的证据，但尚未触发利用效果
+    典型证据：[HTTP] 200 + 响应体中包含注入的 payload 内容、JWT被接受、文件上传成功
+    关键区分：payload 被"接受"了，但尚未产生 S 级物理铁证
+
+  gadget_triggered — 利用链触发，漏洞已激活并产生可观测效果
+    判定条件：S 级或 A 级物理铁证出现（uid=0、/etc/passwd、SSTI计算值、SQL数据回显）
+    典型证据：stdout 中出现命令执行结果、SSTI {{7*7}}→49、SQL查询结果、文件内容
+    此状态是 repro_success=true 的必要条件
+
+  oob_received — 带外数据已成功到达
+    判定条件：OOBReceiver 收到目标回连，且携带有效数据（flag、文件内容、token）
+    典型证据：OOB hit 包含 flag 内容、cookie/session token、数据库dump
+    此状态等价于 gadget_triggered + 数据成功外传，repro_success=true
+
+【状态转换硬规则】：
+  - 必须按顺序推进：init → probe_success → payload_injected → gadget_triggered → oob_received
+  - 严禁跳级：没有 probe_success 证据（HTTP 200 + 正常响应），不得判定为 payload_injected
+  - 严禁回退：一旦达到某个状态，本轮 current_exploit_state 不得低于该状态
+  - state_transition_blocker 必须精确引用 HTTP 响应体中的具体字段/状态码/错误信息
+  - 如果代码 STEP_OK 但状态未推进 → 这是最危险的"静默失败"，必须深入分析 HTTP 响应体
+
+【🚫 泛化回退禁令 — 代码执行成功但利用未推进时】：
+当步骤 exit_code=0（STEP_OK）但未产生 S 级或 A 级证据时，以下回退输出被严格禁止：
+  ❌ error_fingerprint="NoError" — 没有崩溃不代表攻击成功！静默失败不是成功！
+  ❌ current_exploit_state 跳级 — 不能从 init 直接跳到 gadget_triggered
+  ❌ state_transition_blocker="无" 或 "没有阻塞" — 状态未推进必有阻塞点，必须找到它
+  ❌ next_required_action="继续尝试" — 必须给出具体的字段名/端点/payload 修改方案
+  ❌ milestones_achieved=["无"] — 如果 probe_success 达成，必须记录
+正确做法：
+  ✅ error_fingerprint 填写实际 HTTP 响应特征（如 HTTPError4xx、AllFieldsRequired）
+  ✅ current_exploit_state 准确反映当前最高证据等级
+  ✅ state_transition_blocker 引用具体 HTTP 响应内容解释为何 payload 未被触发
+  ✅ next_required_action 给出可直接复制的代码修改（精确到字段名/endpoint/payload格式）
+
+	【绝对禁止】以下幻觉陷阱：
   1. 严禁仅凭 HTTP 状态码（如 200、403、500）就判定"漏洞存在"或"利用成功"。
      403 可能只是 WAF 的正常拦截，500 可能只是应用自身的业务 Bug，不等于攻击成功。
   2. 严禁轻信 Planner 的自我评估（如 Plan 中声称"我认为已成功"）。
@@ -71,23 +328,58 @@ EVAL_SYSTEM = """你是 Co-RedTeam 评估智能体（Evaluation Agent），对�
   3. 严禁在没有物理层面证据的情况下给出 repro_success=true。
      如果 raw_stdout 中看不到确凿的证据，你必须判决 status: failed。
 
+【🔴 认知论红线 — Verified_Facts 与 Hypothesis 的绝对分离】：
+
+  本系统最大的安全漏洞是"推断当事实"。你必须在认知层面严格区分以下两类信息：
+
+  ✅ verified_facts（已验证事实）——仅限 100% 物理观测到的结果：
+    - "HTTP 200 状态码"
+    - "响应体包含字符串 49"
+    - "响应体包含 #set($x=7*7)$x 原文"（payload 被反射）
+    - "stderr 输出 ParseException: ..."
+    - "STEP_OK 标记出现"
+    - "stdout 为空"
+    - "/etc/passwd 内容回显：root:x:0:0:..."
+    以上是物理事实，不包含任何推断成分。
+
+  💭 hypothesis（假说/推测）——任何包含推理跳跃的结论：
+    - "因为 7*7=49 执行成功，所以 Java 反射也应该可行" ← 这是推断，不是事实！
+    - "应可工作"、"应该能"、"推断"、"可能"、"likely"、"probably"、"therefore"
+    - "既然 SSTI 已确认，那么 Runtime.exec() 也应该能执行" ← 推断链！
+    - "说明 Velocity 引擎已解析模板" ← 前半句是事实(49)，后半句"已解析"是推断
+    - 任何以已观测事实为前提推导出的"下一步应该做什么"的因果链
+
+  🚨 红线规则（违反将导致系统级幻觉链）：
+    ❌ 绝对禁止将推测性结论写入 verified_facts 字段
+    ❌ 绝对禁止在 hard_evidence_found 中填写任何包含"因此/所以/应可/推断"的句子
+    ❌ 绝对禁止基于"A 成功所以 B 也应该成功"的因果链提升 confidence > 0.5
+    ❌ 如果你没有在响应体中亲眼看到命令执行的结果（如 uid=0、/etc/passwd 内容），
+       就绝对不能说 exec 成功！算术求值（49）≠ 代码执行！
+    ❌ primitive_confidence 只能基于 stdout 中直接可见的证据，不能基于推断链
+    ✅ 正确做法：观测到 49 → verified_facts: "响应含 49"
+       hypothesis: "49=7*7 表明模板引擎执行了算术运算，但尚未观测到代码执行"
+       confidence: 0.45 (A级证据，单条不足以判成功)
+
 【🟢 物理层面铁证清单 — 只有看到以下之一才能判成功】：
 
-  证据等级 S（必须看到至少一条，repro_success=true, confidence ≥ 0.9）：
-    ✅ uid=0(root) 或 uid=1000(www-data) 等系统命令输出（说明已 RCE）
-    ✅ /etc/passwd 文件内容的实际回显（如 root:x:0:0:root:/root:/bin/bash）
-    ✅ /etc/shadow 或 /flag.txt 等敏感文件的完整内容回显
-    ✅ 数据库表名/列名/行数据的实际回显（如 SELECT 查询结果表格）
-    ✅ 延时注入的时间侧信道证据：OOBReceiver 记录的请求耗时 ≥ 10 秒
-    ✅ flag{...} / CTF{...} / HTB{...} 等 CTF 格式字符串的完整回显
-    ✅ OOB 带外回调成功收到数据（hit 含 body/path 且内容非空）
+  ┌─────────────────────────────────────────────────────────────┐
+  │ 🔴 唯一停止条件：stdout 中出现 flag{...}/HTB{...}/CTF{...}  │
+  │                                                             │
+  │  除此之外的一切输出（命令结果、文件内容、HTTP 状态码……）    │
+  │  统统只是中间过程。没有 flag 字符串 = 任务没完成。           │
+  │  repro_success 只在检测到 flag 格式字符串时才能为 true。     │
+  └─────────────────────────────────────────────────────────────┘
 
-  证据等级 A（单独不够，需多条组合才能 repro_success=true, confidence ≤ 0.7）：
-    ⚠️ 命令注入后输出中出现预期系统信息（如 Linux version、kernel 版本、hostname）
-    ⚠️ SSTI 注入后输出中出现数学计算结果（如 49=7*7、7777777='7'*7）
-    ⚠️ SQL 注入后输出中出现数据库版本字符串（如 MySQL 8.0.33、PostgreSQL 14.2）
-    ⚠️ XSS 注入后 OOBReceiver 收到带 cookie/session 的回调
-    ⚠️ 文件包含后输出中出现配置文件内容（如 DB_HOST=、SECRET_KEY=）
+  证据等级 S-FLAG（任务完成！repro_success=true, should_continue=false, confidence ≥ 0.95）：
+    ✅ flag{...} / CTF{...} / HTB{...} 格式字符串的完整回显
+    ⚠️ 只有以上三种格式才算任务完成。其他任何输出都不算。
+
+  证据等级 A（攻击取得进展，但任务未完成。repro_success=false, should_continue=true）：
+    ⚠️ 系统命令输出（如 uid=0、whoami 结果、hostname 等）
+    ⚠️ 文件内容回显（如 /etc/passwd、配置文件等）
+    ⚠️ SSTI/SQL/表达式求值结果（如 49=7*7、数据库版本号等）
+    ⚠️ OOB 带外回调收到数据
+    ⚠️ 以上均说明攻击能力在推进，但还没拿到 flag，必须继续。
 
   证据等级 F（以下情况无论如何不得判成功）：
     ❌ "HTTP 200 OK" — 这不能证明任何事
@@ -103,7 +395,18 @@ EVAL_SYSTEM = """你是 Co-RedTeam 评估智能体（Evaluation Agent），对�
   "repro_success": bool,
   "confidence": number (0.0-1.0),
   "evidence_level": "S" | "A" | "F",
-  "hard_evidence_found": "具体在 raw_stdout 的哪一行发现了什么物理铁证（若没有则填 'NONE'）",
+  "hard_evidence_found": "具体在 raw_stdout 的哪一行发现了什么物理铁证（若没有则填 'NONE'）。只允许纯观测描述，禁止'因此/所以/应可/推断'等因果连接词。",
+  "error_fingerprint": "具体错误类型，如 ConnectionRefused/NameError/HTTPError500/SyntaxError/AllFieldsRequired。若成功则为空字符串。禁止填写 unknown_error 除非所有步骤 stdout 为空且你已在 raw_evidence 中明确说明。",
+  "current_exploit_state": "当前攻击状态机状态。必须从以下枚举中选择一个：init | probe_success | payload_injected | gadget_triggered | oob_received。严禁跳级。根据 raw_stdout 中的物理证据逐级判定。",
+  "milestones_achieved": ["本轮达成的里程碑列表。每个里程碑格式：'[state]: 具体描述'。例如：['probe_success: 确认 /api/login endpoint 可达，HTTP 200 + JSON 响应正常']。若本轮无任何进展，填写 ['init: 本轮未取得进展']。禁止空列表或 ['无']。"],
+  "state_transition_blocker": "当前状态转换的具体阻塞点。必须精确引用 HTTP 响应体中的字段名/状态码/错误信息。例如：'HTTP 200 body: {\"error\":\"Invalid Email Address\"}，字段名 email 被拒绝，需改用 username 注入'。如果已达 gadget_triggered/oob_received，填写 'N/A — 已到达最终状态'。",
+  "next_required_action": "打破 state_transition_blocker 必须执行的操作。必须提供可直接复制的代码片段或精确修改指令。例如：'将 data={'email': payload} 改为 data={'username': payload}，注入 SSTI 探测 {{7*7}}'。禁止泛泛地说'调整参数'。",
+  "what_worked": "哪些步骤成功了，具体做了什么（列出 step_id 和成功原因）",
+  "what_failed": "哪些步骤失败了，具体报错是什么（列出 step_id 和 stderr/stdout 中提取的错误信息）",
+  "raw_evidence": "从 stdout 中提取的关键证据片段，原文引用（包括 [HTTP] 日志、STEP_OK/STEP_FAIL 标记、异常 traceback）。如果所有步骤 stdout 为空，必须明确报告'所有步骤 stdout 为空，Executor 输出捕获可能存在问题'。",
+  "verified_facts": ["纯物理观测事实列表。每一条必须是 100% 可验证的观测，不含任何推断。例如：'HTTP 200 状态码'、'响应体含字符串 49'、'stderr 输出 ParseException at line 3'。禁止包含任何'因此/所以/应可/推断/说明/likely/probably/therefore'的语句。"],
+  "hypothesis": "基于 verified_facts 的推测性假说，明确标注这是推断而非事实。例如：'49=7*7 表明模板引擎执行了算术运算（A级证据），但尚未观测到代码执行或文件读取。Velocity SecurityManager 可能限制了反射调用。'。若无法推断则填写'证据不足，无法推断'。",
+  "next_direction": "（已废弃字段，使用 next_required_action + state_transition_blocker 代替）建议 Planner 下一步改变什么",
   "analysis": {
     "what_happened": "string — 逐步描述实际发生了什么：引用真实的 HTTP 状态码、响应体片段、错误信息、OOB 回调内容",
     "vs_expectation": "string — 逐步对比每个步骤的 expected_outcome 与实际输出，说明哪些达到预期、哪些没有、为什么",
@@ -118,8 +421,35 @@ EVAL_SYSTEM = """你是 Co-RedTeam 评估智能体（Evaluation Agent），对�
     "pattern": { "add_patterns": [ { ... } ] },
     "strategy": { "add_success": [ { ... } ], "add_failures": [ { ... } ] },
     "tech": { "add_commands": [ { ... } ], "add_payload_templates": [ { ... } ], "add_scripts": [ { ... } ] }
-  }
+  },
+  "detected_primitives": ["从执行输出中检测到的 exploit primitive 列表。必须从 Primitive Taxonomy 中选择。例如：['ssti_reflection', 'ssti_execution']。如果未检测到任何 primitive，填写空列表 []。"],
+  "primitive_confidence": {"ssti_reflection": 0.92, "ssti_execution": 0.85},
+  "primitive_evidence": {"ssti_reflection": "{{7*7}} reflected as 49 — template expression evaluated and computed"},
+  "exploit_chain_primitive": ["按时间顺序排列的已激活 primitive 链。例如：['ssti_reflection'] 或 ['ssti_reflection', 'ssti_execution']。空列表表示尚未激活任何 primitive。"]
 }
+
+【error_fingerprint 枚举规范】：
+你必须从以下枚举中选择最匹配的错误类型填入 error_fingerprint 字段：
+  ConnectionRefused — 目标连接被拒绝
+  ConnectionTimeout — 目标连接超时
+  NameError — Python 变量/方法名不存在
+  SyntaxError — Python 语法错误
+  ImportError — 导入模块失败
+  HTTPError4xx — HTTP 4xx 客户端错误（403/404/405 等）
+  HTTPError5xx — HTTP 5xx 服务器错误
+  AllFieldsRequired — REST API 返回 "All fields are required"
+  InvalidEmail — REST API 返回 "Invalid Email Address"
+  CSRFDetected — REST API 返回 "CSRF Detected"
+  Unauthorised — REST API 返回认证失败
+  JWTFormatError — JWT/Base64 格式错误
+  AllStdoutEmpty — 所有步骤 stdout 为空（此时 repro_success 必须为 false）
+  NoError — 所有步骤成功，无可检测错误
+
+【重要：error_fingerprint 禁止 unknown_error！】
+如果在枚举列表中找不到匹配项 → 仔细检查 raw_evidence 中的 [HTTP] 日志和 STEP_FAIL 标记。
+如果确实无法归类 → 填写最接近的枚举值，并在 raw_evidence 中附上原始错误文本。
+如果所有步骤 stdout 为空 → 填写 AllStdoutEmpty，而不是 unknown_error。
+unknown_error 只有在连 AllStdoutEmpty 都不满足时（如 executor 本身崩溃）才能使用。
 
 【成功判定流程（必须严格按此顺序执行）】：
 
@@ -216,23 +546,45 @@ def _sanitize_exec_output(exec_out: dict[str, Any], plan: dict[str, Any] | None 
     out = copy.deepcopy(exec_out)
 
     # Build a step_id → plan_step lookup for expected_outcome injection
-    plan_steps: dict[int, dict] = {}
-    if plan:
-        for st in plan.get("steps") or []:
+    plan_steps: dict[str, dict] = {}
+    if plan and isinstance(plan, dict):
+        for st in (plan.get("steps") or []):
             if isinstance(st, dict) and st.get("id") is not None:
-                plan_steps[int(st["id"])] = st
+                try:
+                    plan_steps[str(st["id"])] = st
+                except (ValueError, TypeError):
+                    pass
 
     for sr in out.get("step_results") or []:
         res = sr.get("result") or {}
-        res["stdout"] = _clean_str(res.get("stdout", ""))
-        res["stderr"] = _clean_str(res.get("stderr", ""), max_chars=500)
+        # _stdout/_stderr are the canonical keys set by Executor (chain_output merges),
+        # but fall back to raw stdout/stderr if _stdout is absent
+        stdout_raw = res.get("_stdout") or res.get("stdout", "")
+        stderr_raw = res.get("_stderr") or res.get("stderr", "")
+        # Evidence hygiene: strip framework noise BEFORE truncation
+        stdout_clean = clean_framework_artifacts(stdout_raw)
+        stderr_clean = clean_framework_artifacts(stderr_raw)
+        res["stdout"] = _clean_str(stdout_clean)
+        res["stderr"] = _clean_str(stderr_clean, max_chars=500)
         sr["result"] = res
+        # Also clean chain_output stdout/stderr (Executor-injected context)
+        co = sr.get("chain_output")
+        if isinstance(co, dict):
+            for co_key in ("_stdout", "_stderr", "stdout", "stderr"):
+                co_val = co.get(co_key)
+                if isinstance(co_val, str):
+                    co[co_key] = clean_framework_artifacts(co_val)
         # Inject expected_outcome and purpose from plan so LLM can compare directly
         step_id = sr.get("step_id")
-        if step_id is not None and int(step_id) in plan_steps:
-            ps = plan_steps[int(step_id)]
-            sr.setdefault("expected_outcome", ps.get("expected_outcome", ""))
-            sr.setdefault("purpose", ps.get("purpose", ""))
+        if step_id is not None:
+            try:
+                key = str(step_id)
+            except (ValueError, TypeError):
+                key = ""
+            if key in plan_steps:
+                ps = plan_steps[key]
+                sr.setdefault("expected_outcome", ps.get("expected_outcome", ""))
+                sr.setdefault("purpose", ps.get("purpose", ""))
     return out
 
 
@@ -258,18 +610,374 @@ def _detect_success_signal(text: str) -> str:
     return ""
 
 
-def _detect_blind_rce(step_results: list[dict[str, Any]]) -> bool:
-    """Return True when at least one step succeeded (ok=True) with blank stdout.
+def _detect_primitives(all_stdouts: str, payload_text: str, step_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """从执行输出中自动检测 exploit primitive——本地启发式规则。
 
-    Unlike the old all-or-nothing check, we flag Blind RCE if *any* ok step
-    has empty output — a later RCE step can be blind even if an earlier
-    reconnaissance step produced output.
+    返回: {"detected_primitives": [...], "primitive_confidence": {...}, "primitive_evidence": {...}}
     """
+    registry = get_primitive_registry()
+    detected: list[str] = []
+    confidence: dict[str, float] = {}
+    evidence: dict[str, str] = {}
+
+    combined_text = f"{all_stdouts} {payload_text}".lower()
+
+    # SSTI family
+    if re.search(r'\{\{7\*7\}\}.*49|\$\{7\*7\}.*49', all_stdouts, re.DOTALL):
+        detected.append("ssti_reflection")
+        confidence["ssti_reflection"] = 0.92
+        evidence["ssti_reflection"] = "{{7*7}} reflected as 49 — template expression evaluated"
+
+    if re.search(r'<Config\s|secret_key|SECRET_KEY', all_stdouts, re.IGNORECASE):
+        if "ssti_reflection" not in detected:
+            detected.append("ssti_reflection")
+        detected.append("ssti_execution")
+        confidence["ssti_execution"] = 0.85
+        evidence["ssti_execution"] = "Config object or secret_key accessed — code execution via template"
+
+    if re.search(r'__globals__|__subclasses__|__mro__|__builtins__', all_stdouts, re.IGNORECASE):
+        detected.append("ssti_execution")
+        confidence["ssti_execution"] = 0.90
+        evidence["ssti_execution"] = "Python object introspection via template — class traversal succeeded"
+
+    # SQLi family
+    if re.search(r'UNION\s+(ALL\s+)?SELECT\s+\d+', payload_text, re.IGNORECASE):
+        detected.append("sql_union")
+        confidence["sql_union"] = 0.70
+        evidence["sql_union"] = "UNION SELECT payload detected in injected query"
+
+    if re.search(r"'?\s*OR\s+['\"]?\d['\"]?\s*=\s*['\"]?\d['\"]?\s*--", payload_text, re.IGNORECASE):
+        detected.append("sql_boolean")
+        confidence["sql_boolean"] = 0.65
+        evidence["sql_boolean"] = "Boolean-based SQL injection payload detected"
+
+    # Command injection
+    if re.search(r'[;&|`$]\s*(id|whoami|ls|cat|dir)', payload_text, re.IGNORECASE):
+        detected.append("command_separator")
+        confidence["command_separator"] = 0.75
+        evidence["command_separator"] = "Shell separator with command detected in payload"
+
+    if re.search(r'uid=\d+|gid=\d+|www-data|root:[x*]:', all_stdouts, re.IGNORECASE):
+        detected.append("command_execution")
+        confidence["command_execution"] = 0.95
+        evidence["command_execution"] = "System command output detected — uid/gid or passwd content"
+
+    # Post-exploitation
+    if re.search(r'root:[x*]:\d+:\d+:|/etc/(passwd|shadow)', all_stdouts, re.IGNORECASE):
+        detected.append("arbitrary_file_read")
+        confidence["arbitrary_file_read"] = 0.95
+        evidence["arbitrary_file_read"] = "/etc/passwd or shadow content found in output"
+
+    if re.search(r'(password|passwd|secret|api_key|token)\s*[:=]\s*[\'"]?\S+', all_stdouts, re.IGNORECASE):
+        detected.append("credential_dump")
+        confidence["credential_dump"] = 0.80
+        evidence["credential_dump"] = "Credentials extracted — password/secret/token found in output"
+
+    # Deserialization
+    if re.search(r'__reduce__|pickle\.(dumps|loads)|cos\\nsystem', payload_text, re.IGNORECASE):
+        detected.append("deserialization_object_injection")
+        confidence["deserialization_object_injection"] = 0.70
+        evidence["deserialization_object_injection"] = "Pickle/reduce gadget chain payload detected"
+
+    # OOB
+    if re.search(r'OOBReceiver.*hit\.body|callback.*received|OOB.*hit\s', all_stdouts, re.IGNORECASE):
+        detected.append("blind_rce_oob")
+        confidence["blind_rce_oob"] = 0.90
+        evidence["blind_rce_oob"] = "OOB callback received with data — blind RCE confirmed"
+
+    # ── Partial confidence heuristics (incremental progress signals) ──
+    # These detect intermediate progress that doesn't yet meet the high-confidence bar
+    # but should NOT be flattened to 0 confidence.
+
+    # Response length anomaly: payload caused a significant change in response size
+    for sr in step_results:
+        rr = sr.get("result") or {}
+        stdout = rr.get("stdout", "")
+        if re.search(r'Content-Length:\s*(\d+)', stdout, re.IGNORECASE):
+            lengths = [int(m) for m in re.findall(r'Content-Length:\s*(\d+)', stdout, re.IGNORECASE)]
+            if lengths and len(lengths) >= 2 and abs(lengths[0] - lengths[-1]) > 100:
+                if "response_length_change" not in detected:
+                    detected.append("response_length_change")
+                    confidence["response_length_change"] = 0.30
+                    evidence["response_length_change"] = (
+                        f"Response length changed from {lengths[0]} to {lengths[-1]} "
+                        f"(diff={abs(lengths[0]-lengths[-1])}) — payload may have altered behavior"
+                    )
+
+    # Payload reflection in HTTP response body
+    if payload_text.strip():
+        reflected_words = [w for w in payload_text.split() if len(w) > 6 and w.lower() in all_stdouts.lower()]
+        if len(reflected_words) >= 2:
+            if "payload_reflection" not in detected:
+                detected.append("payload_reflection")
+                confidence["payload_reflection"] = 0.35
+                evidence["payload_reflection"] = (
+                    f"Payload fragments reflected in response: {reflected_words[:3]}"
+                )
+
+    # OOB attempt: OOBReceiver was initialized/started but no callback yet
+    if re.search(r'OOBReceiver\(|oob\.start\(\)|oob\.url|OOB.*URL:', all_stdouts, re.IGNORECASE):
+        if "blind_rce_oob" not in detected:
+            detected.append("oob_attempt")
+            confidence["oob_attempt"] = 0.30
+            evidence["oob_attempt"] = "OOB receiver started — attempting out-of-band extraction"
+
+    # Server error triggered post-payload (500 only after injection)
+    has_500 = bool(re.search(r'\[HTTP\]\s*5\d{2}', all_stdouts))
+    has_200 = bool(re.search(r'\[HTTP\]\s*2\d{2}', all_stdouts))
+    if has_500 and has_200:
+        if "error_triggered" not in detected:
+            detected.append("error_triggered")
+            confidence["error_triggered"] = 0.35
+            evidence["error_triggered"] = (
+                "Mixed HTTP 200 and 5xx — payload triggered an error response "
+                "alongside normal responses, suggesting injection reached the application"
+            )
+
+    # Timing anomaly: significant delay in response
+    timing_delays = re.findall(r'(?:response_time|elapsed|duration)[:=]\s*([\d.]+)', all_stdouts, re.IGNORECASE)
+    if timing_delays:
+        delays = [float(d) for d in timing_delays]
+        if max(delays) > 2.0:
+            if "timing_anomaly" not in detected:
+                detected.append("timing_anomaly")
+                confidence["timing_anomaly"] = 0.30
+                evidence["timing_anomaly"] = (
+                    f"Response time {max(delays):.1f}s — payload may have caused "
+                    f"blocking operation (sleep, DNS lookup, command execution)"
+                )
+
+    # Stdout fragments: partial command execution output
+    fragment_signals = [
+        (r'(?:total|drwx|rwx)\s+\d+', "file_listing_fragment", 0.45, "Directory listing fragment"),
+        (r'uid=\d+|gid=\d+', "uid_fragment", 0.55, "System user id fragment"),
+        (r'(?:Usage:|usage:)\s+\w+', "command_usage_fragment", 0.40, "Command usage output fragment"),
+        (r'(?:error|Error|ERROR)[:\s].{10,60}', "error_message_fragment", 0.30, "Error message in output"),
+    ]
+    for pattern, pid, conf, desc in fragment_signals:
+        if re.search(pattern, all_stdouts, re.IGNORECASE):
+            if pid not in detected:
+                detected.append(pid)
+                confidence[pid] = conf
+                evidence[pid] = f"{desc} found in stdout — incremental progress signal"
+
+    # Also use the registry for matching
+    registry_matches = registry.match_payload_to_primitive(payload_text, all_stdouts)
+    if registry_matches is None:
+        registry_matches = []
+    for p, score in registry_matches[:3]:
+        pid = p.primitive_id
+        if pid not in detected:
+            detected.append(pid)
+            confidence[pid] = score
+            evidence[pid] = f"Registry match: {p.description}"
+
+    # Fill confidence for all detected
+    for pid in detected:
+        confidence.setdefault(pid, 0.6)
+        evidence.setdefault(pid, f"Heuristic detection: {ALL_PRIMITIVE_DEFINITIONS.get(pid, {}).get('description', '')}")
+
+    return {
+        "detected_primitives": detected,
+        "primitive_confidence": confidence,
+        "primitive_evidence": evidence,
+    }
+
+
+def _detect_blind_rce(step_results: list[dict[str, Any]]) -> bool:
+    """Return True when at least one step succeeded (ok=True) with blank stdout."""
     for sr in step_results:
         res = sr.get("result") or {}
         if res.get("ok") and _BLANK_STDOUT_RE.match(res.get("stdout", "")):
             return True
     return False
+
+
+# ────────────────────────────────────────────────────────────────
+#  Exploit Progress Engine (EPE) — semantic side-effect scoring
+# ────────────────────────────────────────────────────────────────
+
+# Level 1: Surface Signals — payload reached backend and perturbed its state
+#   response_length_mutation, timing_anomaly, redirect_change_received,
+#   new_cookie_set, http_500_post_payload, connection_reset_after_injection
+_LEVEL_1_WEIGHTS: dict[str, float] = {
+    "response_length_change": 0.15,
+    "timing_anomaly":         0.15,
+    "error_triggered":        0.20,
+    "payload_reflection":     0.15,
+    "error_message_fragment": 0.10,
+}
+
+# Level 2: Primitive Signals — exploit primitive established / backend parser disrupted
+#   payload_reflection_rich, deserialization_fault_detected,
+#   template_evaluation_artifact, backend_parser_state_changed,
+#   backend_semantic_disruption
+_LEVEL_2_WEIGHTS: dict[str, float] = {
+    "oob_attempt":                    0.30,
+    "command_usage_fragment":         0.30,
+    "deserialization_object_injection": 0.40,
+    "ssti_reflection":                0.40,
+}
+
+# Level 3: Capability Signals — attacker gained partial controlled capability
+#   arbitrary_file_read_fragment, partial_command_output,
+#   outbound_controlled_channel_established, filesystem_side_effect,
+#   persistence_indicator
+_LEVEL_3_WEIGHTS: dict[str, float] = {
+    "command_separator":       0.50,
+    "sql_union":               0.50,
+    "sql_boolean":             0.50,
+    "uid_fragment":            0.60,
+    "file_listing_fragment":   0.55,
+    "command_execution":       0.70,
+    "credential_dump":         0.65,
+    "arbitrary_file_read":     0.70,
+    "ssti_execution":          0.70,
+}
+
+# Level 4: Objective Signals — mission accomplished
+#   flag_captured, persistent_shell_established, oob_data_exfiltrated
+_LEVEL_4_WEIGHTS: dict[str, float] = {
+    "blind_rce_oob": 1.0,
+}
+
+
+def _compute_progress_score(
+    all_stdouts: str,
+    payload_text: str,
+    step_results: list[dict[str, Any]],
+    primitive_results: dict[str, Any],
+    flag_found: str,
+    success_signal: str,
+) -> dict[str, Any]:
+    """Semantic exploit progress evaluation — tiered side-effect scoring.
+
+    Computes progress_score via non-linear accumulation across 4 abstraction levels.
+    Each level's detected signals are combined via 1 - ∏(1 - w_i) within the level,
+    then levels are stacked cumulatively (L1+L2+L3+L4). The result monotonically
+    increases as the attacker gains control, even without an immediate flag.
+
+    Never zeros out progress because "flag not yet captured" — side effects ARE progress.
+    """
+    primitives = set(primitive_results.get("detected_primitives", []))
+    prim_conf = primitive_results.get("primitive_confidence", {})
+
+    # ── Detect abstract behavioral evidence (NOT CWE-specific patterns) ──
+    behavioral_signals: dict[str, float] = {}
+
+    # → backend_parser_state_changed: any HTTP response mutation after payload
+    has_http_changes = any(
+        p in primitives for p in ("response_length_change", "error_triggered", "timing_anomaly")
+    )
+    if has_http_changes:
+        behavioral_signals["backend_parser_state_changed"] = 0.18
+
+    # → backend_deserialization_fault_detected: type confusion / deser errors
+    deser_keywords = (
+        r'deserializ|pickle|unpickle|unserializ|__reduce__|typeerror.*object|'
+        r'cannot (?:deserializ|unpickle)|classnotfound|cannot cast|'
+        r'java\.io\.(?:invalidclass|streamcorrupted)|invaliddataexception|'
+        r'marshal\.loads.*error|unserialize\(\)|unmarshalling failed'
+    )
+    if re.search(deser_keywords, all_stdouts, re.IGNORECASE):
+        behavioral_signals["backend_deserialization_fault_detected"] = 0.35
+
+    # → backend_parser_state_changed via structure disruption (CRLF, protocol injection)
+    if re.search(r'(?:protocol|parser?|syntax)\s+(?:error|fault|violation|unexpected)',
+                 all_stdouts, re.IGNORECASE):
+        cur = behavioral_signals.get("backend_parser_state_changed", 0.0)
+        behavioral_signals["backend_parser_state_changed"] = max(cur, 0.15)
+
+    # → process_crash_or_worker_restart: connection refused AFTER successful connection
+    has_conn_refused = bool(re.search(r'connection\s+refused|connection\s+reset|'
+                                       r'broken\s+pipe|remote\s+end\s+closed',
+                                       all_stdouts, re.IGNORECASE))
+    has_prior_success = bool(re.search(r'\[HTTP\]\s*2\d{2}', all_stdouts))
+    if has_conn_refused and has_prior_success:
+        behavioral_signals["process_crash_or_worker_restart"] = 0.25
+
+    # → outbound_controlled_channel_established: DNS/HTTP interaction from target
+    if re.search(r'(?:dns|nslookup|resolve|curl|wget|fetch)\s+(?:http|https)://|'
+                 r'outbound.*(?:connection|request|callback)|'
+                 r'OOBReceiver|oob\.(?:url|result|hit)',
+                 all_stdouts, re.IGNORECASE):
+        behavioral_signals["outbound_controlled_channel_established"] = 0.55
+
+    # → filesystem_side_effect: file listing / content fragments
+    if re.search(r'(?:total\s+\d+|drwx|rwx|ls\s+-|find\s+/|cat\s+/|head\s+/|tail\s+/)',
+                 all_stdouts, re.IGNORECASE):
+        behavioral_signals["filesystem_side_effect"] = 0.60
+
+    # → template_evaluation_artifact: expression computation from template engine
+    if re.search(r'\{\{.*\}\}.*\d+|expression\s+(?:evaluated|computed|result)',
+                 all_stdouts, re.IGNORECASE):
+        behavioral_signals["template_evaluation_artifact"] = 0.38
+
+    # ── Tiered scoring with non-linear accumulation ──
+    def _level_score(weights: dict[str, float]) -> float:
+        """1 - ∏(1 - w_i) for all signals matching this level's weight table."""
+        product = 1.0
+        for signal_id, w in weights.items():
+            if signal_id in primitives:
+                product *= (1.0 - w)
+            elif signal_id in behavioral_signals:
+                product *= (1.0 - behavioral_signals[signal_id])
+        if product == 1.0:
+            return 0.0
+        return 1.0 - product
+
+    l1 = _level_score(_LEVEL_1_WEIGHTS)
+    l2 = _level_score(_LEVEL_2_WEIGHTS)
+    l3 = _level_score(_LEVEL_3_WEIGHTS)
+    l4 = _level_score(_LEVEL_4_WEIGHTS) if flag_found else 0.0
+
+    # Flag found → force 1.0
+    if flag_found:
+        progress = 1.0
+    else:
+        # Cumulative stacking: L1 + L2 + L3 — each layer adds on top of previous
+        # but capped so no level can overshoot into the next tier's range
+        progress = l1 * 0.25 + l2 * 0.35 + l3 * 0.40 + l4
+        progress = min(progress, 0.99)  # cap at 0.99 without objective
+
+    # State transition probability: likelihood of reaching next state machine stage
+    # Based on the highest evidence level detected
+    if flag_found:
+        stp = 1.0
+    elif l3 > 0:
+        stp = 0.7 + l3 * 0.3
+    elif l2 > 0:
+        stp = 0.4 + l2 * 0.4
+    elif l1 > 0:
+        stp = 0.2 + l1 * 0.3
+    else:
+        stp = 0.05
+
+    # Suggested next action based on what we have
+    if flag_found:
+        suggested = "DONE"
+    elif l3 > 0.3:
+        suggested = "DEEP_DIVE"   # close to breakthrough, keep pushing
+    elif l2 > 0.1:
+        suggested = "EVOLVE"      # primitive established, mutate payload
+    elif l1 > 0.05:
+        suggested = "DEEP_DIVE"   # surface signal — dig deeper on this path
+    else:
+        suggested = "EVOLVE"      # no signal yet, but don't say PIVOT
+
+    # Exploit momentum: is there ANY forward movement from side effects?
+    has_momentum = (l1 + l2 + l3) > 0.05
+
+    return {
+        "progress_score": round(progress, 3),
+        "primitive_confidence": prim_conf,
+        "exploit_momentum": has_momentum,
+        "state_transition_probability": round(stp, 3),
+        "suggested_next_action": suggested,
+        "_level_breakdown": {"L1_surface": round(l1, 3), "L2_primitive": round(l2, 3),
+                             "L3_capability": round(l3, 3), "L4_objective": 1.0 if flag_found else 0.0},
+        "_behavioral_signals": behavioral_signals,
+    }
 
 
 # ────────────────────────────────────────────────────────────────
@@ -285,6 +993,16 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
             "confidence": 0.2,
             "evidence_level": "F",
             "hard_evidence_found": "NONE",
+            "error_fingerprint": "AllStdoutEmpty",
+            "current_exploit_state": "init",
+            "milestones_achieved": ["init: 计划未执行，验证失败或被安全层阻止"],
+            "state_transition_blocker": "计划未被执行（executed=False），验证阶段失败或安全策略阻止",
+            "next_required_action": "检查 validator 报错，确保步骤结构合法且符合 sandbox_policy.yaml 规则",
+            "what_worked": "无步骤执行",
+            "what_failed": "计划未被执行，验证阶段失败或计划被安全层阻止",
+            "raw_evidence": "executed=False — 计划未执行",
+            "hypothesis": "验证失败或安全层阻止",
+            "next_direction": "检查 validator 报错，确保步骤结构合法",
             "analysis": {
                 "what_happened": "计划未被执行，验证阶段失败或计划被安全层阻止。",
                 "vs_expectation": "预期执行攻击步骤，实际未执行任何步骤。",
@@ -299,40 +1017,136 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
         }
 
     results = exec_out.get("step_results") or []
-    all_stdouts = " ".join((r.get("result") or {}).get("stdout", "") for r in results)
+    all_stdouts = " ".join(
+        str((r.get("result") or {}).get("_stdout") or (r.get("result") or {}).get("stdout") or "")
+        for r in results
+    )
+    # 同时扫描 chain_output._stdout（Executor 注入的上下文 stdout）
+    chain_stdouts = " ".join(
+        str((r.get("chain_output") or {}).get("_stdout") or "")
+        for r in results
+    )
+    all_stdouts = f"{all_stdouts} {chain_stdouts}"
     flag = _detect_flag(all_stdouts)
     signal = _detect_success_signal(all_stdouts) if not flag else ""
     all_ok = all((r.get("result") or {}).get("ok") for r in results)
     blind_rce = _detect_blind_rce(results) if not flag else False
 
+    _STATIC_HYPOTHESIS_UNKNOWN = "证据不足，无法推断"
+
     if flag:
         success, confidence, evidence_level = True, 0.95, "S"
         hard_evidence = f"Flag detected: {flag}"
         what_happened = f"S级铁证：检测到 flag — {flag}"
+        error_fingerprint = "NoError"
+        current_exploit_state = "oob_received" if "OOB" in all_stdouts else "gadget_triggered"
+        milestones = [f"gadget_triggered: S级铁证 — flag {flag}"]
+        transition_blocker = "N/A — 已到达最终状态"
+        next_action = "任务完成，停止迭代"
+        what_worked_str = f"step 中包含 flag 检测步骤，成功捕获 flag: {flag}"
+        what_failed_str = "无失败步骤"
+        raw_evidence_str = f"Flag in stdout: {flag}"
+        hypothesis_str = "攻击链完整，flag 已获取"
+        next_direction_str = "任务已完成，停止迭代"
     elif blind_rce:
         success, confidence, evidence_level = False, 0.5, "F"
         hard_evidence = "NONE"
         what_happened = "步骤退出码为 0（ok=True）但 stdout 全部为空，疑似 Blind RCE：命令已执行但无回显。无任何物理铁证。"
+        error_fingerprint = "AllStdoutEmpty"
+        current_exploit_state = "payload_injected"
+        milestones = ["payload_injected: 命令已执行（exit_code=0）但无回显，疑似 Blind RCE"]
+        transition_blocker = "所有步骤 stdout 为空，无法确认 gadget 是否触发。需 OOB 带外回调验证"
+        next_action = "切换到 OOBReceiver(port=8765) 带外数据提取，将命令输出通过 curl/wget 发送到 oob.url"
+        what_worked_str = "步骤 exit_code=0 但无任何输出回显"
+        what_failed_str = "所有步骤 stdout 为空，无法确认攻击结果"
+        raw_evidence_str = "所有步骤 stdout 为空 — Executor 输出捕获可能存在问题或命令为 Blind RCE"
+        hypothesis_str = "命令已执行但输出未回显（Blind RCE），需要 OOB 带外回调提取数据"
+        next_direction_str = "切换到 OOBReceiver 带外数据提取模式"
     elif signal:
         success, confidence, evidence_level = True, 0.7, "A"
         hard_evidence = f"Success signal: {signal[:120]}"
         what_happened = f"A级证据：检测到攻击成功信号 — {signal[:120]}"
+        error_fingerprint = "NoError"
+        current_exploit_state = "gadget_triggered"
+        milestones = [f"gadget_triggered: A级证据 — {signal[:120]}"]
+        transition_blocker = "已获得 A 级证据，需升级到 S 级铁证。当前缺少 uid=0、/etc/passwd 或 flag 完整回显"
+        next_action = "继续利用已触发的 gadget，执行更高权限命令获取 S 级铁证"
+        what_worked_str = f"检测到攻击成功信号: {signal[:120]}"
+        what_failed_str = "无明确失败"
+        raw_evidence_str = f"stdout 中发现成功信号: {signal[:200]}"
+        hypothesis_str = "攻击部分成功，需进一步确认 S 级铁证"
+        next_direction_str = "继续获取 S 级铁证（uid=0、/etc/passwd 或 flag）"
     elif not all_stdouts.strip():
         success, confidence, evidence_level = False, 0.1, "F"
         hard_evidence = "NONE"
         what_happened = "所有步骤 stdout 均为空，无任何物理铁证，无法判断攻击结果。"
+        error_fingerprint = "AllStdoutEmpty"
+        current_exploit_state = "init"
+        milestones = ["init: 本轮未取得进展，所有步骤 stdout 为空"]
+        transition_blocker = "所有步骤 stdout 为空，无法确认脚本是否正常执行。需排查 Executor/Docker 输出捕获机制"
+        next_action = "排查 Executor stdout 捕获机制，检查 Docker 容器日志和脚本包装逻辑"
+        what_worked_str = "无步骤产生有效输出"
+        what_failed_str = "所有步骤 stdout 为空，Executor 输出捕获可能存在问题"
+        raw_evidence_str = "所有步骤 stdout 为空 — 这是严重异常，Executor 输出捕获可能存在问题"
+        hypothesis_str = "所有步骤 stdout 为空，Executor 输出捕获可能存在问题。请检查 Docker 容器日志和脚本包装逻辑。"
+        next_direction_str = "排查 Executor stdout 捕获机制，确认脚本是否正常执行"
     elif all_ok:
         success, confidence, evidence_level = False, 0.3, "F"
         hard_evidence = "NONE"
         what_happened = "所有步骤退出码为 0，有输出但未检测到任何 S 级或 A 级物理铁证。仅凭 exit_code=0 不足以判定成功。"
+        error_fingerprint = "NoError"
+        current_exploit_state = "probe_success"
+        milestones = ["probe_success: 所有步骤 exit_code=0，确认目标可达且脚本无语法错误"]
+        transition_blocker = "脚本执行成功但 payload 未正确触发漏洞。需分析 HTTP 响应体确定 payload 是否被目标接受/处理"
+        next_action = "检查 [HTTP] 日志中的响应体内容，调整 payload 参数/格式/端点，尝试触发 S 级证据"
+        what_worked_str = "所有步骤 exit_code=0"
+        what_failed_str = "虽有 stdout 输出但无 S 级或 A 级物理铁证"
+        raw_evidence_str = all_stdouts[:500] if all_stdouts.strip() else "stdout 有内容但无铁证"
+        hypothesis_str = "脚本执行成功但 payload 未正确触发漏洞"
+        next_direction_str = "调整 payload 参数/格式/端点，尝试触发 S 级证据"
     else:
         success, confidence, evidence_level = False, 0.2, "F"
         hard_evidence = "NONE"
         what_happened = "部分步骤失败，未检测到任何物理铁证。"
+        error_fingerprint = "ConnectionRefused"
+        current_exploit_state = "init"
+        milestones = ["init: 本轮未取得进展，部分步骤失败"]
+        transition_blocker = f"部分步骤失败 ({len([r for r in results if not (r.get('result') or {}).get('ok')])}/{len(results)} 步骤失败)，需检查错误类型确定阻塞点"
+        next_action = "检查 stderr 中的错误指纹，修复语法/连通性问题后再探测"
+        what_worked_str = "无步骤成功"
+        what_failed_str = f"部分步骤失败 ({len([r for r in results if not (r.get('result') or {}).get('ok')])}/{len(results)} 步骤失败)"
+        raw_evidence_str = all_stdouts[:500] if all_stdouts.strip() else "stdout 无有效内容"
+        hypothesis_str = _STATIC_HYPOTHESIS_UNKNOWN
+        next_direction_str = "检查目标连通性和脚本语法"
 
     blind_rce_feedback = _BLIND_RCE_FEEDBACK if blind_rce else (
         "若失败：拆分命令、增加探测步骤；若成功：固化可复用 payload 到技术记忆。"
     )
+
+    # ── Partial primitive detection (even in MOCK mode) ──
+    all_payloads = " ".join(
+        str(st.get("command") or "") for st in ((plan or {}).get("steps") or [])
+    )
+    mock_primitives = _detect_primitives(all_stdouts, all_payloads, results)
+
+    # ── EPE: semantic progress scoring ──
+    epe = _compute_progress_score(all_stdouts, all_payloads, results, mock_primitives, flag, signal)
+
+    # is_milestone: true when we have L3 capability or L2 primitive breakthrough
+    has_partial_progress = epe["progress_score"] >= 0.25
+
+    # Momentum-aware feedback: cross-round state carry is now richer
+    momentum_feedback = blind_rce_feedback
+    if epe["exploit_momentum"] and not blind_rce:
+        l1 = epe["_level_breakdown"]["L1_surface"]
+        l2 = epe["_level_breakdown"]["L2_primitive"]
+        l3 = epe["_level_breakdown"]["L3_capability"]
+        if l3 > 0:
+            momentum_feedback += f" [MOMENTUM·L3] capability signal detected (score={epe['progress_score']:.2f}). Deepen this path — DO NOT pivot or restart fuzzing."
+        elif l2 > 0:
+            momentum_feedback += f" [MOMENTUM·L2] exploit primitive activated (score={epe['progress_score']:.2f}). Continue refining payload on this same endpoint."
+        elif l1 > 0:
+            momentum_feedback += f" [MOMENTUM·L1] surface perturbation confirmed (score={epe['progress_score']:.2f}). Stay on this injection point and escalate payload complexity."
 
     return {
         "version": 1,
@@ -340,6 +1154,17 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
         "confidence": confidence,
         "evidence_level": evidence_level,
         "hard_evidence_found": hard_evidence,
+        "error_fingerprint": error_fingerprint,
+        "current_exploit_state": current_exploit_state,
+        "milestones_achieved": milestones,
+        "state_transition_blocker": transition_blocker,
+        "next_required_action": next_action,
+        "what_worked": what_worked_str,
+        "what_failed": what_failed_str,
+        "raw_evidence": raw_evidence_str,
+        "verified_facts": [],
+        "hypothesis": hypothesis_str,
+        "next_direction": next_direction_str,
         "analysis": {
             "what_happened": what_happened,
             "vs_expectation": "MOCK 模式：基于本地正则检测，未进行语义分析。",
@@ -349,17 +1174,71 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
             ),
         },
         "summary": what_happened,
-        "feedback_for_planner": blind_rce_feedback,
+        "feedback_for_planner": momentum_feedback,
         "should_continue": not success or blind_rce,
         "suggest_abort": False,
-        "is_milestone": bool(flag or signal),
+        "is_milestone": bool(flag or signal) or has_partial_progress,
         "memory_patch": {},
+        "detected_primitives": mock_primitives.get("detected_primitives", []),
+        "primitive_confidence": mock_primitives.get("primitive_confidence", {}),
+        "primitive_evidence": mock_primitives.get("primitive_evidence", {}),
+        "exploit_chain_primitive": [],
+        # ── EPE fields (backward-compat: additive, existing schema intact) ──
+        "progress_score": epe["progress_score"],
+        "exploit_momentum": epe["exploit_momentum"],
+        "state_transition_probability": epe["state_transition_probability"],
+        "suggested_next_action": epe["suggested_next_action"],
+        "_epe_levels": epe["_level_breakdown"],
+        "_behavioral_signals": epe["_behavioral_signals"],
     }
 
 
 # ────────────────────────────────────────────────────────────────
 # 主入口
 # ────────────────────────────────────────────────────────────────
+
+def _runtime_truth_value(runtime_truths: dict[str, Any] | None, key: str, default: Any = None) -> Any:
+    if not runtime_truths:
+        return default
+    value = runtime_truths.get(key, default)
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value", default)
+    return value
+
+
+def _enforce_authoritative_context(
+    fb: dict[str, Any],
+    runtime_truths: dict[str, Any] | None,
+    template_selection: dict[str, Any] | None,
+) -> dict[str, Any]:
+    prefixes: list[str] = []
+    method = _runtime_truth_value(runtime_truths, "confirmed_render_method") or _runtime_truth_value(runtime_truths, "form_method")
+    param = _runtime_truth_value(runtime_truths, "confirmed_injection_param") or _runtime_truth_value(runtime_truths, "form_param") or "text"
+    if str(method).upper() == "POST":
+        prefixes.append(
+            f"[TARGET_FACT] Runtime facts require POST. Never recommend GET. Use POST body parameter {param}."
+        )
+
+    selection = template_selection or {}
+    if selection.get("status") == "ALL_MATCHED_STRATEGIES_REJECTED":
+        prefixes.append(
+            "[NO_AVAILABLE_STRATEGY_FOR_SURFACE] All known strategies for the current surface are empirically rejected. "
+            "Do not recommend same-family payloads; request a new strategy or switch surface."
+        )
+
+    if not prefixes:
+        return fb
+
+    prefix = "\n".join(prefixes)
+    fb.setdefault("analysis", {})
+    for field in ("next_required_action", "feedback_for_planner"):
+        existing = fb.get(field) or ""
+        if prefix not in existing:
+            fb[field] = prefix + ("\n" + existing if existing else "")
+    guidance = fb["analysis"].get("guidance") or ""
+    if prefix not in guidance:
+        fb["analysis"]["guidance"] = prefix + ("\n" + guidance if guidance else "")
+    return fb
 
 def run_evaluator(
     settings: Settings,
@@ -370,23 +1249,51 @@ def run_evaluator(
     feedback_path: Path,
     llm: DeepSeekClient | None,
     adapter: ChallengeAdapter | None = None,
+    runtime_truths: dict[str, Any] | None = None,
+    template_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # ── 0. None 防御: executor 超时/崩溃时 exec_out 可能为 None ──
+    if exec_out is None:
+        fb = {
+            "success": False,
+            "error": "executor_timeout_or_crash",
+            "repro_success": False,
+        }
+        feedback_path.parent.mkdir(parents=True, exist_ok=True)
+        feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
+        return fb
+
     # ── 1. 脏数据清洗（截断 + 去 ANSI）+ expected_outcome 注入
     clean_exec_out = _sanitize_exec_output(exec_out, plan=plan)
 
     # ── 2. 本地预判定（不依赖 LLM）────────────────────
+    safe_plan = plan if plan is not None else {}
     all_stdouts = " ".join(
-        (r.get("result") or {}).get("stdout", "")
+        str((r.get("result") or {}).get("_stdout") or (r.get("result") or {}).get("stdout") or "")
         for r in clean_exec_out.get("step_results") or []
+    )
+    # 同时扫描 chain_output._stdout（Executor 注入的上下文 stdout）
+    chain_stdouts = " ".join(
+        str((r.get("chain_output") or {}).get("_stdout") or "")
+        for r in clean_exec_out.get("step_results") or []
+    )
+    all_stdouts = f"{all_stdouts} {chain_stdouts}"
+    # Evidence hygiene: strip framework noise from aggregated stdout
+    all_stdouts = clean_framework_artifacts(all_stdouts)
+    all_payloads = " ".join(
+        str(st.get("command") or "") for st in (safe_plan.get("steps") or [])
     )
     pre_flag    = _detect_flag(all_stdouts)
     pre_signal  = _detect_success_signal(all_stdouts) if not pre_flag else ""
     pre_blind   = _detect_blind_rce(clean_exec_out.get("step_results") or []) if not pre_flag else False
+    pre_primitives = _detect_primitives(all_stdouts, all_payloads, clean_exec_out.get("step_results") or [])
 
     # ── 3. Mock 模式 ────────────────────────────────
     if settings.mock_llm or llm is None:
         fb = _mock_evaluate(confirmed, plan, clean_exec_out)
+        fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
+        _update_payload_scores_from_eval(fb.get("repro_success", False), safe_plan)
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
         feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
         return fb
@@ -398,36 +1305,161 @@ def run_evaluator(
         if extra:
             system_prompt = EVAL_SYSTEM + "\n\n【靶场专项规则】\n" + extra
 
-    # 预检测结果注入（减少 LLM 幻觉）
+
+    runtime_context_rules = (
+        "\n\n[AUTHORITATIVE_RUNTIME_CONTEXT]\n"
+        "Runtime facts override speculative recommendations.\n"
+        "If target facts require POST, never recommend GET.\n"
+        "Template selection status is authoritative. If status is ALL_MATCHED_STRATEGIES_REJECTED, "
+        "do not recommend same-family payloads or variants.\n"
+        "These constraints apply to next_required_action, analysis.guidance, and feedback_for_planner.\n"
+        f"runtime_truths={json.dumps(runtime_truths or {}, ensure_ascii=False)}\n"
+        f"template_selection={json.dumps(template_selection or (plan or {}).get('template_selection') or {}, ensure_ascii=False)}"
+    )
+    system_prompt += runtime_context_rules    # ═══════════════════════════════════════════════════════════════════
+    # 🔬 ABLATION HOOK — 实验开关（对正常逻辑零影响）
+    # 设置环境变量 CO_REDTEAM_ABLATION=EXP_A|EXP_B|EXP_C 激活实验
+    # ═══════════════════════════════════════════════════════════════════
+    _ablation_mode = get_mode()
+    if _ablation_mode:
+        print(f"\n[evaluator] {'='*60}")
+        print(f"[evaluator] 🔬 ABLATION ACTIVE: {ablation_summary()}")
+        print(f"[evaluator] {'='*60}\n")
+        # Experiment transforms: may strip confirmed, plan, or rewrite rejection text
+        _ablation_confirmed, _ablation_plan, _ablation_pre_note = apply_ablation(
+            _ablation_mode, confirmed, plan, ""
+        )
+        # Apply transforms to local variables used below
+        confirmed = _ablation_confirmed  # type: ignore[assignment]
+        plan = _ablation_plan  # type: ignore[assignment]
+        # For EXP_C: pre_detection_note is set by apply_ablation;
+        # for EXP_A/EXP_B: we rebuild it normally after this block.
+        # We detect EXP_C by checking if apply_ablation returned non-empty note.
+        _ablation_has_rejection_override = bool(_ablation_pre_note)
+    else:
+        _ablation_mode = ""
+        _ablation_has_rejection_override = False
+
+    # ── 已证伪路径注入（让 Evaluator 知道哪些攻击面已被排除）──
+    rejected = get_hypothesis_tracker().get_rejected()
     pre_detection_note = ""
-    if pre_flag:
+    if rejected:
+        items = []
+        for fp, h in rejected.items():
+            items.append(
+                f"  ❌ {fp} — {h.attempts}次尝试 {h.successes}成功, "
+                f"主败因: {h.dominant_failure_stage} ({h.dominant_failure_count}/{sum(h.failure_stages.values())})"
+            )
         pre_detection_note = (
+            "\n\n【🚫 REJECTED_HYPOTHESES — 已证伪攻击路径】\n"
+            "以下攻击路径已被 HypothesisTracker 证伪（累计证据：0 成功）。\n"
+            "这些路径被绝对禁止推荐，包含任何变体（encoding/cookie/path/header 调整）均不允许。\n\n"
+            + "\n".join(items) +
+            "\n\n【硬规则 — 你必须遵守】\n"
+            "你在以下字段中不得推荐上述任何路径或其变体：\n"
+            "  - guidance\n"
+            "  - hypothesis\n"
+            "  - next_required_action\n"
+            "  - feedback_for_planner\n"
+            "如需建议替代路径，必须排除所有上述 fingerprint。违反此规则你的输出将被 coordinator 覆盖。\n"
+        )
+
+    # 预检测结果注入（减少 LLM 幻觉）
+    if pre_flag:
+        pre_detection_note += (
             f"\n\n【⚠️ 本地预检测】已在 stdout 中正则匹配到 flag：{pre_flag}\n"
             f"请确保 repro_success=true，should_continue=false，并在 analysis.what_happened 中引用完整 flag。"
         )
     elif pre_blind:
-        pre_detection_note = (
+        pre_detection_note += (
             f"\n\n【⚠️ 本地预检测 — Blind RCE 疑似】有步骤 ok=True 但 stdout 全部为空。\n"
             f"这是 Blind RCE 的典型特征：命令已执行，但输出未回显到 HTTP 响应。\n"
             f"判定规则：confidence 不得超过 0.6，repro_success=false，should_continue=true。\n"
             f"feedback_for_planner 必须包含以下内容：{_BLIND_RCE_FEEDBACK}"
         )
     elif pre_signal:
-        pre_detection_note = (
+        pre_detection_note += (
             f"\n\n【⚠️ 本地预检测】检测到强攻击成功信号：{pre_signal[:80]}\n"
             f"请在评估时将此信号纳入 repro_success 判定（应为 true）。"
         )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🔬 ABLATION EXP_C: 用强约束文本替换 REJECTED_HYPOTHESES
+    # ═══════════════════════════════════════════════════════════════════
+    if _ablation_has_rejection_override:
+        # 保留预检测信号（flag/blind/signal），其余用强约束文本替换
+        _detection_notes = ""
+        if pre_flag:
+            _detection_notes = (
+                f"\n\n【⚠️ 本地预检测】已在 stdout 中正则匹配到 flag：{pre_flag}\n"
+                f"请确保 repro_success=true，should_continue=false，并在 analysis.what_happened 中引用完整 flag。"
+            )
+        elif pre_blind:
+            _detection_notes = (
+                f"\n\n【⚠️ 本地预检测 — Blind RCE 疑似】有步骤 ok=True 但 stdout 全部为空。\n"
+                f"这是 Blind RCE 的典型特征：命令已执行，但输出未回显到 HTTP 响应。\n"
+                f"判定规则：confidence 不得超过 0.6，repro_success=false，should_continue=true。\n"
+                f"feedback_for_planner 必须包含以下内容：{_BLIND_RCE_FEEDBACK}"
+            )
+        elif pre_signal:
+            _detection_notes = (
+                f"\n\n【⚠️ 本地预检测】检测到强攻击成功信号：{pre_signal[:80]}\n"
+                f"请在评估时将此信号纳入 repro_success 判定（应为 true）。"
+            )
+        pre_detection_note = _ablation_pre_note + _detection_notes
+        print(f"[ablation] EXP_C: final pre_detection_note = {len(pre_detection_note)} chars")
 
     user_payload = {
         "confirmed_vuln": confirmed,
         "plan": plan,
         "execution_result": clean_exec_out,
+        "runtime_truths": runtime_truths or {},
+        "template_selection": template_selection or (plan or {}).get("template_selection") or {},
     }
     user_msg = json.dumps(user_payload, ensure_ascii=False) + pre_detection_note
 
     # ── 5. 调用 LLM ─────────────────────────────────
     fb = llm.complete_json(system_prompt, user_msg)
+    fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🔬 ABLATION RECORD — 保存完整实验数据
+    # ═══════════════════════════════════════════════════════════════════
+    if _ablation_mode:
+        record_ablation(
+            mode=_ablation_mode,
+            system_prompt=system_prompt,
+            user_msg=user_msg,
+            llm_output=fb,
+            metadata={
+                "confirmed_vuln_keys": list(confirmed.keys()) if isinstance(confirmed, dict) else str(type(confirmed)),
+                "plan_keys": list(plan.keys()) if isinstance(plan, dict) else str(type(plan)),
+                "pre_detection_note_len": len(pre_detection_note),
+                "pre_flag": bool(pre_flag),
+                "pre_blind": pre_blind,
+                "pre_signal": bool(pre_signal),
+            },
+        )
+
+    if fb is None:
+        # LLM 返回 None，回退到 mock 评估
+        fb = _mock_evaluate(confirmed, plan, clean_exec_out)
+        fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
+        memory.apply_evaluator_patch(fb.get("memory_patch") or {})
+        _update_payload_scores_from_eval(fb.get("repro_success", False), safe_plan)
+        feedback_path.parent.mkdir(parents=True, exist_ok=True)
+        feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
+        return fb
     fb.setdefault("version", 1)
+    # 防 LLM 返回 "analysis": null 导致后续 [] 崩溃
+    if not isinstance(fb.get("analysis"), dict):
+        fb["analysis"] = {}
+
+    # ── 5.5 认知论守卫：强制分离 verified_facts 与 hypothesis ──
+    fb = _sanitize_verified_facts(fb)
+
+    # ── 5.6 证据锚定验证：hypothesis 必须引用具体 observable evidence ──
+    fb = _validate_hypothesis_anchoring(fb)
 
     # ── 6. 严谨成功判定覆写（防 LLM 幻觉）─────────────
     if pre_flag and not fb.get("repro_success"):
@@ -474,34 +1506,105 @@ def run_evaluator(
     fb.setdefault("evidence_level", "F")
     fb.setdefault("hard_evidence_found", "NONE")
 
-    # ── 7.1 零信任覆写：LLM 声称成功但无 S 级铁证时强制降级 ──
+    # ── primitive detection fields ──
+    fb.setdefault("detected_primitives", pre_primitives.get("detected_primitives", []))
+    fb.setdefault("primitive_confidence", pre_primitives.get("primitive_confidence", {}))
+    fb.setdefault("primitive_evidence", pre_primitives.get("primitive_evidence", {}))
+    fb.setdefault("exploit_chain_primitive", [])  # Exploit chain in primitive terms
+
+    # ── EPE: compute progress score even when LLM is used ──
+    ep = _compute_progress_score(all_stdouts, all_payloads,
+                                  clean_exec_out.get("step_results") or [],
+                                  pre_primitives, pre_flag, pre_signal)
+    fb.setdefault("progress_score", ep["progress_score"])
+    fb.setdefault("exploit_momentum", ep["exploit_momentum"])
+    fb.setdefault("state_transition_probability", ep["state_transition_probability"])
+    fb.setdefault("suggested_next_action", ep["suggested_next_action"])
+    fb.setdefault("_epe_levels", ep["_level_breakdown"])
+    fb.setdefault("_behavioral_signals", ep["_behavioral_signals"])
+
+    # ── 7.0 新字段兜底：确保 error_fingerprint / state machine 等字段始终存在 ──
+    fb.setdefault("error_fingerprint", "AllStdoutEmpty" if not all_stdouts.strip() else "ConnectionRefused")
+    fb.setdefault("current_exploit_state", "init")
+    fb.setdefault("milestones_achieved", ["init: 本轮未取得进展"])
+    fb.setdefault("state_transition_blocker", "证据不足，无法确定阻塞点")
+    fb.setdefault("next_required_action", "根据 raw_evidence 中的 HTTP 响应调整 payload 参数")
+    fb.setdefault("what_worked", "无步骤产生有效输出")
+    fb.setdefault("what_failed", "所有步骤 stdout 为空" if not all_stdouts.strip() else "部分步骤失败")
+    fb.setdefault("raw_evidence", (
+        "所有步骤 stdout 为空 — Executor 输出捕获可能存在问题"
+        if not all_stdouts.strip()
+        else all_stdouts[:500]
+    ))
+    fb.setdefault("verified_facts", [])
+    fb.setdefault("hypothesis", "证据不足，无法推断")
+    fb.setdefault("next_direction", (
+        "排查 Executor stdout 捕获机制"
+        if not all_stdouts.strip()
+        else "根据 raw_evidence 中的 HTTP 响应调整 payload 参数"
+    ))
+
+    # ── 7.0.1 AllStdoutEmpty 时强制覆盖：禁止 unknown_error + 锁定状态机为 init ──
+    if not all_stdouts.strip():
+        fb["error_fingerprint"] = "AllStdoutEmpty"
+        fb["current_exploit_state"] = "init"
+        fb["milestones_achieved"] = ["init: 本轮未取得进展，所有步骤 stdout 为空"]
+        fb["state_transition_blocker"] = "所有步骤 stdout 为空，无法推进状态。需排查 Executor/Docker 输出捕获机制"
+        fb["next_required_action"] = "排查 Executor stdout 捕获机制，检查 Docker 容器日志和脚本包装逻辑"
+        fb["hypothesis"] = "所有步骤 stdout 为空，Executor 输出捕获可能存在问题"
+        fb["raw_evidence"] = "所有步骤 stdout 为空 — 这是严重异常，请检查：\n" \
+            "1. Docker 容器是否正常启动并执行了脚本\n" \
+            "2. 脚本包装器（_run_docker）是否正常注入了输出捕获\n" \
+            "3. 脚本是否因阻塞/死循环导致超时前无输出"
+    elif fb.get("error_fingerprint") == "unknown_error":
+        # 有 stdout 但 LLM 返回了 unknown_error → 从 stdout 提取真实错误
+        all_text = all_stdouts + " " + " ".join(
+            str((r.get("result") or {}).get("stderr") or "")[:200]
+            for r in clean_exec_out.get("step_results") or []
+        )
+        if "STEP_FAIL:" in all_text:
+            fb["error_fingerprint"] = "NameError"
+            fb.setdefault("current_exploit_state", "init")
+            fb.setdefault("state_transition_blocker", "Python NameError — 变量/方法名不存在。需要反射探测确认 SDK API")
+        elif "[HTTP] 4" in all_text:
+            fb["error_fingerprint"] = "HTTPError4xx"
+            fb.setdefault("current_exploit_state", "init")
+            fb.setdefault("state_transition_blocker", "HTTP 4xx 客户端错误 — 请求被目标拒绝。检查字段名/endpoint/认证")
+        elif "[HTTP] 5" in all_text:
+            fb["error_fingerprint"] = "HTTPError5xx"
+            fb.setdefault("current_exploit_state", "init")
+        elif "Connection refused" in all_text or "ConnectionError" in all_text:
+            fb["error_fingerprint"] = "ConnectionRefused"
+            fb.setdefault("current_exploit_state", "init")
+            fb.setdefault("state_transition_blocker", "目标连接被拒绝 — 检查 base_url 和网络连通性")
+        elif "SyntaxError" in all_text:
+            fb["error_fingerprint"] = "SyntaxError"
+            fb.setdefault("current_exploit_state", "init")
+            fb.setdefault("state_transition_blocker", "Python 语法错误 — 修复脚本语法")
+        elif "All fields are required" in all_text:
+            fb["error_fingerprint"] = "AllFieldsRequired"
+            fb.setdefault("current_exploit_state", "probe_success")
+            fb.setdefault("state_transition_blocker", "REST API 'All fields are required!' — 字段名不匹配，需用 email 替代 username")
+        fb["raw_evidence"] = all_text[:500]
+
+    # ── 7.1 零信任覆写：LLM 声称成功但 stdout 中无 flag 时强制降级 ──
     if fb.get("repro_success") and not pre_flag:
-        evidence = fb.get("hard_evidence_found", "")
         raw_stdout_text = all_stdouts
-        # Check for S-level physical evidence
-        has_s_evidence = False
-        s_patterns = [
-            r"uid=\d+\(\w+\)",               # uid=0(root)
-            r"root:[x*]:\d+:\d+:",           # /etc/passwd content
-            r"/etc/(passwd|shadow)",          # sensitive file refs
-            r"flag\{[^}]+\}",                 # flag format
-            r"CTF\{[^}]+\}",                  # CTF format
-            r"HTB\{[^}]+\}",                  # HTB format
-        ]
-        for pat in s_patterns:
-            if re.search(pat, raw_stdout_text, re.IGNORECASE):
-                has_s_evidence = True
-                break
-        if not has_s_evidence:
+        # flag 格式是唯一的"任务完成"信号，其他一切都是中间过程
+        has_flag = any(re.search(p, raw_stdout_text, re.IGNORECASE) for p in [
+            r"flag\{[^}]+\}", r"CTF\{[^}]+\}", r"HTB\{[^}]+\}",
+        ])
+        if not has_flag:
             fb["repro_success"] = False
+            fb["should_continue"] = True
             fb["confidence"] = min(fb.get("confidence", 0.5), 0.5)
             fb["evidence_level"] = "F"
             fb.setdefault("analysis", {})
             fb["analysis"]["what_happened"] = (
                 fb["analysis"].get("what_happened", "")
-                + "（零信任覆写：LLM 声称成功但 raw_stdout 中无 S 级物理铁证，强制降级为 failed）"
+                + "（零信任覆写：stdout 中未检测到 flag{...}/HTB{...}/CTF{...} 字符串，强制降级）"
             )
-            fb["summary"] = "[FAILED·零信任覆写] LLM 已宣称成功，但 raw_stdout 中缺少 S 级物理铁证（uid=0、/etc/passwd、flag 等），已被系统强制判定为失败。"
+            fb["summary"] = "[FAILED·零信任覆写] 未检测到 flag 字符串，任务未完成。"
 
     # ── 7.2 LLM 声称失败时强制 [FAILED] 前缀 ──
     if not fb.get("repro_success"):
@@ -510,12 +1613,41 @@ def run_evaluator(
             fb["summary"] = "[FAILED] " + existing_summary
 
     # ── 7.5 history_state 透传：将当前 plan 的 history_state 作为 prior_history_state 传给下一轮 Planner ──
-    current_history = plan.get("history_state")
+    current_history = safe_plan.get("history_state")
     if current_history and isinstance(current_history, dict):
         fb["prior_history_state"] = current_history
 
     # ── 8. 写入记忆和文件 ────────────────────────────
     memory.apply_evaluator_patch(fb.get("memory_patch") or {})
+
+    # ── 8.1 更新 payload 评分 ──
+    _update_payload_scores_from_eval(fb.get("repro_success", False), safe_plan)
+
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
     return fb
+
+
+def _update_payload_scores_from_eval(success: bool, plan: dict[str, Any]) -> None:
+    """根据评估结果更新 tech.json 中对应 payload 的评分。
+
+    从 plan 的每个 step 中提取 template，计算指纹，然后调用 update_payload_score。
+    """
+    from core.payload_registry import update_payload_score, fingerprint
+
+    steps = plan.get("steps") or []
+    if not steps:
+        return
+
+    memory_dir = Path(__file__).resolve().parents[1] / "memory"
+
+    for step in steps:
+        template = step.get("template") or step.get("command") or ""
+        if not template or not isinstance(template, str):
+            continue
+        lang = step.get("lang", "python")
+        fp = fingerprint(template, lang)
+        try:
+            update_payload_score(memory_dir, fp, success)
+        except Exception:
+            pass

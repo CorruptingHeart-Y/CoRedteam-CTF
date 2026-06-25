@@ -1,0 +1,31 @@
+{
+  "learned_primitives": [
+    {
+      "primitive_id": "command_separator",
+      "confidence": 0.7,
+      "evidence": "shell separator in payload: command_separator_used",
+      "engine_hint": "",
+      "payload_instance": "",
+      "endpoint": "/workspace/context.json",
+      "method": "GET",
+      "learned_at": "2026-06-14T16:04:18.573338+00:00",
+      "observations_count": 1,
+      "generalized": true,
+      "cross_target_applicable": []
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 0.7,
+      "evidence": "class traversal output detected: object_introspection_succeeded",
+      "engine_hint": "jinja2",
+      "payload_instance": "{{config.__class__.__init__.__globals__[",
+      "endpoint": "/workspace/context.json",
+      "method": "GET",
+      "learned_at": "2026-06-16T15:41:02.806932+00:00",
+      "observations_count": 1,
+      "generalized": true,
+      "cross_target_applicable": []
+    }
+  ],
+  "version": 1
+}

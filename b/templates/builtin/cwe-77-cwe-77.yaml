@@ -1,0 +1,36 @@
+metadata:
+  id: cwe-77-cwe-77
+  name: CWE-77
+  cwe_ids:
+  - CWE-77
+  target_type: generic
+  tags:
+  - cwe-77
+  - cwe-77
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 基于CWE-77（命令注入）的带外确认Payload，使用curl将命令输出外带至OOB服务器，避免依赖HTTP响应
+payload_templates:
+- name: oob-curl-command-injection
+  description: 基于CWE-77（命令注入）的带外确认Payload，使用curl将命令输出外带至OOB服务器，避免依赖HTTP响应
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: single-quote-breakout-with-curl-oob
+  description: '针对date命令单引号注入的特殊变种，注入''; curl ...; #'' 实现逃逸与外带'
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: single-quote-breakout-in-shell-exec
+  description: Payload that breaks out of single quotes in a shell command built by
+    exec() or system(), appending arbitrary commands. Ideal for PHP apps that wrap
+    user input in single quotes inside backticks or shell_exec.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical

@@ -1,0 +1,93 @@
+┌──────────────────── Co-RedTeam  Phase 2 — Exploitation ─────────────────────┐
+│  Target   http://172.29.80.1:9084                                           │
+│  Vulns    data/confirmed_vuln.json                                          │
+│  Adapter  generic                                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────── 🔒 TARGET LOCKED — 仅此目标可被访问 ────────────────────┐
+│  URL    http://172.29.80.1:9084                                             │
+│  Host   172.29.80.1                                                         │
+│  IP     172.29.80.1                                                         │
+│  Port   9084                                                                │
+│  Scheme http                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+D:\11\Lib\site-packages\paramiko\pkey.py:82: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from this module in 48.0.0.
+  "cipher": algorithms.TripleDES,
+D:\11\Lib\site-packages\paramiko\transport.py:219: CryptographyDeprecationWarning: Blowfish has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.Blowfish and will be removed from this module in 45.0.0.
+  "class": algorithms.Blowfish,
+D:\11\Lib\site-packages\paramiko\transport.py:243: CryptographyDeprecationWarning: TripleDES has been moved to cryptography.hazmat.decrepit.ciphers.algorithms.TripleDES and will be removed from this module in 48.0.0.
+  "class": algorithms.TripleDES,
+No challenge-specific warmup for 'generic', skipping static injection
+[CLI] Starting Phase 2 pipeline (challenge=generic, max_runs=1)...
+
+========== OUTER RUN 1/1 ==========
+[memory] Loaded 27 initial patterns
+[memory] Loaded 0 success strategies
+[memory] Loaded 0 initial tech commands
+[memory] Loaded 23 initial payload templates
+[memory] Loaded 0 initial scripts
+[CLI] 挑战适配器: generic
+[CLI] 目标白名单已锁定 → http://172.29.80.1:9084 (ip=172.29.80.1)
+输入漏洞文件: C:\Users\ADMIN\redteam\b\data\confirmed_vuln.json
+mock_llm=False, model=deepseek-v4-flash, max_iter=3
+2026-06-24 21:11:47,971 [INFO] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-06-24 21:11:50,072 [INFO] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+2026-06-24 21:11:52,224 [INFO] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"
+[coordinator] 🔄 RuntimeTruths 已重置（新目标开始）
+
+==================================================
+MODEL HEALTH CHECK
+==================================================
+
+Planner:
+  model = deepseek-v4-flash
+[llm] DIAG — system_prompt: 21 chars / 47 bytes
+[llm] DIAG — user_prompt:   44 chars / 84 bytes
+[llm] DIAG — total_prompt:  65 chars / 131 bytes
+[llm] DIAG — usage: prompt_tokens=55, completion_tokens=26, total_tokens=81
+[llm] DIAG — len(resp.choices)=1
+[llm] DIAG — finish_reason: stop
+[llm] DIAG — content len:   16
+[llm] DIAG — reasoning_content len: 43
+[llm] DIAG — tool_calls: None
+[llm] DIAG — content[:500]: '{"status": "ok"}'
+[llm] DIAG — raw message dict: {'content': '{"status": "ok"}', 'refusal': None, 'role': 'assistant', 'annotations': None, 'audio': None, 'function_call': None, 'tool_calls': None, 'reasoning_content': '我们只需要输出一个JSON对象：{"status": "ok"}。不能有任何其他内容。'}
+[llm] DIAG — VERDICT: normal response
+================================================================================
+  api   = OK
+  json  = OK
+
+Evaluator:
+  model = deepseek-v4-flash
+[llm] DIAG — system_prompt: 21 chars / 47 bytes
+[llm] DIAG — user_prompt:   44 chars / 84 bytes
+[llm] DIAG — total_prompt:  65 chars / 131 bytes
+[llm] DIAG — usage: prompt_tokens=55, completion_tokens=34, total_tokens=89
+[llm] DIAG — len(resp.choices)=1
+[llm] DIAG — finish_reason: stop
+[llm] DIAG — content len:   16
+[llm] DIAG — reasoning_content len: 55
+[llm] DIAG — tool_calls: None
+[llm] DIAG — content[:500]: '{"status": "ok"}'
+[llm] DIAG — raw message dict: {'content': '{"status": "ok"}', 'refusal': None, 'role': 'assistant', 'annotations': None, 'audio': None, 'function_call': None, 'tool_calls': None, 'reasoning_content': '我们被要求输出一个JSON对象: {"status": "ok"}，且不要任何其他内容。因此直接输出该字符串。'}
+[llm] DIAG — VERDICT: normal response
+================================================================================
+  api   = OK
+  json  = OK
+
+Consolidator:
+  model = deepseek-v4-pro
+[consolidator] DIAG — finish_reason: stop
+[consolidator] DIAG — content length: 16 chars / 16 bytes
+[consolidator] DIAG — usage: prompt_tokens=25, completion_tokens=20, total_tokens=45
+[consolidator] DIAG — reasoning_content length: 24 chars
+[consolidator] DIAG — content[:500]: '{"status": "ok"}'
+  api   = OK
+  json  = OK
+
+==================================================
+[fsm] progression=generic CWE=['CWE-93 → CWE-502 → CWE-78']
+[hypothesis_tracker] 已加载 4 条历史假设 (已拒绝: 3)
+───────────────────────────────── 迭代 1 / 3 ──────────────────────────────────
+[Planner] 构建攻击链...
+2026-06-24 21:11:54,689 [INFO] HTTP Request: POST https://api.deepseek.com/chat/completions "HTTP/1.1 200 OK"

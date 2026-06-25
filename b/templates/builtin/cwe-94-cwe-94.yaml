@@ -1,0 +1,184 @@
+metadata:
+  id: cwe-94-cwe-94
+  name: CWE-94
+  cwe_ids:
+  - CWE-94
+  target_type: generic
+  tags:
+  - cwe-94
+  - cwe-94
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 针对 Apache Velocity SSTI 的模板，利用 Java 反射链执行系统命令并捕获输出。该模板可用于容器化环境下的渗透测试，规避沙箱对本地系统调用的限制。
+payload_templates:
+- name: velocity-java-reflection-rce
+  description: 针对 Apache Velocity SSTI 的模板，利用 Java 反射链执行系统命令并捕获输出。该模板可用于容器化环境下的渗透测试，规避沙箱对本地系统调用的限制。
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: velocity-rce-reflection-chain-inline-output
+  description: 新增 Velocity SSTI 反射链 RCE 载荷模板，用于 CWE-94（模板注入）场景，包含反射确认逻辑和命令执行载荷，适用于
+    Apache Velocity。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-reflection-code-execution
+  description: 基于Apache Velocity的SSTI利用模板，包含反射验证、算术确认和Java Runtime RCE payload。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-reflection-rce-with-scanner
+  description: 针对 Apache Velocity 模板注入的 RCE payload，利用反射调用 Runtime.exec 并用 Scanner
+    获取输出。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-oob-reflective-rce
+  description: 基于 Apache Velocity 模板注入，通过 Java 反射执行系统命令并利用 OOB 回调外带结果，完全无内联回显且不依赖
+    Docker 基础设施。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-file-read-via-parse
+  description: 新增针对Apache Velocity SSTI的文件包含读取flag武器化模板，包含无方法调用的#parse指令payload，适用于禁止反射的场景。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: verify-then-exec
+  description: 'Creates a new YAML weaponization template for Velocity SSTI (CWE-94)
+    with a two-phase approach: arithmetic verification followed by minimal Runtime.exec.
+    The template should include the Python code as a payload template under payload_templates,
+    tagged with ''velocity'', ''ssti'', ''verification'', ''rce''.'
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-classloader-rce
+  description: 在代码注入模板库中追加基于 ClassLoader 的 Velocity RCE 载荷，作为 Runtime 直接调用的替代方案。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-basic-expression-check
+  description: '为 Apache Velocity SSTI 创建一个全新的武器化规则，收录基于 #set 的数学运算探针 Payload。模板会包含构造
+    GET 请求的完整流程，并注明必须使用正确的目标端口。'
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-runtime-exec-via-class-forName
+  description: 追加经典 Velocity SSTI RCE payload，利用 java.lang.Runtime 执行系统命令并获取回显。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: Velocity-SSTI-MultiProbe-Plus-OOB-RCE
+  description: 创建 Velocity SSTI 专用武器库规则，包含多态活性探测载荷和安全的 OOB 外带 RCE 流程，确保未来面对 Apache
+    Velocity 模板注入时，能先严格确认漏洞再执行命令外带，避免在误报上浪费步骤。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-detect-and-rce
+  description: 针对 Apache Velocity SSTI 的武器化模板，包含检测荷载 $class 和 Java Runtime 反射 RCE
+    荷载，适配 Labyrinth Linguist 环境。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-runtime-exec-reflection
+  description: 创建新的 CWE-94 Apache Velocity SSTI 模板，包含通过 Class.forName 反射调用 Runtime.exec
+    并回显的标准 Payload，标记为沙箱安全且可直接复用。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-rce-via-reflection
+  description: 为 Apache Velocity SSTI 生成 RCE 武器库模板，包含基于字符串反射的载荷，用于 CWE-94 漏洞利用。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-post-form-ssti-with-csrf
+  description: 新增一个基于 POST 表单+CSRF 感知的 Velocity SSTI 自动化探测模板，强制要求先进行方法发现和反射测试，避免查询参数误用。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-reflection-rce-inline-readfile
+  description: 针对 Apache Velocity SSTI 的反射型 RCE payload，通过 Java Runtime 执行命令并利用 Scanner
+    内联输出，规避了常见 WAF 对敏感类的过滤。添加至全局武器库以便后续 Velocity 场景自动选用。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-java-reflection-cat-flag
+  description: 基于 Java 反射链的 Velocity SSTI 载荷，通过 Runtime.exec + Scanner 读取文件内容，适配沙箱安全的
+    Python 执行环境。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-blind-sleep
+  description: 全新 CWE-94 Velocity SSTI 武器化模板，包含时间盲注和 OOB 外带两种高阶 Payload，替代失败的内联输出捕获方案。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-class-inspect-runtime-exec-scanner
+  description: Adds a Velocity SSTI payload template that uses class inspection to
+    get Runtime.exec and captures output with a character‑by‑character read loop,
+    suitable for environments where java.util.Scanner is not available or to avoid
+    extra dependecies.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-reflection-command-exec-read-output
+  description: 通过空字符串反射获取 Runtime 执行系统命令并读取输出的 Velocity 模板注入 payload。适用于参数 text 等用户输入直接拼入模板的场景。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-math-detection
+  description: 基于 HTTP GET 请求的 Velocity 模板注入探测骨架，使用数学表达式反射确认漏洞。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-runtime-exec-via-text-param
+  description: A Velocity SSTI payload that leverages Java Runtime.exec to execute
+    commands and returns output via Scanner. Injected through the vulnerable 'text'
+    POST parameter.
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical

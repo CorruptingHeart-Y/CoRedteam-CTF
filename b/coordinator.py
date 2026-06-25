@@ -8,13 +8,22 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from agents.evaluator import run_evaluator
 from agents.executor import run_executor
 from agents.planner import run_planner
 from agents.validator import run_validator
+from control.hypothesis_tracker import HypothesisTracker
 from core.challenge_adapter import ChallengeAdapter, get_adapter, list_adapters
+from core.strategy_identity import (
+    TRUSTED_SELECTION_FILENAME,
+    build_trusted_selection,
+    validate_plan_against_trusted_selection,
+    write_trusted_selection,
+)
+from core.template_manager import TemplateManager
 from core.llm_client import DeepSeekClient
 from core.memory_store import LayeredMemory
 from core.settings import get_settings
@@ -43,6 +52,34 @@ def _list_json_files(folder: Path) -> list[str]:
     if not folder.exists() or not folder.is_dir():
         return []
     return sorted([p.name for p in folder.glob("*.json") if p.is_file()])
+
+
+def should_record_strategy_attempt(exec_out: dict[str, Any]) -> bool:
+    """Only real executor runs count as strategy attempts; infra/pre-gate failures do not."""
+    if not exec_out.get("executed"):
+        return False
+    if exec_out.get("infra_failure") or exec_out.get("execution_mode") == "infra_failure":
+        return False
+    return bool(exec_out.get("step_results") or [])
+
+
+def _record_strategy_attempt_if_executed(
+    tracker: HypothesisTracker,
+    selected_canonical_strategy_id: str,
+    exec_out: dict[str, Any],
+    feedback: dict[str, Any],
+) -> None:
+    if not selected_canonical_strategy_id or not should_record_strategy_attempt(exec_out):
+        return
+    success = bool(feedback.get("repro_success"))
+    failure_stage = "" if success else str(feedback.get("error_fingerprint") or "runtime_failure")
+    evidence = str(feedback.get("summary") or feedback.get("feedback_for_planner") or "")[:300]
+    tracker.record_attempt(
+        selected_canonical_strategy_id,
+        success=success,
+        failure_stage=failure_stage,
+        evidence=evidence,
+    )
 
 
 def _load_confirmed(path: Path) -> dict[str, Any]:
@@ -507,10 +544,13 @@ def run_pipeline(
     validated_path = ws / "validated_plan.json"
     exec_path = ws / "execution_result.json"
     feedback_path = ws / "feedback.json"
+    trusted_selection_path = ws / TRUSTED_SELECTION_FILENAME
 
     feedback: dict[str, Any] | None = None
     last_plan: dict[str, Any] | None = None
     success_log: list[dict[str, Any]] = []
+    run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S%fZ")
+    _hypothesis_tracker = HypothesisTracker()
     _retry_iteration_done = False
 
     # ── 熔断器状态（论文 §3.3 防死循环机制）──────────────
@@ -545,6 +585,19 @@ def run_pipeline(
         # ── Planner ────────────────────────────────────────────────────────
         _print_agent_header("planner")
         stage("Planner", "构建攻击链...")
+        template_selection = TemplateManager().select_templates_for_target(
+            confirmed,
+            state=(feedback or {}).get("current_exploit_state", ""),
+            rejected_strategy_ids=_hypothesis_tracker.get_rejected_strategy_ids(),
+            strategy_health_resolver=lambda sid: _hypothesis_tracker.evaluate_strategy_health(sid).to_dict(),
+        )
+        trusted_selection = build_trusted_selection(
+            run_id=run_id,
+            round_index=iteration,
+            template_selection=template_selection.to_dict(),
+        )
+        write_trusted_selection(trusted_selection_path, trusted_selection)
+
         last_plan = run_planner(
             settings=settings,
             memory=memory,
@@ -553,6 +606,7 @@ def run_pipeline(
             out_path=plan_path,
             llm=llm,
             adapter=adapter,
+            trusted_selection=trusted_selection,
         )
         muted(
             f"plan_id={last_plan.get('plan_id')} steps={len(last_plan.get('steps') or [])} "
@@ -568,7 +622,12 @@ def run_pipeline(
         # ── Validator ──────────────────────────────────────────────────────
         _print_agent_header("validator")
         stage("Validator", "校验计划安全策略与语法...")
-        v = run_validator(plan_path, validated_path, prior_feedback=feedback)
+        v = run_validator(
+            plan_path,
+            validated_path,
+            prior_feedback=feedback,
+            trusted_selection_path=trusted_selection_path,
+        )
         val = v.get("validation", {})
         warnings = v.get("warnings") or []
         muted(
@@ -589,6 +648,28 @@ def run_pipeline(
             continue
 
         # ── Executor ───────────────────────────────────────────────────────
+        selected_canonical_strategy_id = str(last_plan.get("selected_canonical_strategy_id") or "").strip()
+        trusted_ok, trusted_errors = validate_plan_against_trusted_selection(last_plan, trusted_selection)
+        pre_gate_errors = list(trusted_errors) if not trusted_ok else []
+        if selected_canonical_strategy_id:
+            health = _hypothesis_tracker.evaluate_strategy_health(selected_canonical_strategy_id)
+            if health.decision in ("REJECT", "HARD_REJECT"):
+                pre_gate_errors.append(
+                    f"STRATEGY_REJECTED: {selected_canonical_strategy_id} decision={health.decision}"
+                )
+        if pre_gate_errors:
+            feedback = {
+                "from": "coordinator_pre_exec_gate",
+                "iteration": iteration,
+                "errors": pre_gate_errors,
+                "strategy_exhausted": trusted_selection.get("status") == "ALL_MATCHED_STRATEGIES_REJECTED",
+                "reason": "pre_execution_gate_blocked",
+                "feedback_for_planner": "Choose another trusted canonical strategy for the same confirmed surface.",
+            }
+            feedback_path.write_text(json.dumps(feedback, ensure_ascii=False, indent=2), encoding="utf-8")
+            warn(f"pre-exec gate blocked execution: {pre_gate_errors}")
+            continue
+
         _print_agent_header("executor")
         stage("Executor", "执行沙箱脚本...")
         try:
@@ -671,6 +752,12 @@ def run_pipeline(
             adapter=adapter,
         )
         feedback = fb
+        _record_strategy_attempt_if_executed(
+            _hypothesis_tracker,
+            selected_canonical_strategy_id,
+            exec_out,
+            fb,
+        )
         render_evaluator_feedback(fb)
 
         # ── AI 主动熔断（suggest_abort）────────────────────────────────────

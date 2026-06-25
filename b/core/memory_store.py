@@ -16,6 +16,101 @@ COLLECTION_TECH = "exploit_techniques"
 
 CHROMA_ALLOWED_TYPES = (str, int, float, bool, type(None))
 
+# ── P0: Memory Quarantine — 全局写开关 ──
+# True = 切断所有 ChromaDB 长期写入，防止幻觉污染知识库
+# 仅在 mock 模式下禁用写入；正常打靶时必须允许写入以积累经验
+def _resolve_write_disabled() -> bool:
+    try:
+        from core.settings import get_settings
+        return get_settings().mock_llm
+    except Exception:
+        return True  # 安全默认值：无法确定时禁用
+
+DISABLE_LONG_TERM_WRITE = _resolve_write_disabled()
+
+# ── Fix C: Unified Tactical Memory Gate ──
+# 全局控制：当 CWE 未知 且 FSM 处于初始/侦察状态时，禁止注入战术级 payload
+# 到 Planner Prompt。防止跨目标 SSTI/Velocity/命令注入 payload 污染。
+# 用法：允许调用方在 query_tech_payloads() 前检查此门控。
+
+
+def allow_tactical_memory(
+    confirmed: dict[str, Any] | None = None,
+    feedback: dict[str, Any] | None = None,
+    fsm_override: str | None = None,
+) -> tuple[bool, str]:
+    """Unified gate for tactical memory injection (tech payloads, commands, scripts).
+
+    Returns (allowed: bool, reason: str).
+
+    Rules:
+    - All CWEs are UNKNOWN/empty → block (no target-specific payload exists)
+    - FSM is discovery/init/probe_success → block (no component confirmed yet)
+    - Both conditions must be False for tactical memory to be allowed
+    """
+    # ── Rule 1: all known CWEs ──
+    cwe_ids: list[str] = []
+    if confirmed:
+        for v in (confirmed.get("vulnerabilities") or []):
+            cwe = str(v.get("cwe_id", "") or v.get("cwe", "") or "").strip()
+            if cwe:
+                cwe_ids.append(cwe)
+
+    known_cwes = [c for c in cwe_ids if c.upper() != "UNKNOWN"]
+    cwe_is_unknown = len(known_cwes) == 0
+
+    # ── Rule 2: FSM state ──
+    fsm_state = ""
+    if fsm_override is not None:
+        fsm_state = fsm_override.strip().lower()
+    elif feedback:
+        fsm_state = (feedback.get("current_exploit_state", "") or "").strip().lower()
+
+    # Also check the new capability-centric FSM (discovery stage)
+    fsm_is_early = (
+        (not fsm_state)
+        or (fsm_state in ("init", "probe_success", "discovery"))
+    )
+
+    if cwe_is_unknown and fsm_is_early:
+        return False, (
+            "tactical_memory_blocked: CWE=UNKNOWN + FSM="
+            f"'{fsm_state or 'init'}' → 禁止注入战术级 payload"
+        )
+
+    if cwe_is_unknown:
+        return False, (
+            "tactical_memory_blocked: CWE=UNKNOWN → 禁止注入战术级 payload "
+            "(缺少目标组件指纹)"
+        )
+
+    if fsm_is_early:
+        return False, (
+            "tactical_memory_blocked: FSM='{fsm_state}' → 禁止注入战术级 payload "
+            "(尚未确认组件特征)"
+        )
+
+    return True, ""
+
+# 写入白名单：仅 confidence >= 此值 且 source == "observed" 的事实可通过
+_MIN_WRITE_CONFIDENCE = 0.95
+
+
+def _quarantine_check(metadata: dict[str, Any] | None) -> bool:
+    """检查一条写入是否通过隔离审查。
+
+    返回 True = 允许写入，False = 隔离拒绝。
+    """
+    if DISABLE_LONG_TERM_WRITE:
+        return False
+    if metadata is None:
+        return False
+    confidence = metadata.get("confidence", 0)
+    source = metadata.get("source", "")
+    if isinstance(confidence, (int, float)) and confidence >= _MIN_WRITE_CONFIDENCE and source == "observed":
+        return True
+    return False
+
 
 def _extract_tokens(entry: dict) -> list[str]:
     """Extract raw keyword tokens from a JSON entry (shared by tags_str and bool_tags).
@@ -225,6 +320,7 @@ class LayeredMemory:
         self._client = chromadb.PersistentClient(path=str(db_path))
         self._collections: dict[str, Any] = {}
         self._seen_ids: dict[str, set[str]] = {}
+        self._fallback_printed: set[str] = set()
         self._ensure_collections()
 
     def _get_collection(self, name: str):
@@ -533,11 +629,15 @@ class LayeredMemory:
         doc_id = f"pattern_{hashlib.md5(content.encode()).hexdigest()[:12]}"
         meta = _sanitize_metadata(metadata or {})
         meta.setdefault("type", "pattern")
-        self.patterns_collection.upsert(
-            documents=[content],
-            ids=[doc_id],
-            metadatas=[meta],
-        )
+        if _quarantine_check(metadata):
+            self.patterns_collection.upsert(
+                documents=[content],
+                ids=[doc_id],
+                metadatas=[meta],
+            )
+            print(f"[memory] 💾 pattern 已持久化到 ChromaDB: {doc_id}")
+        else:
+            print(f"[memory] 🛡️ 隔离拒绝: pattern 写入被阻断 (quarantine: confidence/source 未达标或 DISABLE_LONG_TERM_WRITE={DISABLE_LONG_TERM_WRITE})")
         return doc_id
 
     def upsert_strategy(self, content: str, strategy_type: str = "success", metadata: dict[str, Any] | None = None) -> str:
@@ -545,11 +645,15 @@ class LayeredMemory:
         meta = _sanitize_metadata(metadata or {})
         meta.setdefault("type", "strategy")
         meta.setdefault("strategy_type", strategy_type)
-        self.strategy_collection.upsert(
-            documents=[content],
-            ids=[doc_id],
-            metadatas=[meta],
-        )
+        if _quarantine_check(metadata):
+            self.strategy_collection.upsert(
+                documents=[content],
+                ids=[doc_id],
+                metadatas=[meta],
+            )
+            print(f"[memory] 💾 strategy 已持久化到 ChromaDB: {doc_id}")
+        else:
+            print(f"[memory] 🛡️ 隔离拒绝: strategy 写入被阻断 (quarantine: confidence/source 未达标或 DISABLE_LONG_TERM_WRITE={DISABLE_LONG_TERM_WRITE})")
         return doc_id
 
     def upsert_tech(self, content: str, tech_type: str = "command", metadata: dict[str, Any] | None = None) -> str:
@@ -557,11 +661,15 @@ class LayeredMemory:
         meta = _sanitize_metadata(metadata or {})
         meta.setdefault("type", "tech")
         meta.setdefault("tech_type", tech_type)
-        self.tech_collection.upsert(
-            documents=[content],
-            ids=[doc_id],
-            metadatas=[meta],
-        )
+        if _quarantine_check(metadata):
+            self.tech_collection.upsert(
+                documents=[content],
+                ids=[doc_id],
+                metadatas=[meta],
+            )
+            print(f"[memory] 💾 tech 已持久化到 ChromaDB: {doc_id}")
+        else:
+            print(f"[memory] 🛡️ 隔离拒绝: tech 写入被阻断 (quarantine: confidence/source 未达标或 DISABLE_LONG_TERM_WRITE={DISABLE_LONG_TERM_WRITE})")
         return doc_id
 
     def load_all(self) -> dict[str, Any]:
@@ -616,6 +724,9 @@ class LayeredMemory:
 
     def planning_context(self) -> str:
         bundle = self.load_all()
+        # Fix B: 移除 tech_samples — 禁止未经门控的战术级 payload 注入。
+        # planning_context() 被直接注入到 Planner 的 user["layered_memory"]，
+        # 无 CWE/FSM 门控，因此只返回统计计数和抽象策略/模式样本。
         slim = {
             "pattern_count": len(bundle.get("pattern", {}).get("patterns", [])),
             "pattern_samples": bundle.get("pattern", {}).get("patterns", [])[:3],
@@ -626,7 +737,6 @@ class LayeredMemory:
             "tech_commands_count": len(bundle.get("tech", {}).get("commands", [])),
             "tech_payloads_count": len(bundle.get("tech", {}).get("payload_templates", [])),
             "tech_scripts_count": len(bundle.get("tech", {}).get("scripts", [])),
-            "tech_samples": bundle.get("tech", {}).get("commands", [])[:3],
         }
         return json.dumps(slim, ensure_ascii=False, indent=2)
 
@@ -717,7 +827,8 @@ class LayeredMemory:
         ChromaDB 1.5 only supports scalar metadata and ``$eq``/``$or``/``$and``.
         We build a ``$or`` clause over ``tag_<keyword>`` boolean fields.
 
-        Falls back to unfiltered query when the filter yields zero results.
+        Returns empty list when the filter yields zero results (no fallback to
+        unfiltered query — cross-target contamination is worse than no memory).
         """
         where = _build_bool_filter(filter_tags)
         if where is not None:
@@ -753,8 +864,11 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
-        return self.query_tech_payloads(query_text, n_results)
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter MISS: 无匹配 tag 的 tech payload 可用于 {filter_tags[:8]}... — 返回空列表 (宁可缺记忆，不注入错经验)")
+        return []
 
     def query_strategies_filtered(
         self,
@@ -764,7 +878,7 @@ class LayeredMemory:
     ) -> list[dict[str, Any]]:
         """Tag-filtered strategy query using boolean metadata fields + ``$or``.
 
-        Falls back to unfiltered query when the filter yields zero results.
+        Returns empty list when the filter yields zero results (no fallback).
         """
         where = _build_bool_filter(filter_tags)
         if where is not None:
@@ -789,8 +903,11 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
-        return self.query_strategies(query_text, n_results)
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter MISS: 无匹配 tag 的 strategy 可用于 {filter_tags[:8]}... — 返回空列表")
+        return []
 
     def query_patterns_filtered(
         self,
@@ -800,7 +917,7 @@ class LayeredMemory:
     ) -> list[dict[str, Any]]:
         """Tag-filtered pattern query using boolean metadata fields + ``$or``.
 
-        Falls back to unfiltered query when the filter yields zero results.
+        Returns empty list when the filter yields zero results (no fallback).
         """
         where = _build_bool_filter(filter_tags)
         if where is not None:
@@ -825,8 +942,11 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
-        return self.query_patterns(query_text, n_results)
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter MISS: 无匹配 tag 的 pattern 可用于 {filter_tags[:8]}... — 返回空列表")
+        return []
 
     def get_stats(self) -> dict[str, int]:
         return {

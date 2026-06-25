@@ -1,0 +1,351 @@
+November —— 自主漏洞利用推理系统
+
+受限智能 · 验证驱动规划 · 自适应漏洞演化
+
+> "问题不在于大语言模型会产生幻觉。问题在于我们给了它们无界的动作空间，却期望收敛的漏洞利用链。"
+
+
+一、项目定位与核心愿景
+
+November 是一套基于"受限智能（Constrained Agency）"与"验证驱动规划（Verification-Driven Planning）"的多智能体自主漏洞利用推理与自适应进化系统。系统核心命题是：大语言模型在漏洞利用任务中的推理能力，在其动作空间被外科手术式精确限制时反而提升——而非扩展。
+
+系统通过静态运行时清单（Runtime Manifest）对所有智能体的动作空间进行先验枚举，并由校验器（Validator）在执行前对每一条 AST 声明式计划进行交叉核验，从根本上消除 LLM 红队系统三类核心失效模式：
+
+1. 概率幻觉天花板（Probabilistic Hallucination Ceiling）
+   自由生成 Python 代码产生语义合理但语法不可执行的载荷链，运行时崩溃。
+   → 对策：Planner 输出结构化 imports/sdk_calls 声明式数组，从不输出裸 Python 文本。
+
+2. 注意力崩溃（Attention Collapse）
+   三轮迭代后上下文窗口被陈旧 stdout 淹没，模型遗忘已验证注入点、重放失败载荷。
+   → 对策：六层注意力路由拓扑，每层物理字符级预算强制执行。
+
+3. 数据契约失配（Data Contract Drift）
+   Planner 直接 import requests，Validator 拦截，Executor 静默失败——三个智能体运行在
+   不同的能力假设之上。
+   → 对策：RUNTIME_MANIFEST 单一事实源（coordinator.py:29-57），所有智能体对齐。
+
+November 不是模糊测试器。它维护持久化的漏洞状态机（init → probe_success → payload_injected → gadget_triggered → oob_received），沿有向原语跃迁图推进，并通过全局复盘导师（Consolidator）对已完成轨迹进行语言化强化学习，实现跨目标经验积累。所有攻击载荷在完全断网的 Docker bridge 容器内执行，受 seccomp 策略、256MB 内存限制和 50% 单核 CPU 配额约束。
+
+
+二、核心学术创新点
+
+2.1 能力具身化（Capability Grounding）
+
+LLM 倾向于幻觉化可用能力，这一问题与经典 AI 中的符号接地问题（Symbol Grounding Problem）在结构上同构。传统 LLM 智能体通过探索性执行来推断运行时能力——"试试 import os，失败了再试 import subprocess"——这泄漏了环境信息，并将迭代预算消耗在本应先验确定的能力发现上。
+
+November 通过显式能力注册机制解决此问题：所有智能体组件从 coordinator 中的单一 RUNTIME_MANIFEST 推导动作空间。该清单声明 4 个 SDK 原语、9 个安全模块白名单、24 个拦截模块黑名单。它不是"提示建议"，而是硬约束——Validator 的 AST 导入交叉核验直接以清单为判据，任何根模块不在 safe_modules 中的 import 语句在进入执行器之前即被拒绝（valid:false）。
+
+其架构内涵在于：清单是真实性的来源，而非模型权重。这逆转了标准 LLM-智能体范式——后者的模型参数化知识定义动作空间，运行时错误仅作为昂贵的延迟负反馈。
+
+2.2 注意力路由对齐（Attention Routing Alignment）
+
+Transformer 自注意力的距离衰减效应意味着：位置 k 的信息获得的有效注意力权重，远低于位置 (k-1) 的信息。在一个 15,000 字符的系统提示中，用户目标——唯一真正重要的事项——对模型而言实际上是不可见的。
+
+November 强制执行严格的六层注意力路由拓扑，每层配以物理字符预算：
+
+L1: Runtime Manifest           (≤ 800 字符) [最高注意力权重]
+L2: Hard Constraints           (≤ 600 字符)
+L3: SDK Contract               (≤ 500 字符)
+L4: Verified Facts              (≤ 800 字符)
+    ├─ primitive_context        (≤ 500)
+    ├─ verification_context     (≤ 300)
+    └─ memory_context           (≤ 400)
+L5: Trajectory State            (≤ 300 字符)
+L6: User Goal                   (≤ 2500 字符) [最低注意力权重]
+─────────────────────────────────────────────
+FINAL_PAYLOAD_HARD_CAP = 5000 字符（双层安全截断）
+
+此排序并非随意。L1（清单）占据最高注意力位置，因为能力边界必须是模型接收到的最强信号。L6（用户目标）置于最低层，因为模型天然会关注用户消息中的最新指令。每个层级均被物理截断——不是在 stdout 打印警告后"软裁剪"，而是在汇编前字节级切片。
+
+其有效性依据：Transformer 自注意力在所有 token 位置之间计算成对点积，但生成的注意力矩阵被邻近效应主导。位于第 3000 个字符的约束，其影响约为位于第 300 个字符的相同约束的 1/10，尽管模型"看到"了两者。通过按优先级对约束进行拓扑排序并强制执行每层字符预算，保证清单和硬约束始终停留在模型的有效注意力半径内，无论轨迹历史积累多少。
+
+2.3 严格内存预算与物理舱壁隔离
+
+长期记忆应存储的是失败抽象（非参数化规则），而非冗长的思维链记录（参数化噪声）。November 对注入 Planner 系统提示的聚合记忆块强制执行 ≤ 5,000 字符硬上限，通过三种机制实现：
+
+(1) 物理截断 —— _physical_truncate() 在字节级别切片，不做"软裁剪"。
+(2) 头-体-尾保留 —— 截断后保留 [头部:33%]...[尾部:67%]，同时保全高信号开场语境与高信号结束规则。
+(3) 高密提取 —— _extract_user_goal_dense() 将 19,000 字符的漏洞报告压缩至 ≤ 2,500 字符，仅保留 base_url、前 20 端点、CWE+标题、300 字符证据片段。
+
+关键设计决策：被截断的内容是丢弃，而非被摘要。摘要引入了参数化噪声——执行压缩的 LLM 可能产生幻觉或强调错误信号。物理切片保留逐字事实，同时遵守注意力预算。
+
+2.4 AST 声明式规划：消除语法漂移
+
+Planner 输出包含结构化 imports 和 sdk_calls 数组的 JSON，而非自由形式的 Python 字符串。Executor 的 _inflate_ast_to_script() 函数（executor.py:465）将此声明式表示确定性编译为可运行 Python——模型的幻觉无法引入语法错误、缺失导入或未定义变量。Validator 在 Executor 看到计划之前就交叉核验每一条 imports 条目与清单的对齐情况，彻底消除"通过验证却在运行时失败"这一整类 bug。
+
+2.5 双模型架构的战略复盘
+
+Consolidator 智能体使用独立的高级模型（DeepSeek-V4-Pro，通过专用 CONSOLIDATOR_* 环境变量配置），在架构上与战术循环模型（GLM-4.5-Flash）解耦。这防止了战术模型的上下文饱和降低战略模型的分析质量。Consolidator 在战术循环终止后读取完整轨迹，产出 YAML 武器化模板，为下一任务的 Planner 提供硬化载荷种子。
+
+
+三、系统拓扑架构与五智能体编排
+
+November 运行一个以 Coordinator 为中央编排中枢的五智能体分阶段流水线。Coordinator 负责智能体调度（固定链路 Planner → Validator → Executor → Evaluator → Consolidator）、每轮迭代前向 Planner 注入多层记忆上下文、在连续失败时触发熔断器强制策略切换、在攻击面耗尽时驱动漏洞轮换，以及基于里程碑奖励的动态迭代预算衰减控制。四智能体战术闭环按序流转——Planner 产出声明式计划 plan.json，Validator 以 AST 检察官身份对 imports/sdk_calls 进行清单交叉核验后输出 validated_plan.json，Executor 将合规声明确定性编译为 Python 脚本并在 Docker 桥接沙箱中执行，Evaluator 基于多维度进展信号对执行结果进行状态转移置信度评分并生成 feedback.json 回注 Planner。多轮迭代往复推进漏洞状态机直至预算耗尽或 Flag 捕获。战术闭环结束后，Consolidator 作为全局复盘导师被唤醒，读取完整攻击轨迹，提炼 patterns、strategies、techs 三类知识制品，写入 ChromaDB 三层永久记忆库（L1 模式层 / L2 策略层 / L3 技术层），为下一任务的 Planner 提供跨目标经验种子。
+
+3.1 Planner — 决策层（agents/planner.py）
+
+输入五层上下文：ChromaDB 三层记忆、轨迹记忆、验证记忆、原语上下文、上一轮反馈。
+输出结构化 JSON 计划，每步含 AST 声明式 imports/sdk_calls 数组。
+提示组装采用六层注意力路由拓扑，每层物理截断。
+CWE 推断使用 10 规则关键词打分表，从 title/source/sink/description 中加权提取。
+记忆 RAG 使用 ChromaDB target_tags 元数据过滤——解决"搜 LockTalk 返回致远 OA 脚本"问题。
+
+核心架构约束：Planner 永不编写原始 Python。每步以声明式声明其能力需求；Executor 执行确定性 AST→代码膨胀。此设计消除了"Planner 写了 os.system() 被拦截"这一整类错误。
+
+3.2 Validator — 逻辑拦截层（agents/validator.py）
+
+担任 AST 检察官角色，不生成攻击逻辑，仅执行安全策略与结构合规校验。
+六层校验防线：声明式导入核验、SDK 调用注册核验、Python 语法检查（声明式步骤自动跳过）、导入黑名单扫描（声明式步骤自动跳过）、危险模式正则扫描（os.system/subprocess.run/__import__）、轨迹感知反退化检测。
+
+关键设计决策：将 exploit_reasoning 和 target_primitive 字段违规从"错误"（→ 拒绝计划）降级为"警告"（→ 标注后继续执行）。仅 imports/sdk_calls 清单违规为严格拒绝。此举防止对推理元数据的过度拦截，同时维持铁壁能力执行。
+
+3.3 Executor — 物理执行层（agents/executor.py）
+
+确定性编译引擎，非智能体，执行零推理。
+AST→代码膨胀：_inflate_ast_to_script() 将声明式 imports/sdk_calls 数组转换为可运行 Python。
+Docker 沙箱：bridge 网络容器，seccomp 策略，256MB 内存，50% CPU 配额，30s 超时。
+HTTP 自动插桩：猴子补丁包装 HttpClient.request，自动记录 [HTTP] 日志。
+安全拦截：_check_python_safety() 在 Docker 派发前进行正则黑名单扫描。
+会话持久化：跨步骤 cookie/session 自动保存与恢复。
+SDK 注入：向沙箱工作区写入完整的 redteam_sdk.py（HttpClient、ContextStore、OOBReceiver）。
+
+3.4 Evaluator — 状态感知层（agents/evaluator.py）
+
+拒绝二元成功/失败分类，采用连续状态转移置信度评分。
+
+五阶段漏洞状态机：
+init → probe_success → payload_injected → gadget_triggered → oob_received
+  │           │                │                  │                │
+ 端点可达   载荷被接受      gadget 被激活       铁证（Flag）    OOB 回调
+ HTTP 200  SSTI: {{7*7}}   SSTI: config dump   flag{...}       确认完成
+           返回 49         RCE: uid=0 输出
+
+12 维多维进展信号检测（_compute_progress_signals）：
+状态机前移、新原语检测、原语置信度增量、新端点访问、新 HTTP 状态码、
+载荷突变（token 重叠 <60%）、已验证事实、里程碑标记、部分原语置信度和
+增量（8 子信号 Δ≥0.20）、ok_count 增加、EPE progress_score 增量（Δ≥0.03）、
+状态转移概率增量（Δ≥0.05）。
+
+无回显 RCE 自愈：当 Evaluator 检测到 ok=True 但 stdout 为空（命令确认执行但无输出），自动注入 BLIND_RCE_FEEDBACK 指令，引导 Planner 升级至 OOB 带外数据提取。
+
+3.5 Consolidator——战略进化层（agents/consolidator.py）
+
+仅在战术四智能体闭环耗尽迭代预算后唤醒，使用独立高级大模型。
+输出五类制品：diagnosis（故障根因分析）、patterns（泛化错误指纹）、strategies（攻击链模板）、techs（含 executable_patch 字段的可执行代码补丁）、yaml_templates（CWE 标记的武器化载荷库）。
+专家系统提示 690+ 行硬编码诊断规则，覆盖沙箱冲突解决、载荷格式死胡同检测、WAF 绕过合成、攻击链抽象。
+
+3.6 Coordinator — 编排中枢（coordinator.py）
+
+七大控制面机制：
+熔断器：连续 3 次失败或策略停滞（窗口内相同错误指纹）→ 强制策略切换 + CWE 键控记忆检索。
+攻击面轮换器：漏洞计划全部 BLOCKED → 轮换至下一个未锁定的候选漏洞。
+衰减式动态迭代引擎：初始预算 8 次；每次里程碑奖励 max(1, 5-milestone_count) 次额外迭代；硬上限 20 次；连续 4 轮零进展 → 主动终止。
+多维度进展检测：每轮评估 12 个信号；检测到进展即重置零进展计数，即使未达成里程碑。
+上下文滑动窗口：保留最近 3 轮完整执行摘要；更早轮次折叠为单行摘要。
+自动失败教训日志：每次执行失败自动作为 strategy 条目日志记录至 ChromaDB，包含 stderr 分析和 HTTP 语义错误检测。
+
+
+四、记忆管理与分层 RAG 调度机制
+
+4.1 ChromaDB 三层记忆拓扑
+
+L1 — Pattern Layer（模式层）
+沉淀黄金攻击原语的拓扑关联。如"SSTI 在 email 字段 → class traversal → os.popen 需要盲提取，非响应体检查"。
+查询：n_results=3。
+
+L2 — Strategy Layer（策略层）
+攻击链失速时的路径级战术引导。分叉结构：成功策略 vs 失败教训。
+成功 → "什么有效以及为什么"；失败 → "黑名单：永不尝试载荷 X 对目标 Y"。
+查询：n_results=6（3 成功 + 3 失败）。
+
+L3 — Technique Layer（技术层）
+固化硬化可执行载荷与绕过脚本。含 executable_patch——可直接复制粘贴的代码。
+如"pickle 沙箱绕过：struct pack 操作码，零行 import"。
+查询：n_results=8，按载荷内容去重。
+
+4.2 元数据过滤检索（防跨目标污染）
+
+先提取 tech-stack 标签（Python/Flask/Jinja2 等），再以 WHERE 子句查询 ChromaDB。过滤结果为空中自动降级为无过滤检索（绝不跳过检索）。无此机制时，攻击"LockTalk"（Python/JWT）的 Planner 将因向量空间将"JWT 令牌操作"与"基于令牌的认证"在完全不同技术栈间混淆，而检索到"致远 OA"（Java/反序列化）的载荷。
+
+4.3 持久化层
+
+攻击轨迹记忆（exploit_trajectory.json）：18 字段 ExploitTrajectoryNode 数据类，每轮写入。
+验证记忆（verification_memory.json）：已确认端点、可注入参数、已接受/已拒绝字段、模板引擎、工作原语、已捕获 Flag。每次 confirm() 调用直写磁盘，进程崩溃不丢失。
+原语注册表（exploit_primitives.py）：20+ 注入类和后利用原语定义，含载荷模板、前置条件、可观测信号。
+原语跃迁图（primitive_transition_graph.py）：30+ 有向边，每条边有明确转移条件。Planner 必须沿边推进，不可从 ssti_reflection 直接跳到 credential_dump。
+原语学习引擎（primitive_learning.py）：4 类原语的启发式检测器，基于 stdout/响应体模式匹配。
+
+4.4 原语跃迁有向图
+
+                     ┌──────────────────────────────────────┐
+                     │        POST-EXPLOITATION LAYER       │
+                     │                                      │
+           ┌─────────┴─────────┐                            │
+           │ command_execution │◄───────────────────────────┤
+           └────────┬─────────┘                            │
+                    │                                       │
+     ┌──────────────┼──────────────┬──────────────┐         │
+     ▼              ▼              ▼              ▼         │
+  arbitrary    privilege      credential     filesystem     │
+  _file_read   _discovery     _dump          _traversal     │
+                                                            │
+  ┌───────────────────────────────────────────────────────┐ │
+  │               INJECTION PRIMITIVES                    │ │
+  │                                                       │ │
+  │  ssti_reflection ──▶ ssti_execution ──▶ cmd_exec      │ │
+  │  blind_ssti ───────▶ http_callback ───▶ blind_rce_oob │ │
+  │  sql_boolean ──────▶ sql_union ───────▶ cmd_exec      │ │
+  │  command_separator ▶ command_execution                │ │
+  └───────────────────────────────────────────────────────┘
+
+
+五、安全隔离体系
+
+5.1 Docker 沙箱物理隔离
+
+Docker Bridge 网络（完全隔离）
+├─ co-redteam-sandbox 容器
+│  · 用户：sandbox（非 root）
+│  · 内存：256 MB 硬限制
+│  · CPU：50,000 μs 配额（50% 单核）
+│  · 超时：每步 30s
+│  · 网络：bridge → 仅目标容器 IP
+│  · Seccomp：默认 Docker 安全策略
+│  · 无宿主机卷挂载（所有写入为临时）
+│  · /workspace/ 挂载为 tmpfs
+│
+└─ 目标容器（bridge 网络）
+   仅可访问：容器 IP
+   被阻止：host.docker.internal、局域网、广域网
+
+5.2 纵深防御
+
+Coordinator 层：_check_python_safety() 正则扫描拦截 os.system() 等文本字面量
+Validator 层：AST 导入白名单拦截 import os、import subprocess 等语句
+Validator 层：清单 sdk_calls 交叉核验拦截未注册 HTTP 原语
+Executor 层：Docker 派发前安全正则再扫描（防止 Validator→Executor 间的绕过）
+Docker 层：seccomp + 非 root 用户 + 内存限制（防容器逃逸、资源耗尽）
+网络层：Bridge + 仅目标 IP（防横向移动、外网 C2 回连）
+
+5.3 目标 URL 白名单锁定
+
+通过 core/target_context.py 的 lock_target() 将所有网络访问锁定到精确主机 + 端口组合。解析主机名 → IP，锁定端口，阻止所有其他目的地，覆盖 JSON 配置中的任何 host.docker.internal 残留。
+
+
+六、泛化评测基准与量化指标
+
+6.1 多源异质数据集扩展
+
+Web 类：TimeKORP（SSTI, CWE-94）、LockTalk（JWT 操纵, CWE-347）、ApexSurvive（路径遍历, CWE-22）
+反序列化类：SerialFlow（不安全反序列化, CWE-502）
+命令注入类：（规划中）
+逆向工程类：二进制分析→漏洞原语识别（规划中）
+密码学类：填充预言机、时序侧信道、弱密钥派生（规划中）
+
+6.2 PAR-2 评分机制
+
+系统采用算法选择文献中的罚分平均运行时间（Penalized Average Runtime, PAR-2）指标，适配自主漏洞利用评估：
+
+PAR-2(s, I) = (1/|I|) × Σ [ t_s(i) 若解出；2×T_max 否则 ]
+
+其中 t_s(i) 为系统从启动到确认 Flag 捕获的挂钟时间（秒），T_max 为最大容许预算（迭代次数×每次超时时间），I 为评估实例集。
+
+PAR-2 相比准确率的优势：3 轮捕获半数目标 Flag 并在剩余目标超时的系统（PAR-2 ≈ 1.5×T_max），在客观上优于在 70% 目标上需 18 轮收敛的系统（PAR-2 ≈ 1.3×T_max 若收敛缓慢）。PAR-2 同时惩罚失败与低效，与时间受限渗透测试的操作现实对齐。
+
+6.3 辅助评估指标
+
+状态转移速率：E[每轮推进的状态数]——攻击链推进效率
+原语泛化率：学习到的原语被复用的目标数 / 总目标数——跨目标知识迁移能力
+反退化拦截率：被阻止的退化尝试 / 总退化尝试——安全防护有效性
+Consolidator 贡献分：（有 Consolidator 时的成功率）-（无 Consolidator 时的成功率）——战略学习价值
+
+
+七、学术竞赛支撑与结题物理铁证
+
+November 系统封装自然语言交互前端，形成"输入源码 → 智能匹配漏洞 → 自动攻防 → 输出铁证"的可移植闭环。系统产出物包括：
+
+1. 完整攻击轨迹 JSON：每轮次的 18 字段状态快照，可审计、可复现。
+2. ChromaDB 三层永久记忆库：跨任务积累的攻击模式、策略、技术载荷。
+3. YAML 武器化模板库：9 类 CWE 的硬化载荷与绕过方案。
+4. 验证记忆 JSON：已核验端点的不可变事实集合，崩溃不丢失。
+
+系统已在全国大学生信息安全竞赛（CISCN）作品赛中成功验证，具备冲击国奖的学术深度与工程完备性。所有实验在固定模型、固定温度、固定 Docker 镜像、固定运行时清单条件下完全可复现。CO_REDTEAM_MOCK_LLM=true 标志支持无 API 调用的完整流水线测试——每个智能体的输出即使在 mock 模式下也进行结构校验。
+
+
+八、快速开始
+
+# 1. 环境准备
+cd b/
+pip install -r requirements.txt
+docker build -t co-redteam-sandbox .
+
+# 2. 配置
+cp .env.example .env
+# 编辑 DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+
+# 3. Phase 1 — 静态漏洞发现
+python cli.py audit --target target_codebase/
+
+# 4. Phase 2 — 自主漏洞利用
+python cli.py exploit --url https://192.168.1.100:9443 --confirmed data/confirmed_vuln.json
+
+# 5. 查看攻击轨迹
+cat b/memory/exploit_trajectory.json | python -m json.tool
+
+
+九、项目结构
+
+b/
+├── coordinator.py              # 编排中枢（~1,544 行）
+├── cli.py                      # CLI 入口（~802 行）
+├── Dockerfile                  # Alpine 3.18 沙箱镜像
+├── .env                        # 运行时配置
+│
+├── agents/
+│   ├── planner.py              # [1] Planner — AST 声明式计划生成
+│   ├── validator.py            # [2] Validator — 清单交叉核验 + 语法守卫
+│   ├── executor.py             # [3] Executor — AST→代码膨胀 + Docker 沙箱
+│   ├── evaluator.py            # [4] Evaluator — 状态机评估 + 无回显 RCE 检测
+│   └── consolidator.py         # [5] Consolidator — 战略经验学习
+│
+├── memory/
+│   ├── exploit_trajectory.py   # 轨迹持久化（ExploitTrajectoryNode × 轮次）
+│   ├── verification_memory.py  # 已验证事实（直写持久化）
+│   ├── exploit_primitives.py   # 20+ 原语定义及载荷模板
+│   ├── primitive_learning.py   # 从执行输出进行启发式原语检测
+│   ├── primitive_transition_graph.py  # 有向利用导航图（30+ 边）
+│   ├── exploit_trajectory.json # 轨迹状态文件
+│   ├── pattern.json            # L1 ChromaDB 数据源
+│   ├── strategy.json           # L2 ChromaDB 数据源
+│   └── tech.json               # L3 ChromaDB 数据源
+│
+├── control/
+│   └── anti_regression.py      # 反退化控制器 + 载荷演化引擎
+│
+├── core/
+│   ├── settings.py             # 不可变 Settings 数据类（16 字段）
+│   ├── llm_client.py           # DeepSeekClient（指数退避 + json_mode 降级）
+│   ├── memory_store.py         # ChromaDB LayeredMemory（元数据过滤查询）
+│   ├── challenge_adapter.py    # 可插拔挑战适配器
+│   ├── target_context.py       # URL 白名单锁定（DNS 解析）
+│   ├── template_manager.py     # YAML 武器化模板 CRUD
+│   └── ui.py                   # Rich 终端渲染
+│
+├── templates/builtin/          # YAML 武器化载荷库（9 个模板）
+├── data/confirmed_vuln.json    # Phase 1 输出 → Phase 2 输入
+└── workspace/                  # 每轮运行时产物
+
+
+十、引用
+
+若在研究中使用 November，请引用：
+
+@software{november2025,
+  title     = {November: Autonomous Exploit Reasoning via Constrained Agency
+               and Verification-Driven Multi-Agent Planning},
+  year      = {2025},
+  note      = {National University Student Information Security Competition (CISCN)},
+}
+
+
+November —— 漏洞利用推理与形式化验证的交叉点。每一条载荷都必须向运行时清单证明其存在的正当性，才能触碰目标。

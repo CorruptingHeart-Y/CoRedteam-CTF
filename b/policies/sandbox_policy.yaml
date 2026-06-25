@@ -1,0 +1,264 @@
+# Co-RedTeam Sandbox Security Policy
+# Consolidator can overwrite this file at runtime.
+# Validator re-reads on every invocation (no caching).
+
+import_rules:
+  allowlist:
+    - json
+    - re
+    - base64
+    - hashlib
+    - hmac
+    - struct
+    - binascii
+    - html
+    - xml
+    - xml.etree
+    - bs4
+    - lxml
+    - jwt
+    - time
+    - datetime
+    - random
+    - string
+    - itertools
+    - functools
+    - collections
+    - copy
+    - io
+    - pathlib
+    - threading
+    - redteam_sdk
+    - typing
+    - dataclasses
+    - enum
+    - abc
+    - codecs
+    - unicodedata
+    - Crypto
+    - cryptography
+    - math
+    - decimal
+    - fractions
+    - sys
+    - os.path
+  blocklist:
+    # 原生通信库 — 强制走 redteam_sdk.HttpClient 高阶封装
+    - requests
+    - urllib
+    - urllib3
+    - httpx
+    - http
+    - socket
+    - os
+    - subprocess
+    - ctypes
+    - cffi
+    - pty
+    - signal
+    - multiprocessing
+    - importlib
+    - pickle
+    - marshal
+    - builtins
+    - gc
+    - inspect
+    - ast
+    - code
+    - codeop
+    - compileall
+    - dis
+    - types
+    - weakref
+
+text_scan_rules:
+  # ── Python code injection patterns ──
+  - name: os_system_exec
+    pattern: 'os\.system\('
+    severity: error
+    remediation: "禁止代码文本出现 os.system( 字面量。改用 redteam_sdk.OOBReceiver 做带外回调，或通过 HTTP 请求将 payload 发送到目标服务器执行，沙箱只负责构造和发送。"
+
+  - name: subprocess_call
+    pattern: 'subprocess\.(run|call|Popen)\('
+    severity: error
+    remediation: "禁止 subprocess，改用 redteam_sdk.OOBReceiver 做带外回调。"
+
+  - name: dynamic_import
+    pattern: '__import__\('
+    severity: error
+    remediation: "禁止动态导入 __import__，只允许使用白名单模块的显式 import 语句。"
+
+  # ── Shell chain danger ──
+  - name: shell_chain_danger
+    pattern: '(;|&&|\|\|)\s*(rm|del|format|mkfs|dd)\b'
+    severity: error
+    step_types: [shell]
+    remediation: "shell 命令包含链式高危操作（rm/del/format/mkfs/dd），已拒绝"
+
+  # ── Shell danger patterns ──
+  - name: rm_recursive_root
+    pattern: 'rm\s+(-[rfFR]+\s*)+/'
+    severity: error
+    remediation: "命中高危禁止模式：递归删除根目录"
+
+  - name: fork_bomb
+    pattern: ':\(\)\s*\{'
+    severity: error
+    remediation: "命中高危禁止模式：fork 炸弹"
+
+  - name: mkfs
+    pattern: 'mkfs\.'
+    severity: error
+    remediation: "命中高危禁止模式：创建文件系统"
+
+  - name: dd_if
+    pattern: 'dd\s+if='
+    severity: error
+    remediation: "命中高危禁止模式：磁盘直接读写"
+
+  - name: chmod_777_root
+    pattern: 'chmod\s+-R\s+777\s*/'
+    severity: error
+    remediation: "命中高危禁止模式：递归放宽根目录权限"
+
+  - name: redirect_dev_sd
+    pattern: '>/dev/sd'
+    severity: error
+    remediation: "命中高危禁止模式：写入磁盘设备"
+
+  - name: pipe_to_shell
+    pattern: '\|\s*(sh|bash|zsh|fish)\b'
+    severity: error
+    remediation: "命中高危禁止模式：管道到 shell 解释器"
+
+  - name: curl_pipe_shell
+    pattern: 'curl.+\|\s*(sh|bash)'
+    severity: error
+    remediation: "命中高危禁止模式：curl 管道到 shell"
+
+  - name: wget_pipe_shell
+    pattern: 'wget.+\|\s*(sh|bash)'
+    severity: error
+    remediation: "命中高危禁止模式：wget 管道到 shell"
+
+  - name: drop_table
+    pattern: 'DROP\s+TABLE'
+    severity: error
+    remediation: "命中高危禁止模式：DROP TABLE"
+
+  - name: format_drive
+    pattern: 'format\s+[a-z]:'
+    severity: error
+    remediation: "命中高危禁止模式：格式化驱动器"
+
+  - name: shutdown_root
+    pattern: 'shutdown\s+/'
+    severity: error
+    remediation: "命中高危禁止模式：系统关机"
+
+  - name: invoke_webrequest
+    pattern: 'Invoke-WebRequest.*-OutFile'
+    severity: error
+    remediation: "命中高危禁止模式：PowerShell 下载执行"
+
+  - name: del_windows_system
+    pattern: 'del\s+/f\s+/s\s+/q\s+[a-z]:\\\\windows'
+    severity: error
+    remediation: "命中高危禁止模式：删除 Windows 系统文件"
+
+  # ── JWT/JSON polyglot correctness warnings (python only) ──
+  - name: json_dumps_polyglot
+    pattern: 'json\.dumps\s*\(\s*(?:polyglot|\{)'
+    context_pattern: 'fake_payload|forged|polyglot|extra_key'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      检测到使用 json.dumps(dict) 构造 JWT/JSON polyglot。
+      这会导致注入的 key 被排序到最后，python_jwt 先解析正经字段再解析伪造字段，从而产生
+      'Invalid base64-encoded string' 或 'Invalid JWS Object' 错误。
+      【修复】：必须用字符串拼接 (f-string 或 +) 构造 polyglot，并将伪造 key 放在 JSON 对象的【第一个】位置。
+
+  - name: base64_rstrip_equals
+    pattern: '\.rstrip\s*\(\s*[''"]=\s*[''"]\s*\)'
+    context_pattern: 'base64|urlsafe_b64encode|b64encode'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      检测到 base64 编码后调用了 .rstrip('=')。
+      python_jwt 内部的 jwcrypto 解码器要求完整 padding，去掉 '=' 会导致
+      'Incorrect padding' 或 'Invalid base64-encoded string' 错误。
+      【修复】：删除 .rstrip('=') 调用，保留 base64url 编码的完整输出。
+
+  - name: alg_none_jwt
+    pattern: '"alg"\s*:\s*"none"'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      检测到使用 alg:none 的 JWT 攻击。
+      python_jwt 3.3.3 及更高版本明确拒绝 alg:none 令牌，此攻击无效。
+      【修复】：使用 JSON Polyglot 攻击 (CVE-2022-39227) 替代 alg:none。
+
+  # ── 沙箱脚本输出模板强制规则（Validator auto-reject on missing patterns）──
+  # Executor 会自动注入 HTTP 日志和 STEP_OK/STEP_FAIL 包装，但 Validator 也在此
+  # 提前检查 Planner 生成的脚本质量，确保消控链路不会因脚本自身问题而断流。
+  - name: bare_requests_no_try_except
+    pattern: '(?:requests|HttpClient)\.(?:get|post|put|delete|request)\s*\('
+    context_pattern: '(?<!except\s)(?<!try\s)(?<!Exception)'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      检测到 HTTP 请求调用未包裹在 try/except 中。Executor 会自动注入异常捕获，
+      但脚本自身应该在关键请求处也加入 try/except 以确保部分失败时仍能输出调试信息。
+      【修复】：将 requests.get/post/put/delete 调用包裹在 try/except Exception as e 中，
+      并在 except 块中 print(f"[HTTP_ERR] {e}") 和 traceback。
+
+  - name: missing_step_status_marker
+    pattern: '^(?!.*(?:STEP_OK|STEP_FAIL|output_result|###CHAIN_OUTPUT###)).*$'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      脚本末尾缺少输出状态标记。Executor 会自动注入 print('STEP_OK') 和异常捕获，
+      但脚本自身也应调用 output_result({...}) 或 print('STEP_OK') 以明确标注步骤完成。
+      这对 Blind RCE / 无回显场景尤其重要：即使 HTTP 请求不返回响应体，
+      STEP_OK 标记至少能证明脚本执行到了末尾。
+
+  - name: http_request_after_log
+    pattern: '(?:requests|HttpClient)\.(?:get|post|put|delete|request)\s*\([^)]*\)\s*$(?![\s\S]*?print\s*\()'
+    severity: warning
+    step_types: [python]
+    remediation: >-
+      检测到 HTTP 请求后没有立即 print 响应信息。Executor 会自动注入 [HTTP] 日志，
+      但为确保在 Executor 注入失败时仍有回退，请在每个 HTTP 请求后显式打印:
+      print(f"HTTP {resp.status_code}: {resp.text[:300]}").
+      这对调试 REST API 字段名/方法/认证问题至关重要。
+
+shell_tool_allowlist:
+  - curl
+  - wget
+  - sqlmap
+  - nmap
+  - nikto
+  - python3
+  - python
+  - py
+  - jq
+  - grep
+  - awk
+  - sed
+  - cut
+  - sort
+  - uniq
+  - tr
+  - head
+  - tail
+  - echo
+  - cat
+  - ls
+  - pwd
+  - dig
+  - nslookup
+  - host
+  - openssl
+  - wfuzz
+  - ffuf
+  - gobuster

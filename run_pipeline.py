@@ -50,6 +50,60 @@ RESET = "\033[0m"
 BOLD = "\033[1m"
 
 
+def cleanup_for_new_target() -> None:
+    """换题清理：只清除运行时产物，保留长期记忆（ChromaDB + memory/*.json）。"""
+    print(f"\n{BOLD}{BLUE}{'─'*70}{RESET}")
+    print(f"{BOLD}{BLUE}[Cleanup] 新目标检测 — 清理运行时产物（长期记忆保留）...{RESET}")
+    print(f"{BOLD}{BLUE}{'─'*70}{RESET}")
+
+    # 1. 删除 confirmed_vuln.json（题目专属）
+    if PHASE2_CONFIRMED_PATH.exists():
+        PHASE2_CONFIRMED_PATH.unlink()
+        print(f"[Cleanup] [OK] 已删除 {PHASE2_CONFIRMED_PATH}")
+
+    # 2. 清空 workspace（运行时产物）
+    workspace_dir = PHASE2_DIR / "workspace"
+    if workspace_dir.exists():
+        shutil.rmtree(workspace_dir)
+        workspace_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[Cleanup] [OK] 已清空 {workspace_dir}")
+
+    # 3. 删除运行时轨迹文件（题目专属）
+    for fname in ["exploit_trajectory.json", "verification_memory.json"]:
+        fp = PHASE2_DIR / "memory" / fname
+        if fp.exists():
+            fp.unlink()
+            print(f"[Cleanup] [OK] 已删除 {fp}")
+
+    # 4. 清除 __pycache__
+    for sub in [PHASE2_DIR / "memory", PHASE2_DIR / "control"]:
+        for pycache in sub.glob("__pycache__"):
+            if pycache.is_dir():
+                shutil.rmtree(pycache)
+                print(f"[Cleanup] [OK] 已清除 {pycache}")
+
+    # 5. 确保 CWE 知识库存在（不删除重建，只有不存在时才初始化）
+    chroma_dir = ROOT / "co_redteam_memory"
+    if not chroma_dir.exists():
+        print(f"[Cleanup] CWE 知识库不存在，正在初始化...")
+        vul_doc_ini = ROOT / "vul_doc_ini.py"
+        if vul_doc_ini.exists():
+            print(f"[Cleanup] 运行 vul_doc_ini.py 初始化 CWE 知识库...")
+        result = subprocess.run(
+            [sys.executable, str(vul_doc_ini)],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print(f"[Cleanup] [OK] CWE 知识库初始化完成")
+        else:
+            stderr_tail = (result.stderr or "").strip()[-200:]
+            print(f"[Cleanup] [WARN] vul_doc_ini.py 异常: {stderr_tail}")
+
+    print(f"\n[Cleanup] 清理完成，环境已就绪\n")
+
+
 def print_banner():
     print(f"\n{BOLD}{CYAN}{'='*70}{RESET}")
     print(f"{BOLD}{CYAN}   Co-RedTeam 全局流水线控制器 v1.0{RESET}")
@@ -628,7 +682,10 @@ def main():
             
         else:
             target_dir = args.target or "target_codebase"
-            
+
+            # Stage 1 入口：自动清理上一题记忆
+            cleanup_for_new_target()
+
             try:
                 phase1_report = run_phase1(target_dir, mock_mode=args.mock)
                 phase1_success = True

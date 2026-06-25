@@ -8,6 +8,8 @@ import ast
 from pathlib import Path
 from typing import Any
 
+from core.strategy_identity import read_trusted_selection, validate_plan_against_trusted_selection
+
 # ────────────────────────────────────────────────────────────────
 # AST-based import security policy
 #
@@ -529,9 +531,15 @@ def _check_broken_dependency_chain(
 def validate_plan(
     plan: dict[str, Any],
     prior_feedback: dict[str, Any] | None = None,
+    trusted_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     syntax_warnings: list[str] = []
+
+    if trusted_selection is not None:
+        trusted_ok, trusted_errors = validate_plan_against_trusted_selection(plan, trusted_selection)
+        if not trusted_ok:
+            errors.extend(trusted_errors)
 
     if plan.get("version") != 1:
         errors.append("顶层字段 `version` 应为整数 1")
@@ -597,10 +605,16 @@ def run_validator(
     plan_path: Path,
     validated_path: Path,
     prior_feedback: dict[str, Any] | None = None,
+    trusted_selection_path: Path | None = None,
 ) -> dict[str, Any]:
     raw_plan = json.loads(plan_path.read_text(encoding="utf-8"))
     normalized_plan, norm_warnings = _normalize_plan(raw_plan)
-    result = validate_plan(normalized_plan, prior_feedback=prior_feedback)
+    trusted_selection = read_trusted_selection(trusted_selection_path) if trusted_selection_path else None
+    result = validate_plan(
+        normalized_plan,
+        prior_feedback=prior_feedback,
+        trusted_selection=trusted_selection,
+    )
     payload = {
         "version": 1,
         "validation": result,

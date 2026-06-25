@@ -1,0 +1,347 @@
+{
+  "fingerprints": {
+    "5f2b2c169c2e2f32": {
+      "first_seen": 1782316909.8213248,
+      "name": "velocity-ssti-presence-verification-via-arithmetic-expression",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "de4c3c1472d2bf33": {
+      "first_seen": 1782317632.5254028,
+      "name": "Velocity SSTI 快速验证与反射链 RCE",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "28c03e5eb1bf3785": {
+      "first_seen": 1782318028.498283,
+      "name": "velocity-ssti-detection-via-arithmetic",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "eaf97f0c12c41982": {
+      "first_seen": 1782318949.273761,
+      "name": "Velocity SSTI RCE via Java Reflection (Runtime.exec)",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "6e9e3d91868436eb": {
+      "first_seen": 1782319235.3221517,
+      "name": "Velocity Template Injection (CWE-1336) — RCE via reflection (inline output)",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "a5bbb99578444366": {
+      "first_seen": 1782319235.323161,
+      "name": "Velocity Template Injection (CWE-1336) — RCE via reflection (OOB exfiltration)",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "2c7fe0eb130d4685": {
+      "first_seen": 1782319568.4647298,
+      "name": "velocity-ssti-via-set-directive",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "64bf219fd6c1d897": {
+      "first_seen": 1782319568.4653654,
+      "name": "velocity-rce-via-reflection-in-ssti",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e1538aacfe61c1ff": {
+      "first_seen": 1782319845.4630535,
+      "name": "velocity-template-injection-rce-via-reflection-oob",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "4b7c1692166eb882": {
+      "first_seen": 1782370363.2642035,
+      "name": "velocity-ssti-direct-rce-via-reflection",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "0a796c0ae9a77c88": {
+      "first_seen": 1781548704.3212757,
+      "name": "memcached-crlf-injection-with-raw-bytes",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "015d61cbce4c125a": {
+      "first_seen": 1781585961.8915281,
+      "name": "memcached-crlf-injection-via-session-cookie",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "1175d5ca13a47149": {
+      "first_seen": 1781586414.3563514,
+      "name": "memcached-crlf-injection-via-raw-http",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "344875f0a3595286": {
+      "first_seen": 1781624314.5747032,
+      "name": "CRLF Injection into Memcached Protocol via HTTP Cookie",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "307590ec1b5453d6": {
+      "first_seen": 1781625065.1214733,
+      "name": "CRLF Injection into Memcached Session Backend leading to Pickle Deserialization ",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "4f66a016530332b7": {
+      "first_seen": 1781686091.741303,
+      "name": "CRLF注入 + Pickle反序列化RCE（沙箱安全硬编码payload）",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "58ab99c2aecb1258": {
+      "first_seen": 1781687502.4798644,
+      "name": "CRLF injection into Flask-Session memcached key leading to pickle deserializatio",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "06a3a7f79dec9515": {
+      "first_seen": 1781701806.2965472,
+      "name": "memcached-crlf-injection-with-handcrafted-pickle-bytes",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "6422509d258e93b8": {
+      "first_seen": 1781703091.2526207,
+      "name": "memcached-crlf-injection-with-pickle-opcode-bypass",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "a76ba703cc2da228": {
+      "first_seen": 1781703480.3595023,
+      "name": "memcached-crlf-command-injection-with-pickle-deserialization-rce",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e14d10e99a04ff43": {
+      "first_seen": 1781703830.3876123,
+      "name": "pickle-deserialization-with-crlf-memcached-injection-sandbox-bypass",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e4dd59c4437fc2d1": {
+      "first_seen": 1781711653.5424,
+      "name": "flask-session-memcached-crlf-injection-with-pickled-rce-via-raw-bytes",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "d82e55b0990f5d75": {
+      "first_seen": 1781714321.4639344,
+      "name": "target-liveliness-check-via-whitelist-modules",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "434f044e97e753e6": {
+      "first_seen": 1781714321.4661162,
+      "name": "memcached-crlf-injection-to-pickle-deserialization-rce",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "95b6d46f0b76cefd": {
+      "first_seen": 1781715263.6021278,
+      "name": "pickle-deserialization-via-raw-bytes",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "9d56f112d7846c34": {
+      "first_seen": 1781716640.1879702,
+      "name": "memcached-crlf-injection-with-pickle-deserialization-and-oob-receiver",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "32f0febb54be8733": {
+      "first_seen": 1781717137.563563,
+      "name": "memcached-crlf-injection-to-pickle-deserialization-sandbox-bypass",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "da9103e44b2f201b": {
+      "first_seen": 1781717683.9032724,
+      "name": "pickle-deserialization-rce-via-memcached-crlf-injection",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "447b22cf3d5e8264": {
+      "first_seen": 1782052116.3379169,
+      "name": "memcached-crlf-to-pickle-rce",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "24e8ba5618876e5b": {
+      "first_seen": 1782052933.2319255,
+      "name": "CRLF注入+Memcached命令注入+Pickle反序列化RCE（Flask-Session + Memcached Session后端）",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "5d5ab6f57eaf1fa1": {
+      "first_seen": 1782059257.2412398,
+      "name": "pickle-deserialization-via-raw-bytes-without-os-popen-literal",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "b3f89306c4ee8b52": {
+      "first_seen": 1782304494.6658897,
+      "name": "pickle-deserialization-via-raw-bytes (沙箱安全手搓pickle字节码)",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "486f0c87cefe8f53": {
+      "first_seen": 1782306250.0488827,
+      "name": "crlf-memcached-pickle-rce",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "005669fa81fd6d1c": {
+      "first_seen": 1781444820.0473242,
+      "name": "target-health-check",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "413012a174f60fd0": {
+      "first_seen": 1781447988.4186645,
+      "name": "backend-recovery-via-docker-restart",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "9e9ff408069b9a6e": {
+      "first_seen": 1781449522.244789,
+      "name": "PHP exec() command injection via 'format' parameter",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "90326869b902d673": {
+      "first_seen": 1781449522.2460797,
+      "name": "generic command injection payload construction with bypasses",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "812163aba8791156": {
+      "first_seen": 1781449716.332107,
+      "name": "target-service-health-check-with-retry",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "17d7dc5056c8b3cf": {
+      "first_seen": 1781452252.2993917,
+      "name": "command-injection-via-oob-curl",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "046931e768a3c351": {
+      "first_seen": 1781452252.3015165,
+      "name": "target-liveness-check-before-attack",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "c393ffe8ead61b65": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe1336",
+      "source": "static-warmup",
+      "cwe": "CWE-1336"
+    },
+    "575a365eb92c5eb9": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe1336",
+      "source": "static-warmup",
+      "cwe": "CWE-1336"
+    },
+    "92ca70e856a2c6eb": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe1336",
+      "source": "static-warmup",
+      "cwe": "CWE-1336"
+    },
+    "5c140d35dcb46a62": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe79",
+      "source": "static-warmup",
+      "cwe": "CWE-79"
+    },
+    "24da3839e77b7ec1": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe200",
+      "source": "static-warmup",
+      "cwe": "CWE-200"
+    },
+    "8cc73ceecc3fb678": {
+      "first_seen": 1780937811.1441724,
+      "name": "static-warmup-cwe502",
+      "source": "static-warmup",
+      "cwe": "CWE-502"
+    },
+    "2f286f6bcda58a97": {
+      "first_seen": 1780937811.1441724,
+      "name": "OS Command Injection via 'format' GET parameter in TimeController",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "2825e212a1819fe4": {
+      "first_seen": 1780937811.1441724,
+      "name": "Advanced Command Injection to Achieve Reverse Shell / Data Exfiltration via redt",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "73f18098d5de91c3": {
+      "first_seen": 1780937811.1441724,
+      "name": "OS Command Injection via reflected output (CWE-78) — direct inline exploitation ",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e3b0c44298fc1c14": {
+      "first_seen": 1780937811.144737,
+      "name": "Apache Velocity SSTI Command Execution via Reflection",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "634c5f46914a0fde": {
+      "first_seen": 1780938213.4376166,
+      "name": "apache-velocity-template-injection-detection-via-math-expression",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "ad61636c561825f1": {
+      "first_seen": 1780938796.1356041,
+      "name": "velocity-ssti-via-http-request",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "c750f9f09162e204": {
+      "first_seen": 1780938796.1366057,
+      "name": "safe-context-initialization",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "150dd6b2e939bb03": {
+      "first_seen": 1781453187.0198848,
+      "name": "OS Command Injection via Single-Quote Escape in Shell Command",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "1772610ca0795885": {
+      "first_seen": 1782307153.4538267,
+      "name": "http-raw-request-with-rawresponse-attribute-correction",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "696cf78ca2942d3b": {
+      "first_seen": 1782307153.4538267,
+      "name": "crlf-memcached-injection-via-rawrequest",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "9a69804ae32bf8ec": {
+      "first_seen": 1782376472.8916833,
+      "name": "velocity-template-injection-rce-via-reflection",
+      "source": "consolidator",
+      "cwe": ""
+    }
+  },
+  "_updated": 1782376472.8916833
+}

@@ -1,0 +1,19 @@
+{
+  "mode": "EXP_BASE",
+  "exit_code": 3,
+  "elapsed_sec": 286.4,
+  "new_ablation_files": 1,
+  "ablation_paths": [
+    "C:\\Users\\ADMIN\\redteam\\b\\workspace\\ablation_exp_base_20260624_130206.json"
+  ],
+  "stdout_last_2000": "",
+  "stderr_last_500": "",
+  "key_fields": {
+    "ablation_exp_base_20260624_130206.json": {
+      "guidance": "根据confirmed_vuln，漏洞为CRLF注入导致memcached命令注入进而pickle反序列化RCE。请使用solver.py中的方法：构造包含\\r\\n的session cookie，注入memcached set/get命令存储并触发pickle payload。避免使用SSTI payload。",
+      "hypothesis": "SSTI注入点不存在或模板引擎不是Jinja2/Velocity等常见引擎。鉴于已证伪假设列表，SSTI路径无效，应转向CRLF注入。",
+      "next_required_action": "放弃SSTI路径，参考confirmed_vuln中CRLF注入+memcached+pickle RCE的solver.py实现。构造CRLF注入payload到session cookie，执行memcached命令注入。",
+      "feedback_for_planner": "SSTI路径无效（多次尝试失败）。立即转向CRLF注入+memcached+pickle RCE，参考solver.py。具体：构造cookie '1\\r\\nset injected 0 5 <length>\\r\\n<pickle payload>\\r\\nget injected'，使用__reduce__执行命令。"
+    }
+  }
+}

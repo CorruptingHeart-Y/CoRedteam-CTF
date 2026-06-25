@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "updated_at": "2026-06-24T12:31:19.482986+00:00",
+  "hypotheses": {
+    "crlf*memcached*pickle_rce": {
+      "fingerprint": "crlf*memcached*pickle_rce",
+      "attempts": 117,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 111,
+        "reflection": 6
+      },
+      "last_evidence": [
+        "[FAILED] [INFO] 探测成功，确认目标可达，但未进行攻击，需按漏洞报告执行CRLF注入",
+        "[FAILED] [INFO] 首次探测成功，目标可达（HTTP 200），获得 session cookie。尚未进行漏洞利用。",
+        "[FAILED] 步骤执行因代码错误 AttributeError 终止，未取得任何有效进展。",
+        "[FAILED] 命令注入尝试未触发任何漏洞，未获取任何敏感信息。需转向session cookie CRLF注入攻击链。",
+        "[FAILED] 命令注入探测失败，响应为正常页面，未触发任何漏洞。且唯一已知攻击路径已被证伪，本轮无进展。"
+      ],
+      "first_seen": "2026-06-16T15:27:56.873416+00:00",
+      "last_seen": "2026-06-24T12:31:19.481978+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-16T15:39:49.943839+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: reflection (4/5 = 80%). Exploitation path is falsified — forced exploration required."
+    },
+    "ssti*generic*exec": {
+      "fingerprint": "ssti*generic*exec",
+      "attempts": 6,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 6
+      },
+      "last_evidence": [
+        "[FAILED] SSTI 注入不成功，payload 被反射但未执行，目标不存在 SSTI 漏洞",
+        "[FAILED] 本轮未触发任何漏洞。路径遍历无效，需转换策略为session cookie CRLF注入。",
+        "[FAILED] SSTI payloads were reflected but not executed; no flag or command output obtained. The true vulnerability is CRLF+pickle, not SSTI.",
+        "[FAILED] SSTI payload 未被解析执行，仅被反射到页面中；目标漏洞为 CRLF+pickle 反序列化，需切换攻击策略。",
+        "[FAILED] SSTI attempts failed; payloads reflected but not executed. The application is vulnerable to CRLF injection + pickle deserialization, not SSTI."
+      ],
+      "first_seen": "2026-06-21T14:25:46.962890+00:00",
+      "last_seen": "2026-06-21T14:40:26.200908+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-21T14:37:43.295189+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required."
+    },
+    "path_traversal*fs*read": {
+      "fingerprint": "path_traversal*fs*read",
+      "attempts": 1,
+      "successes": 0,
+      "failure_stages": {
+        "reflection": 1
+      },
+      "last_evidence": [
+        "[FAILED] 路径遍历探测返回404，未发现flag文件；建议转向已知CRLF注入+pickle RCE漏洞。"
+      ],
+      "first_seen": "2026-06-21T14:26:34.403968+00:00",
+      "last_seen": "2026-06-21T14:26:34.403968+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": ""
+    },
+    "ssti*jinja2*exec": {
+      "fingerprint": "ssti*jinja2*exec",
+      "attempts": 8,
+      "successes": 0,
+      "failure_stages": {
+        "crlf_injection": 8
+      },
+      "last_evidence": [
+        "[FAILED] SSTI 探测未触发，响应中无 49，当前状态为 init。根据漏洞确认，应转向 CRLF+pickle 攻击。",
+        "[FAILED] 步骤执行成功但未检测到 SSTI 反射，目标应用无 SSTI 漏洞。需根据 confirmed_vuln 转向 CRLF 注入 + Pickle RCE 攻击链。",
+        "[FAILED] SSTI 不存在，所有步骤未触发任何漏洞，收到 HTTP 200 但无执行证据。",
+        "[FAILED] SSTI探测失败，payload {{7*7}}未被解析为49，未触发SSTI。建议转向memcached CRLF注入+pickle反序列化攻击路径。",
+        "[FAILED] SSTI 探测未返回预期结果，无任何漏洞证据。"
+      ],
+      "first_seen": "2026-06-21T14:30:10.265670+00:00",
+      "last_seen": "2026-06-24T12:30:11.150356+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-21T14:50:32.950282+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required."
+    }
+  }
+}

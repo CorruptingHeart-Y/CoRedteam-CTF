@@ -1,0 +1,37 @@
+metadata:
+  id: cwe-78-cwe-78
+  name: CWE-78
+  cwe_ids:
+  - CWE-78
+  target_type: generic
+  tags:
+  - cwe-78
+  - cwe-78
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 基于 TimeController 'format' 参数的命令注入模板，支持回显验证和带外数据外带。payload 使用分号、管道、反引号等多种注入语法，并利用
+  2>&1 特性获取错误输出。适用于 PHP exec() 无过滤场景。
+payload_templates:
+- name: time-controller-format-blind-osci
+  description: 基于 TimeController 'format' 参数的命令注入模板，支持回显验证和带外数据外带。payload 使用分号、管道、反引号等多种注入语法，并利用
+    2>&1 特性获取错误输出。适用于 PHP exec() 无过滤场景。
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: php_exec_format_string_break
+  description: 针对 PHP exec() / date 拼接导致的命令注入，通过单引号闭合格式字符串并添加分号执行系统命令的通用 Payload 模板。适用于被注入命令带有
+    2>&1 的反射型场景。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: php-exec-bypass-via-encoding-and-redirect
+  description: 新增通过 base64 编码命令并利用重试机制的命令注入载荷模板，适用于 PHP 环境中引号闭合的 exec() 注入。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical

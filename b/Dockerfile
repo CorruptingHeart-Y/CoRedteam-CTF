@@ -35,7 +35,11 @@ RUN pip3 install --no-cache-dir \
     httpx>=0.24.0 \
     pyyaml>=6.0 \
     beautifulsoup4>=4.12.0 \
-    lxml>=4.9.0
+    lxml>=4.9.0 \
+    pyjwt>=2.8.0 \
+    pycryptodome>=3.19.0 \
+    cryptography>=41.0.0 \
+    urllib3>=2.0.0
 
 RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /opt/sqlmap && \
     ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap
