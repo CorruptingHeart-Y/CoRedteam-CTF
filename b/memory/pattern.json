@@ -65,6 +65,42 @@
       "error_type": "Potential sandbox constraint: Executor regex blocks os.system/popen/subprocess.run literals",
       "root_cause": "即使环境正常，若特工尝试在 Python 脚本中编写 `os.system('cat /flag')` 来辅助验证，将立即触发 `[SECURITY] PYTHON_BLOCKED pattern='os_system_exec'`。这是 Planner 常见错误——认为沙箱只检查 import，忽略了对代码文本的扫描。",
       "fix_suggestion": "【绝对禁令与新战术】严禁在 Python step 中直接写入 `os.system`、`subprocess.run`、`__import__` 等字面量。所有命令执行或文件读取必须转移到目标应用内部，通过模板注入 payload 完成，Python 仅负责发送 HTTP 请求和解析响应中的回显内容。"
+    },
+    {
+      "id": "consolidator_ce29",
+      "error_type": "HTTP_METHOD_MISMATCH — Planner 默认使用 GET 请求传递 payload，而目标期望 POST",
+      "root_cause": "Planner 在未侦察参数位置的情况下，盲目假设查询字符串即注入点。其已知信息仅给出 `text` 参数，但未说明请求方法，且 Planner 缺少对目标表单结构的动态分析（如检查 <form method='post'>）。",
+      "fix_suggestion": "【绝对禁令】禁止在未确认参数传递方式（GET/POST/Header/Cookie）时发送利用 payload。每次打靶必须执行一次无副作用的“方法探测”：尝试 GET、POST（application/x-www-form-urlencoded）、POST（multipart）等多种形式，观察回显差异，确认请求方法后再注入。对于已知 GET 无效的场景，直接切换为 POST 后重试，且在同一步骤中容错处理两种方法。"
+    },
+    {
+      "id": "consolidator_875a",
+      "error_type": "SSTI_HTTP_METHOD_MISMATCH",
+      "root_cause": "Planner未根据漏洞描述推断正确的参数传递方式（文本'用户通过text参数提交'暗示POST表单），盲目沿用默认GET请求，且缺乏对响应无回显的错误诊断机制。",
+      "fix_suggestion": "【绝对禁令与新战术】遇到SSTI漏洞时，禁止假设参数位置为GET QueryString。必须首先手工或通过轻量扫描确认参数传递方式（GET/POST/JSON/XML），然后使用正确的HTTP方法发送payload。同时在Python代码中不得出现任何黑名单模块或系统命令字面量，所有SSTI payload的构造必须在字符串层面完成，使用白名单库（requests）发起请求。"
+    },
+    {
+      "id": "consolidator_55db",
+      "error_type": "SECURITY_BLOCKED_OS_SYSTEM_EXEC",
+      "root_cause": "Planner可能尝试在Python payload中写入os.system或subprocess.run以执行系统命令，但沙箱Executor会对代码文本进行正则扫描并拦截此类字符串，导致步骤失败。",
+      "fix_suggestion": "【绝对禁令】永远不要在Python step中写入os.system、os.popen、subprocess.*或__import__等字面量。所有需要系统命令执行的逻辑必须转移到目标应用内部（如通过Velocity反射），Python代码只负责通过requests发送payload并接收结果。"
+    },
+    {
+      "id": "consolidator_1155",
+      "error_type": "使用了无效的 Velocity 表达式 — `${7*7}` 不会触发数学运算",
+      "root_cause": "Planner 混淆了模板引擎语法，认为 `${7*7}` 能在 Velocity 中执行算术运算，实际上 Velocity 的 `${}` 仅解析变量名，`7*7` 被当作变量名处理，导致无回显。",
+      "fix_suggestion": "【绝对禁令】禁止使用 `${数字*数字}` 探测 Velocity 注入。必须改用 `#set` 指令完成运算并立即输出：`#set($x=7*7)$x` 或使用 `$!{7*7}`。"
+    },
+    {
+      "id": "consolidator_5239",
+      "error_type": "HTTP 方法错误 — 使用 POST 但端点只接受 GET 参数",
+      "root_cause": "Planner 未确认参数传递方式，默认使用了 `requests.post` 并在 body 中发送 `data`，而目标模板引擎从 Query String 中取值，导致 payload 未被解析。",
+      "fix_suggestion": "【战术铁律】在未明确端点接受方式时，**必须优先使用 GET 请求，将参数附加在 URL 中**。如果 GET 失败，再尝试 POST 并检查 `Content-Type` 是否为 `application/x-www-form-urlencoded`。"
+    },
+    {
+      "id": "consolidator_3380",
+      "error_type": "MALFORMED_PYTHON_CODE — Planner generated code with syntax error (e.g., missing indentation after 'if')",
+      "root_cause": "Planner 试图在一行中通过分号组合多个语句，包含 `if` 控制流，但没有正确换行和缩进，导致 Python 语法无效。沙箱 Validator 在检查 import 之前就捕获了语法错误，步骤被跳过。",
+      "fix_suggestion": "【绝对禁令】严禁在 Python 步骤中使用以分号分隔的单行复杂控制流。必须使用多行结构，每个 `if`/`for`/`try` 必须独立成块并正确缩进。建议 Planner 在生成代码后调用 `compile(code, '<string>', 'exec')` 预检语法。提供正确模板如下：\npython\nfrom redteam_sdk import HttpClient\ns = HttpClient('http://target')\nresp = s.get('/?text=${7*7}')\nif '49' in resp.text:\n    print('STEP_OK')\nelse:\n    print('STEP_FAIL')\n"
     }
   ]
 }

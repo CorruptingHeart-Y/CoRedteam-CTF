@@ -733,6 +733,54 @@ def _check_python_safety(code: str, step_id: int) -> list[str]:
 #  工作区准备：SDK + context.json + tmp 目录
 # ──────────────────────────────────────────────
 
+def _materialize_strategy_request(selected_sid: str, target: "TargetContext | None") -> dict | None:
+    """Read YAML template + RuntimeTruths → synthesize exact HTTP request step."""
+    import sys, yaml
+    from pathlib import Path as _Path
+    # Ensure b/ is on path for memory.runtime_truths import
+    _b_root = _Path(__file__).resolve().parent.parent
+    if str(_b_root) not in sys.path:
+        sys.path.insert(0, str(_b_root))
+    from memory.runtime_truths import get_runtime_truths
+    _rtt = get_runtime_truths()
+    method = str(_rtt.get("injection_method") or "POST")
+    endpoint = str(_rtt.get("injection_endpoint") or "/")
+    param = str(_rtt.get("injection_parameter") or "text")
+    target_url = target.url.rstrip("/") if target else "http://127.0.0.1:1"
+    tmpl_dir = _Path(__file__).resolve().parent.parent / "templates"
+    for yf in tmpl_dir.rglob("*.yaml"):
+        with open(yf, encoding="utf-8") as f:
+            d = yaml.safe_load(f)
+        for pt in d.get("payload_templates", []):
+            if pt.get("canonical_strategy_id") == selected_sid:
+                tpl = pt.get("template", "")
+                if not tpl:
+                    print(f"[executor] materializer: {selected_sid} has empty template, skipping")
+                    return None
+                import re as _re
+                if _re.search(r'[A-Z_]{4,}', tpl) and not _re.search(r'[a-z0-9]', tpl.split('(')[-1].split(')')[0] if '(' in tpl else ''):
+                    print(f"[executor] materializer REJECT: unresolved placeholder in template: {repr(tpl)}")
+                    return None
+                code = (
+                    f"import redteam_sdk\n"
+                    f"s = redteam_sdk.HttpClient('{target_url}')\n"
+                    f"payload = {repr(tpl)}\n"
+                    f"resp = s.{method.lower()}('{endpoint}', data={{'{param}': payload}})\n"
+                    f"print(f'HTTP {{resp.status_code}}: {{resp.text[:500]}}')\n"
+                    f"print('STEP_OK')"
+                )
+                print(f"[executor] materialized {selected_sid}: {method} {endpoint} {param}={repr(tpl)[:50]}")
+                return {
+                    "id": "materialized-1",
+                    "type": "python",
+                    "command": code,
+                    "purpose": f"materialized {selected_sid} via {method} {endpoint}?{param}=...",
+                    "expected_outcome": "STEP_OK",
+                }
+    print(f"[executor] materializer: {selected_sid} not found in any YAML")
+    return None
+
+
 def _prepare_exec_workspace(base_workdir: Path, target_context: dict | None = None) -> Path:
     """
     准备执行工作区：
@@ -1224,6 +1272,16 @@ def run_executor(
 
     plan   = data.get("plan") or {}
     steps  = plan.get("steps") or []
+
+    # ── Materializer: if plan has selected_canonical_strategy_id, use YAML + RuntimeTruths ──
+    selected_sid = plan.get("selected_canonical_strategy_id", "")
+    if selected_sid:
+        materialized_step = _materialize_strategy_request(selected_sid, target)
+        if materialized_step:
+            steps = [materialized_step]
+            print(f"[executor] materialized {selected_sid} step cmd={materialized_step['command'][:200]}")
+        else:
+            print(f"[executor] materializer returned None for {selected_sid}, falling back to plan steps")
 
     if target is not None:
         target_url = target.url

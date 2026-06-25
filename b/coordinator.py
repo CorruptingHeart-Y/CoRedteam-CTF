@@ -54,6 +54,52 @@ def _list_json_files(folder: Path) -> list[str]:
     return sorted([p.name for p in folder.glob("*.json") if p.is_file()])
 
 
+def _classify_observation(exec_out, fb):
+    """Return (request_sent, observation_status, failure_class).
+
+    Categories:
+      A. request_not_sent       → no strategy/surface update
+      B. observation_unknown    → diagnostic only, no surface decay
+      C. positive_evidence      → strategy success
+      D. no_positive_evidence   → strategy failure, surface candidate
+    """
+    step_results = exec_out.get("step_results") or []
+    if not step_results:
+        return False, "request_not_sent", None
+    sent = False
+    for r in step_results:
+        http_resps = r.get("http_responses") or []
+        if http_resps:
+            sent = True
+        rr = r.get("result") or {}
+        stdout = str(rr.get("_stdout") or rr.get("stdout") or "")
+        if any(kw in stdout.lower() for kw in ("49", "uid=", "root:", "flag{", "command output")):
+            return True, "positive_evidence", None
+    if not sent:
+        return False, "request_not_sent", None
+    # sent but no known signal
+    summary = str(fb.get("summary") or "").lower()
+    if "no reflection" in summary or "未触发" in summary or "payload 未" in summary:
+        return True, "no_positive_evidence", "expected_signal_missing"
+    if fb.get("repro_success"):
+        return True, "positive_evidence", None
+    detected = fb.get("detected_primitives") or []
+    if detected:
+        return True, "positive_evidence", None
+    return True, "no_positive_evidence", "no_reflection"
+
+
+def _compute_decision_fingerprint(exec_out, fb, selected_sid):
+    """Produce a stable fingerprint for breaker/degradation tracking.
+    Uses observation_status + canonical_id, NOT error keywords."""
+    sent, obs, fail_cls = _classify_observation(exec_out, fb)
+    if not sent:
+        return f"request_not_sent::{selected_sid}"
+    if obs == "positive_evidence":
+        return f"positive::{selected_sid}"
+    return f"{obs}::{fail_cls or 'unknown'}::{selected_sid}"
+
+
 def should_record_strategy_attempt(exec_out: dict[str, Any]) -> bool:
     """Only real executor runs count as strategy attempts; infra/pre-gate failures do not."""
     if not exec_out.get("executed"):
@@ -68,10 +114,15 @@ def _record_strategy_attempt_if_executed(
     selected_canonical_strategy_id: str,
     exec_out: dict[str, Any],
     feedback: dict[str, Any],
+    round_number: int = 0,
 ) -> None:
     if not selected_canonical_strategy_id or not should_record_strategy_attempt(exec_out):
         return
-    success = bool(feedback.get("repro_success"))
+    sent, obs, fail_cls = _classify_observation(exec_out, feedback)
+    if obs == "request_not_sent":
+        print(f"[coordinator] strategy attempt not recorded: request_not_sent for {selected_canonical_strategy_id}")
+        return
+    success = bool(feedback.get("repro_success")) or obs == "positive_evidence"
     failure_stage = "" if success else str(feedback.get("error_fingerprint") or "runtime_failure")
     evidence = str(feedback.get("summary") or feedback.get("feedback_for_planner") or "")[:300]
     tracker.record_attempt(
@@ -79,6 +130,9 @@ def _record_strategy_attempt_if_executed(
         success=success,
         failure_stage=failure_stage,
         evidence=evidence,
+        failure_class=fail_cls or "",
+        round_number=round_number,
+        outcome=obs,
     )
 
 
@@ -98,6 +152,52 @@ def evaluate_pre_execution_gate(
                 f"STRATEGY_REJECTED: {selected_canonical_strategy_id} decision={health.decision}"
             )
     return pre_gate_errors
+
+
+def _discover_form_method(target: TargetContext | None) -> str:
+    """Lightweight HTML form discovery: GET root, parse form method."""
+    if target is None:
+        return ""
+    import re, urllib.request, ssl
+    url = target.url.rstrip("/") + "/"
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, method="GET")
+        resp = urllib.request.urlopen(req, timeout=5, context=ctx)
+        body = resp.read(5000).decode("utf-8", errors="replace")
+        m = re.search(r'<form[^>]+method\s*=\s*["\'](\w+)["\']', body, re.IGNORECASE)
+        if m:
+            print(f"[coordinator] preflight form method: {m.group(1).upper()}")
+            return m.group(1).upper()
+        m = re.search(r'<form[^>]+method\s*=\s*(\w+)', body, re.IGNORECASE)
+        if m:
+            print(f"[coordinator] preflight form method: {m.group(1).upper()}")
+            return m.group(1).upper()
+    except Exception as e:
+        print(f"[coordinator] preflight failed: {e}")
+    return ""
+
+
+def _extract_injection_param(confirmed: dict[str, Any]) -> str:
+    """Extract injection parameter name from confirmed_vuln source code."""
+    import re
+    vulns = confirmed.get("vulnerabilities", [])
+    for v in vulns:
+        code = str((v.get("source") or {}).get("code", ""))
+        for pattern in [
+            r'@RequestParam\s*\([^)]*name\s*=\s*"([^"]+)"',
+            r'@RequestParam\s*\(\s*"([^"]+)"',
+            r'(?:request|req)\.getParameter\s*\(\s*"([^"]+)"',
+            r'\$_GET\s*\[\s*[\'"]([^\'"]+)[\'"]',
+            r'\$_POST\s*\[\s*[\'"]([^\'"]+)[\'"]',
+            r'\$_REQUEST\s*\[\s*[\'"]([^\'"]+)[\'"]',
+        ]:
+            m = re.search(pattern, code)
+            if m:
+                return m.group(1)
+    return "text"
 
 
 def _dry_run_return(
@@ -451,32 +551,38 @@ def _build_breaker_memory_context(
 
 
 def _extract_step_error_fingerprint(step_results: list[dict[str, Any]]) -> str:
-    """Produce a short fingerprint of the dominant failure pattern this iteration.
+    """Produce a short fingerprint of the dominant failure pattern.
 
-    Used to detect when the same error repeats across iterations so the breaker
-    can fire on strategy-level stagnation, not just consecutive eval failures.
+    Checks both failed steps AND successful steps with no positive evidence.
+    HTTP 200 + no reflection → "http_ok_no_reflection" (triggers stagnation).
     """
     error_tokens: list[str] = []
     for r in step_results:
         rr = r.get("result") or {}
-        if rr.get("ok"):
-            continue
         stderr = (rr.get("stderr") or "")[:300]
-        stdout = (rr.get("stdout") or "")[:300]
-        text = f"{stderr} {stdout}"
-        for keyword in (
-            "Invalid URL", "ConnectionError", "Connection refused",
-            "SSLError", "SyntaxError", "NameError", "IndentationError",
-            "KeyError", "401", "403", "404", "405", "500",
-            "All fields are required", "Invalid Email",
-            "CSRF Detected", "Unauthorised",
-            "security_blocked", "skipped_syntax_error",
-        ):
-            if keyword in text:
-                error_tokens.append(keyword)
-                break
+        stdout = (rr.get("_stdout") or rr.get("stdout") or "")[:500]
+        if not rr.get("ok"):
+            text = f"{stderr} {stdout}"
+            for keyword in (
+                "Invalid URL", "ConnectionError", "Connection refused",
+                "SSLError", "SyntaxError", "NameError", "IndentationError",
+                "KeyError", "401", "403", "404", "405", "500",
+                "All fields are required", "Invalid Email",
+                "CSRF Detected", "Unauthorised",
+                "security_blocked", "skipped_syntax_error",
+                "STEP_FAIL",
+            ):
+                if keyword in text:
+                    error_tokens.append(keyword)
+                    break
+            else:
+                error_tokens.append("unknown_error")
         else:
-            error_tokens.append("unknown_error")
+            # ok=True: check for silent non-reflection
+            has_http = any(kw in stdout.lower() for kw in ("[http]", "<!doctype", "<html"))
+            has_signal = any(kw in stdout.lower() for kw in ("49", "uid=", "root:", "flag{", "step_ok"))
+            if has_http and not has_signal:
+                error_tokens.append("http_ok_no_reflection")
     return "|".join(sorted(set(error_tokens))) or "no_failures"
 
 
@@ -643,6 +749,20 @@ def run_pipeline(
     while iteration < _iter_budget and iteration < _MAX_HARD_LIMIT:
         iteration += 1
         render_iteration_header(iteration, _iter_budget)
+
+        # ── Preflight: HTML form discovery (first round only) ──
+        if iteration == 1:
+            from memory.runtime_truths import get_runtime_truths
+            _rtt = get_runtime_truths()
+            if not _rtt.has("injection_method"):
+                _preflight_method = _discover_form_method(target)
+                if _preflight_method:
+                    _rtt.set_fact("injection_method", _preflight_method, "html_form_preflight")
+                    _rtt.set_fact("injection_endpoint", "/", "html_form_preflight")
+                    _rtt.set_fact("injection_parameter", _extract_injection_param(confirmed), "confirmed_vuln_source")
+                    print(f"[coordinator] preflight discovered: method={_preflight_method} endpoint=/ parameter=text")
+                else:
+                    warn("[coordinator] preflight: could not determine form method from target root")
 
         # ── Planner ────────────────────────────────────────────────────────
         _print_agent_header("planner")
@@ -839,6 +959,7 @@ def run_pipeline(
             selected_canonical_strategy_id,
             exec_out,
             fb,
+            round_number=iteration,
         )
         render_evaluator_feedback(fb)
 
@@ -927,10 +1048,12 @@ def run_pipeline(
             print(f"[coordinator] ⚠️  连续失败计数: {_consecutive_failures}/{_BREAKER_THRESHOLD} | 错误指纹: {fp}")
 
         # Stagnation check: same error fingerprint repeated across the window
+        # "no_failures" excluded (no step ran). "http_ok_no_reflection" IS stagnation.
+        _NON_STAGNATING = frozenset({"no_failures"})
         _stagnating = (
             len(_error_fingerprints) >= _BREAKER_THRESHOLD
             and len(set(_error_fingerprints)) == 1
-            and _error_fingerprints[0] != "no_failures"
+            and _error_fingerprints[0] not in _NON_STAGNATING
         )
 
         # ── 攻击面轮换：计划全部 BLOCKED 时强制切换漏洞 ──────────────────

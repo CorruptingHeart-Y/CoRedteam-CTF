@@ -1,1 +1,14 @@
-{}
+{
+  "injection_method": {
+    "value": "POST",
+    "evidence": "html_form_preflight"
+  },
+  "injection_endpoint": {
+    "value": "/",
+    "evidence": "html_form_preflight"
+  },
+  "injection_parameter": {
+    "value": "text",
+    "evidence": "confirmed_vuln_source"
+  }
+}

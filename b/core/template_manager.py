@@ -29,6 +29,10 @@ class TemplateSelectionResult:
     matched_strategy_ids: list[str]
     available_strategy_ids: list[str]
     rejected_strategy_ids: list[str]
+    preferred_strategy_ids: list[str] = field(default_factory=list)
+    fallback_strategy_ids: list[str] = field(default_factory=list)
+    blocked_strategy_ids: list[str] = field(default_factory=list)
+    why_not_selected: dict[str, str] = field(default_factory=dict)
     strategy_health: dict[str, dict[str, Any]] = field(default_factory=dict)
     degraded_strategy_ids: list[str] = field(default_factory=list)
     hard_rejected_strategy_ids: list[str] = field(default_factory=list)
@@ -405,12 +409,24 @@ class TemplateManager:
             else:
                 filtered_out.append((t.id, rejected_sids))
 
+        # ── Tiered output: preferred (ACTIVE), fallback (DEGRADED), blocked (REJECT/HARD_REJECT) ──
+        preferred_strategy_ids = [sid for sid in available_strategy_ids if sid not in degraded_strategy_ids]
+        fallback_strategy_ids = [sid for sid in available_strategy_ids if sid in degraded_strategy_ids]
+        blocked_strategy_ids = list(rejected_for_surface)
+        why_not_selected: dict[str, str] = {}
+        for sid in fallback_strategy_ids:
+            why_not_selected[sid] = "degraded_by_consecutive_failures_or_low_yield"
+        for sid in blocked_strategy_ids:
+            why_not_selected[sid] = "rejected_or_hard_rejected"
+
         if unique:
             print("[template_manager] === strategy selection report ===")
             print(f"[template_manager]   matched templates: {len(unique)}")
             print(f"[template_manager]   matched strategy_ids: {matched_strategy_ids or '(none)'}")
             print(f"[template_manager]   rejected for surface: {rejected_for_surface}")
-            print(f"[template_manager]   available strategy_ids: {available_strategy_ids}")
+            print(f"[template_manager]   preferred: {preferred_strategy_ids}")
+            print(f"[template_manager]   fallback: {fallback_strategy_ids}")
+            print(f"[template_manager]   blocked: {blocked_strategy_ids}")
             for tid, rj in filtered_out:
                 print(f"[template_manager]   filtered template [{tid}]: all strategies rejected {rj}")
 
@@ -428,6 +444,10 @@ class TemplateManager:
                 matched_template_count=len(unique),
                 matched_strategy_ids=matched_strategy_ids,
                 available_strategy_ids=available_strategy_ids,
+                preferred_strategy_ids=preferred_strategy_ids,
+                fallback_strategy_ids=fallback_strategy_ids,
+                blocked_strategy_ids=blocked_strategy_ids,
+                why_not_selected=why_not_selected,
                 rejected_strategy_ids=rejected_for_surface,
                 strategy_health=strategy_health,
                 degraded_strategy_ids=degraded_strategy_ids,
@@ -447,6 +467,10 @@ class TemplateManager:
                 matched_template_count=len(unique),
                 matched_strategy_ids=matched_strategy_ids,
                 available_strategy_ids=[],
+                preferred_strategy_ids=[],
+                fallback_strategy_ids=[],
+                blocked_strategy_ids=blocked_strategy_ids,
+                why_not_selected=why_not_selected,
                 rejected_strategy_ids=rejected_for_surface,
                 strategy_health=strategy_health,
                 degraded_strategy_ids=degraded_strategy_ids,

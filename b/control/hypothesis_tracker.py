@@ -439,6 +439,13 @@ class Hypothesis:
     migrated_from: list[str] = field(default_factory=list)
     migration_version: int = 0
 
+    # ── Extended runtime state (persisted with Hypothesis) ──
+    consecutive_failures: int = 0
+    failure_classes: Counter = field(default_factory=Counter)
+    last_attempt_round: int | None = None
+    last_positive_evidence_round: int | None = None
+    last_outcome: str | None = None
+
     def __post_init__(self) -> None:
         if isinstance(self.failure_stages, dict):
             self.failure_stages = Counter(self.failure_stages)
@@ -495,6 +502,11 @@ class Hypothesis:
             "rejected_reason": self.rejected_reason,
             "migrated_from": self.migrated_from,
             "migration_version": self.migration_version,
+            "consecutive_failures": self.consecutive_failures,
+            "failure_classes": dict(self.failure_classes),
+            "last_attempt_round": self.last_attempt_round,
+            "last_positive_evidence_round": self.last_positive_evidence_round,
+            "last_outcome": self.last_outcome,
         }
 
     @classmethod
@@ -512,6 +524,11 @@ class Hypothesis:
             rejected_reason=data.get("rejected_reason", ""),
             migrated_from=data.get("migrated_from", []),
             migration_version=data.get("migration_version", 0),
+            consecutive_failures=data.get("consecutive_failures", 0),
+            failure_classes=Counter(data.get("failure_classes", {})),
+            last_attempt_round=data.get("last_attempt_round"),
+            last_positive_evidence_round=data.get("last_positive_evidence_round"),
+            last_outcome=data.get("last_outcome"),
         )
 
 
@@ -664,6 +681,9 @@ class HypothesisTracker:
         success: bool,
         failure_stage: str = "",
         evidence: str = "",
+        failure_class: str = "",
+        round_number: int | None = None,
+        outcome: str = "",
     ) -> Hypothesis:
         """Record an execution attempt against a hypothesis.
 
@@ -676,12 +696,20 @@ class HypothesisTracker:
         h = self._hypotheses[fingerprint]
         h.attempts += 1
         h.last_seen = datetime.now(timezone.utc).isoformat()
+        h.last_outcome = outcome or ("positive_evidence" if success else "no_positive_evidence")
+        if round_number is not None:
+            h.last_attempt_round = round_number
 
         if success:
             h.successes += 1
+            h.consecutive_failures = 0
+            h.last_positive_evidence_round = round_number
         else:
+            h.consecutive_failures += 1
             if failure_stage:
                 h.failure_stages[failure_stage] += 1
+            if failure_class:
+                h.failure_classes[failure_class] += 1
             if evidence:
                 h.last_evidence.append(evidence[:300])
                 if len(h.last_evidence) > MAX_EVIDENCE_SNIPPETS:
@@ -772,6 +800,10 @@ class HypothesisTracker:
             decision = "REJECT"
             budget = 0
             reason = "empirically_rejected_strategy"
+        elif matched.consecutive_failures >= 3 and successes == 0:
+            decision = "DEGRADE"
+            budget = 1
+            reason = "consecutive_no_positive_evidence"
         elif attempts >= 3 and successes == 0 and failure_rate >= 0.67:
             decision = "DEGRADE"
             budget = 1

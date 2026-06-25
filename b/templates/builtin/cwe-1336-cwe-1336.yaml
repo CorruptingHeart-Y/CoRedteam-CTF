@@ -851,7 +851,7 @@ payload_templates:
 - name: ssti-detection-arithmetic
   description: '为 Velocity 模板注入漏洞创建基础武器库模板，包含最终探测载荷 #set($x=7*7)$x，用于在利用前确认模板求值存在，避免复杂载荷被盲目发送。'
   lang: python
-  template: ''
+  template: '#set($x=7*7)$x'
   tags: []
   source: consolidator
   severity: critical
@@ -947,7 +947,7 @@ payload_templates:
 - name: velocity-detection-set-calc
   description: 基于#set指令的数学运算检测模板注入
   lang: python
-  template: ''
+  template: '#set($x=7*7)$x'
   tags: []
   source: consolidator
   severity: critical

@@ -60,6 +60,18 @@
       "source": "consolidator",
       "cwe": ""
     },
+    "9a69804ae32bf8ec": {
+      "first_seen": 1782376472.8916833,
+      "name": "velocity-template-injection-rce-via-reflection",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "9dc83efe602dba96": {
+      "first_seen": 1782402369.191598,
+      "name": "Velocity SSTI via POST form parameter (CWE-1336)",
+      "source": "consolidator",
+      "cwe": ""
+    },
     "0a796c0ae9a77c88": {
       "first_seen": 1781548704.3212757,
       "name": "memcached-crlf-injection-with-raw-bytes",
@@ -336,12 +348,12 @@
       "source": "consolidator",
       "cwe": ""
     },
-    "9a69804ae32bf8ec": {
-      "first_seen": 1782376472.8916833,
-      "name": "velocity-template-injection-rce-via-reflection",
+    "7fb62b6d8242f530": {
+      "first_seen": 1782403122.288216,
+      "name": "velocity-template-injection-simple-probe",
       "source": "consolidator",
       "cwe": ""
     }
   },
-  "_updated": 1782376472.8916833
+  "_updated": 1782403122.288216
 }

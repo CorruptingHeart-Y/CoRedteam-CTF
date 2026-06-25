@@ -76,7 +76,7 @@
     "phase1_timestamp": "2026-06-24T23:28:41.950617",
     "total_vulnerabilities": 1,
     "target_context": {
-        "base_url": "http://host.docker.internal:9443",
+        "base_url": "http://172.29.80.1:9084",
         "app_name": "目标应用",
         "os_hint": "linux"
     }

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-25T15:00:02.025230+00:00",
+  "updated_at": "2026-06-25T16:16:04.549968+00:00",
   "hypotheses": {
     "crlf*memcached*pickle_rce": {
       "fingerprint": "crlf*memcached*pickle_rce",
@@ -23,7 +23,12 @@
       "rejected_at": "2026-06-16T15:39:49.943839+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: reflection (4/5 = 80%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*generic*exec": {
       "fingerprint": "ssti*generic*exec",
@@ -45,7 +50,12 @@
       "rejected_at": "2026-06-21T14:37:43.295189+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "path_traversal*fs*read": {
       "fingerprint": "path_traversal*fs*read",
@@ -64,7 +74,12 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*jinja2*exec": {
       "fingerprint": "ssti*jinja2*exec",
@@ -86,7 +101,12 @@
       "rejected_at": "2026-06-21T14:50:32.950282+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "no_reflection*fake*goal": {
       "fingerprint": "no_reflection*fake*goal",
@@ -104,7 +124,12 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*velocity*exec": {
       "fingerprint": "ssti*velocity*exec",
@@ -126,7 +151,12 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*mako*exec": {
       "fingerprint": "ssti*mako*exec",
@@ -148,7 +178,12 @@
       "rejected_at": "2026-06-24T16:32:56.304640+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: crlf_injection (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "cwe-79-cwe-79": {
       "fingerprint": "cwe-79-cwe-79",
@@ -168,7 +203,12 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*velocity*reflection_exec": {
       "fingerprint": "ssti*velocity*reflection_exec",
@@ -186,7 +226,12 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "ssti*generic*arithmetic_probe": {
       "fingerprint": "ssti*generic*arithmetic_probe",
@@ -204,23 +249,82 @@
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     },
     "unit:http:rejected": {
       "fingerprint": "unit:http:rejected",
-      "attempts": 66,
+      "attempts": 77,
       "successes": 0,
       "failure_stages": {
-        "exec": 66
+        "exec": 77
       },
       "last_evidence": [],
       "first_seen": "2026-06-25T14:23:37.175199+00:00",
-      "last_seen": "2026-06-25T15:00:02.024718+00:00",
+      "last_seen": "2026-06-25T16:16:04.549968+00:00",
       "rejected": true,
       "rejected_at": "2026-06-25T14:23:37.179075+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: exec (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
-      "migration_version": 0
+      "migration_version": 0,
+      "consecutive_failures": 11,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": "no_positive_evidence"
+    },
+    "cwe-1336:discovery:arithmetic-detection": {
+      "fingerprint": "cwe-1336:discovery:arithmetic-detection",
+      "attempts": 3,
+      "successes": 0,
+      "failure_stages": {
+        "NoError": 2,
+        "AllStdoutEmpty": 1
+      },
+      "last_evidence": [
+        "[FAILED] 探测 payload 未触发 SSTI，无 49 回显，需要改用 POST 方式",
+        "[FAILED] 探测步骤未返回算术运算结果，payload未触发模板解析，需调整请求方式与参数传递。",
+        "[FAILED] 步骤因语法错误被跳过，未进行任何探测，无法评估漏洞存在性。"
+      ],
+      "first_seen": "2026-06-25T15:40:19.011736+00:00",
+      "last_seen": "2026-06-25T15:58:07.116693+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
+    },
+    "cwe-1336:discovery:set-calc-probe": {
+      "fingerprint": "cwe-1336:discovery:set-calc-probe",
+      "attempts": 1,
+      "successes": 0,
+      "failure_stages": {
+        "NoError": 1
+      },
+      "last_evidence": [
+        "[FAILED] SSTI探测未触发，payload未在响应中回显，需改用POST方式提交。"
+      ],
+      "first_seen": "2026-06-25T15:44:01.574975+00:00",
+      "last_seen": "2026-06-25T15:44:01.574975+00:00",
+      "rejected": false,
+      "rejected_at": "",
+      "rejected_reason": "",
+      "migrated_from": [],
+      "migration_version": 0,
+      "consecutive_failures": 0,
+      "failure_classes": {},
+      "last_attempt_round": null,
+      "last_positive_evidence_round": null,
+      "last_outcome": null
     }
   }
 }

