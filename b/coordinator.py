@@ -1020,7 +1020,39 @@ def run_pipeline(
                         f"stderr={(rr.get('stderr') or '')[:160]}"
                     )
 
-        # ── Evaluator ──────────────────────────────────────────────────────
+        # ── ObservationDecision: created BEFORE Evaluator ──────────────────
+        # Evaluator must only INTERPRET the deterministic decision, never override it.
+        _expected_signals = (
+            template_selection.strategy_descriptors.get(selected_canonical_strategy_id, {})
+            .get("expected_signals", []) if hasattr(template_selection, 'strategy_descriptors') else []
+        )
+        from core.observation_decision import make_observation_decision
+        _surface_key = build_surface_key(confirmed)
+        _obs_decision = make_observation_decision(
+            exec_out=exec_out,
+            expected_signals=_expected_signals,
+            run_id=run_id,
+            surface_key=_surface_key,
+            selected_strategy_id=selected_canonical_strategy_id,
+            evidence_ledger_path=ws,
+        )
+        print(f"[observation_decision] status={_obs_decision.observation_status} "
+              f"matched_signals={_obs_decision.matched_signal_ids} "
+              f"is_new_evidence={_obs_decision.is_new_evidence} "
+              f"is_new_state_transition={_obs_decision.is_new_state_transition}")
+
+        # ── Record strategy attempt BEFORE evaluator (consumes ObservationDecision) ──
+        _record_strategy_attempt_if_executed(
+            _hypothesis_tracker,
+            selected_canonical_strategy_id,
+            exec_out,
+            {},
+            round_number=iteration,
+            expected_signals=_expected_signals,
+            obs_decision=_obs_decision,
+        )
+
+        # ── Evaluator (interprets ObservationDecision; output is explanatory only) ──
         _print_agent_header("evaluator")
         stage("Evaluator", "评估复现结果...")
 
@@ -1066,42 +1098,13 @@ def run_pipeline(
             adapter=adapter,
             runtime_truths=_get_runtime_truths_for_eval().data,
             template_selection=template_selection.to_dict(),
+            obs_decision=_obs_decision.to_dict(),
         )
         feedback = fb
-        _expected_signals = (
-            template_selection.strategy_descriptors.get(selected_canonical_strategy_id, {})
-            .get("expected_signals", []) if hasattr(template_selection, 'strategy_descriptors') else []
-        )
         render_evaluator_feedback(fb)
 
-        # ── ObservationDecision: single deterministic source of truth ──
-        from core.observation_decision import make_observation_decision
-        _surface_key = build_surface_key(confirmed)
-        _obs_decision = make_observation_decision(
-            exec_out=exec_out,
-            expected_signals=_expected_signals,
-            run_id=run_id,
-            surface_key=_surface_key,
-            selected_strategy_id=selected_canonical_strategy_id,
-            evidence_ledger_path=ws,
-        )
-        print(f"[observation_decision] status={_obs_decision.observation_status} "
-              f"matched_signals={_obs_decision.matched_signal_ids} "
-              f"is_new_evidence={_obs_decision.is_new_evidence} "
-              f"is_new_state_transition={_obs_decision.is_new_state_transition}")
-
-        # ── Record strategy attempt (consumes ObservationDecision) ──
-        _record_strategy_attempt_if_executed(
-            _hypothesis_tracker,
-            selected_canonical_strategy_id,
-            exec_out,
-            fb,
-            round_number=iteration,
-            expected_signals=_expected_signals,
-            obs_decision=_obs_decision,
-        )
-
         # ── OUTCOME_CONSISTENCY_VIOLATION check ──
+        # Compare evaluator output against the pre-existing deterministic ObservationDecision
         _old_sent, _old_obs, _old_fail = _classify_observation(exec_out, fb, expected_signals=_expected_signals)
         if _obs_decision.observation_status != _old_obs:
             _violation_msg = (

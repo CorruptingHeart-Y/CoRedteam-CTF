@@ -588,6 +588,134 @@ def _sanitize_exec_output(exec_out: dict[str, Any], plan: dict[str, Any] | None 
     return out
 
 
+def _get_materialized_execution_record(exec_out: dict[str, Any]) -> dict[str, Any]:
+    record = exec_out.get("materialized_execution_record") if isinstance(exec_out, dict) else None
+    if isinstance(record, dict) and record.get("materialized") is True:
+        return record
+    for sr in (exec_out.get("step_results") or []) if isinstance(exec_out, dict) else []:
+        record = sr.get("materialized_execution_record") if isinstance(sr, dict) else None
+        if isinstance(record, dict) and record.get("materialized") is True:
+            return record
+    return {}
+
+
+def _materialized_payload_text(record: dict[str, Any]) -> str:
+    body = record.get("normalized_request_body") if isinstance(record, dict) else None
+    if not isinstance(body, dict):
+        return ""
+    return " ".join(str(v) for _, v in sorted(body.items()))
+
+
+def _plan_with_non_authoritative_intent(
+    plan: dict[str, Any] | None,
+    materialized_record: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not materialized_record.get("materialized"):
+        return plan
+    import copy
+    out = copy.deepcopy(plan or {})
+    original_steps = out.pop("steps", [])
+    out["non_authoritative_planner_intent"] = {
+        "note": "Original planner steps are intent text only; do not infer executed HTTP facts from them.",
+        "steps": original_steps,
+    }
+    return out
+
+
+def _materialized_fact_summary(record: dict[str, Any], fb: dict[str, Any] | None = None) -> str:
+    method = str(record.get("request_method") or "").upper()
+    endpoint = str(record.get("request_endpoint") or "")
+    body = record.get("normalized_request_body") if isinstance(record.get("normalized_request_body"), dict) else {}
+    params = ", ".join(f"{k}={v}" for k, v in sorted(body.items())) or "(none)"
+    statuses = []
+    for resp in record.get("http_responses") or []:
+        if isinstance(resp, dict) and resp.get("status_code") is not None:
+            statuses.append(str(resp.get("status_code")))
+    status_text = ",".join(statuses) if statuses else "none"
+    if record.get("request_sent"):
+        fact = f"Actual request sent: {method} {endpoint}; body parameters: {params}; HTTP status: {status_text}."
+        if not (fb or {}).get("repro_success"):
+            fact += " No expected signal observed for the current route."
+        return fact
+    return f"Actual request was not sent: {method} {endpoint}; body parameters: {params}."
+
+
+def _has_get_to_post_misattribution(text: str) -> bool:
+    if not text:
+        return False
+    lower = text.lower()
+    if "get" not in lower or "post" not in lower:
+        return False
+    english_terms = ("switch", "change", "convert", "use")
+    chinese_terms = ("\u6539\u7528", "\u5207\u6362", "\u6362\u6210", "\u6539\u6210", "\u4f7f\u7528")
+    return any(term in lower for term in english_terms) or any(term in text for term in chinese_terms)
+
+
+def _has_materialized_method_misattribution(text: str, materialized_record: dict[str, Any]) -> bool:
+    if not text:
+        return False
+    if _has_get_to_post_misattribution(text):
+        return True
+    method = str(materialized_record.get("request_method") or "").strip().upper()
+    if not method:
+        return False
+    lower = text.lower()
+    method_lower = method.lower()
+    action_terms = ("switch to", "change to", "convert to", "try ", "use ", "do not use")
+    if method_lower in lower and any(term in lower for term in action_terms):
+        return True
+    if f"may require {method_lower}" in lower or "different request method" in lower:
+        return True
+    chinese_terms = ("\u6539\u7528", "\u5207\u6362", "\u6362\u6210", "\u6539\u6210", "\u4f7f\u7528", "\u5c1d\u8bd5")
+    if method in text and any(term in text for term in chinese_terms):
+        return True
+    return False
+
+
+def _enforce_materialized_execution_facts(
+    fb: dict[str, Any],
+    materialized_record: dict[str, Any],
+) -> dict[str, Any]:
+    if not materialized_record.get("materialized"):
+        return fb
+    fact = _materialized_fact_summary(materialized_record, fb)
+    fb["materialized_execution_record"] = materialized_record
+    verified = fb.get("verified_facts")
+    if not isinstance(verified, list):
+        verified = []
+    if fact not in verified:
+        verified.insert(0, fact)
+    fb["verified_facts"] = verified
+    raw = fb.get("raw_evidence") or ""
+    if fact not in raw:
+        fb["raw_evidence"] = fact + ("\n" + raw if raw else "")
+
+    replacement = (
+        fact
+        + " Continue from this actual execution fact; do not reinterpret this run's "
+        + "already-materialized method, endpoint, or parameter."
+    )
+    for field in (
+        "next_required_action",
+        "feedback_for_planner",
+        "summary",
+        "what_failed",
+        "next_direction",
+        "state_transition_blocker",
+        "hypothesis",
+    ):
+        value = fb.get(field)
+        if isinstance(value, str) and _has_materialized_method_misattribution(value, materialized_record):
+            fb[field] = replacement
+    analysis = fb.get("analysis")
+    if isinstance(analysis, dict):
+        for field in ("what_happened", "guidance", "vs_expectation"):
+            value = analysis.get(field)
+            if isinstance(value, str) and _has_materialized_method_misattribution(value, materialized_record):
+                analysis[field] = replacement
+    return fb
+
+
 # ────────────────────────────────────────────────────────────────
 # Flag / 成功信号检测
 # ────────────────────────────────────────────────────────────────
@@ -1124,9 +1252,13 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
     )
 
     # ── Partial primitive detection (even in MOCK mode) ──
-    all_payloads = " ".join(
-        str(st.get("command") or "") for st in ((plan or {}).get("steps") or [])
-    )
+    materialized_record = _get_materialized_execution_record(exec_out)
+    if materialized_record.get("materialized"):
+        all_payloads = _materialized_payload_text(materialized_record)
+    else:
+        all_payloads = " ".join(
+            str(st.get("command") or "") for st in ((plan or {}).get("steps") or [])
+        )
     mock_primitives = _detect_primitives(all_stdouts, all_payloads, results)
 
     # ── EPE: semantic progress scoring ──
@@ -1212,8 +1344,17 @@ def _enforce_authoritative_context(
     template_selection: dict[str, Any] | None,
 ) -> dict[str, Any]:
     prefixes: list[str] = []
-    method = _runtime_truth_value(runtime_truths, "confirmed_render_method") or _runtime_truth_value(runtime_truths, "form_method")
-    param = _runtime_truth_value(runtime_truths, "confirmed_injection_param") or _runtime_truth_value(runtime_truths, "form_param") or "text"
+    method = (
+        _runtime_truth_value(runtime_truths, "confirmed_render_method")
+        or _runtime_truth_value(runtime_truths, "form_method")
+        or _runtime_truth_value(runtime_truths, "injection_method")
+    )
+    param = (
+        _runtime_truth_value(runtime_truths, "confirmed_injection_param")
+        or _runtime_truth_value(runtime_truths, "form_param")
+        or _runtime_truth_value(runtime_truths, "injection_parameter")
+        or "text"
+    )
     if str(method).upper() == "POST":
         prefixes.append(
             f"[TARGET_FACT] Runtime facts require POST. Never recommend GET. Use POST body parameter {param}."
@@ -1251,6 +1392,7 @@ def run_evaluator(
     adapter: ChallengeAdapter | None = None,
     runtime_truths: dict[str, Any] | None = None,
     template_selection: dict[str, Any] | None = None,
+    obs_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # ── 0. None 防御: executor 超时/崩溃时 exec_out 可能为 None ──
     if exec_out is None:
@@ -1265,6 +1407,7 @@ def run_evaluator(
 
     # ── 1. 脏数据清洗（截断 + 去 ANSI）+ expected_outcome 注入
     clean_exec_out = _sanitize_exec_output(exec_out, plan=plan)
+    materialized_record = _get_materialized_execution_record(clean_exec_out)
 
     # ── 2. 本地预判定（不依赖 LLM）────────────────────
     safe_plan = plan if plan is not None else {}
@@ -1280,9 +1423,12 @@ def run_evaluator(
     all_stdouts = f"{all_stdouts} {chain_stdouts}"
     # Evidence hygiene: strip framework noise from aggregated stdout
     all_stdouts = clean_framework_artifacts(all_stdouts)
-    all_payloads = " ".join(
-        str(st.get("command") or "") for st in (safe_plan.get("steps") or [])
-    )
+    if materialized_record.get("materialized"):
+        all_payloads = _materialized_payload_text(materialized_record)
+    else:
+        all_payloads = " ".join(
+            str(st.get("command") or "") for st in (safe_plan.get("steps") or [])
+        )
     pre_flag    = _detect_flag(all_stdouts)
     pre_signal  = _detect_success_signal(all_stdouts) if not pre_flag else ""
     pre_blind   = _detect_blind_rce(clean_exec_out.get("step_results") or []) if not pre_flag else False
@@ -1292,6 +1438,7 @@ def run_evaluator(
     if settings.mock_llm or llm is None:
         fb = _mock_evaluate(confirmed, plan, clean_exec_out)
         fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
+        fb = _enforce_materialized_execution_facts(fb, materialized_record)
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
         _update_payload_scores_from_eval(fb.get("repro_success", False), safe_plan)
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1314,7 +1461,8 @@ def run_evaluator(
         "do not recommend same-family payloads or variants.\n"
         "These constraints apply to next_required_action, analysis.guidance, and feedback_for_planner.\n"
         f"runtime_truths={json.dumps(runtime_truths or {}, ensure_ascii=False)}\n"
-        f"template_selection={json.dumps(template_selection or (plan or {}).get('template_selection') or {}, ensure_ascii=False)}"
+        f"template_selection={json.dumps(template_selection or (plan or {}).get('template_selection') or {}, ensure_ascii=False)}\n"
+        f"execution_facts={json.dumps({'materialized_execution_record': materialized_record, 'observation_decision': obs_decision} if materialized_record else {'observation_decision': obs_decision}, ensure_ascii=False)}"
     )
     system_prompt += runtime_context_rules    # ═══════════════════════════════════════════════════════════════════
     # 🔬 ABLATION HOOK — 实验开关（对正常逻辑零影响）
@@ -1411,16 +1559,18 @@ def run_evaluator(
 
     user_payload = {
         "confirmed_vuln": confirmed,
-        "plan": plan,
+        "plan": _plan_with_non_authoritative_intent(plan, materialized_record),
         "execution_result": clean_exec_out,
         "runtime_truths": runtime_truths or {},
         "template_selection": template_selection or (plan or {}).get("template_selection") or {},
+        "execution_facts": {"materialized_execution_record": materialized_record, "observation_decision": obs_decision} if materialized_record else {"observation_decision": obs_decision},
     }
     user_msg = json.dumps(user_payload, ensure_ascii=False) + pre_detection_note
 
     # ── 5. 调用 LLM ─────────────────────────────────
     fb = llm.complete_json(system_prompt, user_msg)
     fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
+    fb = _enforce_materialized_execution_facts(fb, materialized_record)
 
     # ═══════════════════════════════════════════════════════════════════
     # 🔬 ABLATION RECORD — 保存完整实验数据
@@ -1445,6 +1595,7 @@ def run_evaluator(
         # LLM 返回 None，回退到 mock 评估
         fb = _mock_evaluate(confirmed, plan, clean_exec_out)
         fb = _enforce_authoritative_context(fb, runtime_truths, template_selection or (plan or {}).get("template_selection") or {})
+        fb = _enforce_materialized_execution_facts(fb, materialized_record)
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
         _update_payload_scores_from_eval(fb.get("repro_success", False), safe_plan)
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1618,6 +1769,8 @@ def run_evaluator(
         fb["prior_history_state"] = current_history
 
     # ── 8. 写入记忆和文件 ────────────────────────────
+    fb = _enforce_materialized_execution_facts(fb, materialized_record)
+
     memory.apply_evaluator_patch(fb.get("memory_patch") or {})
 
     # ── 8.1 更新 payload 评分 ──

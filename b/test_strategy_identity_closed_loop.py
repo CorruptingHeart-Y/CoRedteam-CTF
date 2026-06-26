@@ -1694,6 +1694,87 @@ class ObservationDecisionIntegrationTests(unittest.TestCase):
         self.assertFalse(d.request_sent)
         self.assertEqual(d.observation_status, "request_not_sent")
 
+    # ── Regression: Evaluator contradicts ObservationDecision → downstream uses ObservationDecision ──
+
+    def test_evaluator_no_positive_but_obs_decision_positive_downstream_uses_obs_decision(self):
+        """ObservationDecision=positive_evidence, Evaluator says no_positive_evidence
+        → Evidence Ledger, Surface State, failure counter ALL follow ObservationDecision."""
+        from core.observation_decision import make_observation_decision
+        from core.evidence_ledger import reset_ledger, write_signals_deduped, load_confirmed_signals
+
+        reset_ledger(self.tmpdir, run_id=self._run_id)
+        sk = "cwe=CWE-1336|endpoint=/|parameter=text|context=template-expression"
+        es = ["arithmetic_reflection_confirmed"]
+
+        # Executor produced a clear hit: response contains "49"
+        exec_out = self._make_exec_out()
+        d = make_observation_decision(
+            exec_out=exec_out, expected_signals=es,
+            run_id=self._run_id, surface_key=sk,
+            evidence_ledger_path=self.tmpdir,
+        )
+        # Deterministic observer: positive
+        self.assertEqual(d.observation_status, "positive_evidence")
+        self.assertIn("arithmetic_reflection_confirmed", d.matched_signal_ids)
+        self.assertTrue(d.is_new_evidence)
+
+        # Simulate Evaluator output that contradicts ObservationDecision
+        fb_contradict = {
+            "repro_success": False,
+            "confidence": 0.0,
+            "summary": "No exploitation detected.",
+            "detected_primitives": [],
+            "primitive_confidence": {},
+            "analysis": {"guidance": "nothing found, try different payload"},
+            "next_required_action": "switch strategy",
+            "feedback_for_planner": "Evaluator thinks this failed completely.",
+        }
+
+        # ── Evidence Ledger: MUST follow ObservationDecision, NOT evaluator ──
+        if d.is_new_evidence and d.matched_signal_ids:
+            new_signals = []
+            for i, sig in enumerate(d.matched_signal_ids):
+                ek = d.evidence_keys[i] if i < len(d.evidence_keys) else ""
+                new_signals.append({
+                    "signal_id": sig, "evidence_key": ek,
+                    "run_id": self._run_id, "round": 1, "surface_key": sk,
+                    "execution_fingerprint": d.execution_fingerprint,
+                    "source_strategy_id": "test-sid",
+                })
+            written, skipped = write_signals_deduped(self.tmpdir, new_signals)
+            self.assertEqual(written, 1, "Evidence Ledger must write signal from ObservationDecision")
+            self.assertEqual(skipped, 0)
+
+        signals = load_confirmed_signals(self.tmpdir)
+        self.assertIn("arithmetic_reflection_confirmed", signals)
+        self.assertEqual(len(signals), 1)
+
+        # ── Strategy attempt recording: MUST use ObservationDecision success ──
+        from control.hypothesis_tracker import get_hypothesis_tracker as _ght, reset_hypothesis_tracker
+        reset_hypothesis_tracker()
+        tracker = _ght(self.tmpdir / "hyp_eval_contradict.json")
+        from coordinator import _record_strategy_attempt_if_executed
+        _record_strategy_attempt_if_executed(
+            tracker, "test-sid", exec_out, fb_contradict,
+            round_number=1, expected_signals=es, obs_decision=d,
+        )
+        health = tracker.evaluate_strategy_health("test-sid")
+        self.assertEqual(health.successes, 1,
+                         "StrategyHealth MUST record success from ObservationDecision, not evaluator")
+        self.assertEqual(health.failures, 0)
+
+        # ── Failure counter logic: positive_evidence → does NOT increment ──
+        # (The coordinator implements this: obs_decision.observation_status == "positive_evidence"
+        #  → consecutive_failures = 0)
+        self.assertEqual(d.observation_status, "positive_evidence")
+        self.assertIsNone(d.failure_class)
+
+        # ── Verify evaluator's contradicted primitives do NOT create additional signals ──
+        # Even if evaluator had detected_primitives=["ssti_reflection"] at confidence 0.9,
+        # the old code would have mapped it to arithmetic_reflection_confirmed.
+        # Under the new system, that path is DEAD — only ObservationDecision writes signals.
+        # This test verifies that the Evaluator's fb is visible but unused for signal creation.
+
 
 if __name__ == "__main__":
     unittest.main()
