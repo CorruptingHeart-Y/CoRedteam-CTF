@@ -59,6 +59,63 @@ class TemplateHealth:
     degraded_strategy_ids: list[str] = field(default_factory=list)
     surface_still_valid: bool = True
 
+
+
+def _collect_text(value: Any) -> str:
+    """Flatten vulnerability evidence fields for conservative template aliases."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(_collect_text(v) for v in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_collect_text(v) for v in value)
+    return str(value)
+
+
+def _has_velocity_template_evidence(vuln: dict[str, Any]) -> bool:
+    evidence_text = _collect_text({
+        key: vuln.get(key)
+        for key in (
+            "title",
+            "description",
+            "evidence",
+            "source",
+            "sink",
+            "attack_chain",
+            "data_flow",
+        )
+    }).lower()
+    strong_markers = (
+        "velocity",
+        "runtimeservices",
+        "stringreader",
+        "t.merge",
+        "server-side template injection",
+        "server side template injection",
+        "ssti",
+        "#set",
+    )
+    if any(marker in evidence_text for marker in strong_markers):
+        return True
+    return (
+        "template" in evidence_text
+        and ("text" in evidence_text or "placeholder" in evidence_text or "replacement" in evidence_text)
+        and ("parse" in evidence_text or "merge" in evidence_text)
+    )
+
+
+def _expand_cwe_ids_for_template_selection(vulns: list[dict[str, Any]]) -> set[str]:
+    cwe_ids = {str(v.get("cwe_id") or v.get("cwe") or "").upper() for v in vulns}
+    cwe_ids.discard("")
+    for vuln in vulns:
+        cwe_id = str(vuln.get("cwe_id") or vuln.get("cwe") or "").upper()
+        if cwe_id == "CWE-94" and _has_velocity_template_evidence(vuln):
+            cwe_ids.update({"CWE-1336", "CWE-917"})
+    return cwe_ids
+
+
 class AttackTemplate:
     def __init__(self, metadata: dict[str, Any], content: str):
         self.metadata = metadata
@@ -293,7 +350,7 @@ class TemplateManager:
         rejected_strategy_ids = rejected_strategy_ids or set()
         confirmed_signals = confirmed_signals or set()
         vulns = confirmed_vuln.get("vulnerabilities", [])
-        cwe_set = {v.get("cwe_id", "") for v in vulns}
+        cwe_set = _expand_cwe_ids_for_template_selection(vulns)
 
         matched: list[AttackTemplate] = []
         for cwe_id in cwe_set:
@@ -353,6 +410,17 @@ class TemplateManager:
         non_executable_templates = [t.id for t in unique if not getattr(t, "auto_executable", True)]
         matched_strategy_ids = sorted({sid for t in unique for sid in t.strategy_ids
                                        if _strategy_eligible_for_state(sid, t)})
+        unlocked_next_stage_ids = sorted({
+            sid
+            for t in unique
+            for sid in t.strategy_ids
+            if sid in matched_strategy_ids
+            and t.strategy_stage.get(sid, "") in ("validation", "escalation")
+            and set(t.strategy_requires_signals.get(sid, [])).issubset(confirmed_signals)
+            and set(t.strategy_requires_signals.get(sid, []))
+        })
+        if unlocked_next_stage_ids:
+            matched_strategy_ids = unlocked_next_stage_ids
         strategy_health: dict[str, dict[str, Any]] = {}
         if strategy_health_resolver is not None:
             for sid in matched_strategy_ids:
@@ -457,7 +525,7 @@ class TemplateManager:
             for tid, rj in filtered_out:
                 print(f"[template_manager]   filtered template [{tid}]: all strategies rejected {rj}")
 
-        if available_templates:
+        if available_templates and available_strategy_ids:
             stage_label = "late (file_read / flag_exfil)" if current_idx >= 3 else "early (probe / RCE establish)"
             sections = [
                 f"[Attack Templates - {len(available_templates)} available for CWEs: "

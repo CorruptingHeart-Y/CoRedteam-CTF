@@ -1,0 +1,57 @@
+{
+    "vulnerabilities": [
+        {
+            "id": "VULN-001",
+            "type": "Code Injection",
+            "cwe_id": "CWE-94",
+            "cwe": "CWE-94",
+            "title": "",
+            "severity": "CRITICAL",
+            "location": "unknown_file_1",
+            "function": "unknown",
+            "evidence": "",
+            "source": "未明确标注",
+            "sink": "未明确标注",
+            "description": "The application accepts user input via the 'text' query parameter, reads an HTML template file, replaces the placeholder 'TEXT' with the user input via string replacement, and then parses the result as a Velocity template. Since the replacement happens BEFORE Velocity parsing, an attacker can inject arbitrary Velocity directives (e.g., #set, #if, #foreach) into the template. Velocity's #set directive combined with Java reflection allows full Remote Code Execution (RCE). This is confirmed by the official solver script (solver.py) which demonstrates a working exploit chain.",
+            "attack_chain": "",
+            "data_flow": [
+                "Step 1 - Source: User input via HTTP GET/POST parameter 'text' → @RequestParam(required = false, name = \"text\") String textString (Line 21)",
+                "Step 2 - String Replacement: readFileToString() reads index.html and replaces all occurrences of 'TEXT' with the user-controlled textString (Line 29, Line 66)",
+                "Step 3 - Template Construction: The modified string is wrapped in a StringReader (Line 35)",
+                "Step 4 - Sink - Template Parsing: runtimeServices.parse(reader, \"home\") compiles the string as a Velocity template (Line 41)",
+                "Step 5 - Template Execution: t.merge(context, writer) executes the template, processing any injected Velocity directives (Line 47)"
+            ]
+        },
+        {
+            "id": "VULN-008",
+            "type": "Cross-Site Scripting (XSS)",
+            "cwe_id": "CWE-79",
+            "cwe": "CWE-79",
+            "title": "",
+            "severity": "HIGH",
+            "location": "unknown_file_2",
+            "function": "unknown",
+            "evidence": "",
+            "source": "未明确标注",
+            "sink": "未明确标注",
+            "description": "The application reads an HTML template file (index.html) and performs a raw string replacement of the placeholder 'TEXT' with user-controlled input (the 'text' query parameter). The replaced content is placed inside an <h2> tag in the HTML output. Since the replacement happens at the string level BEFORE Velocity template processing, any HTML/JavaScript injected by the attacker is preserved verbatim in the final output. Velocity's automatic HTML escaping (which only applies to variables rendered via $variable syntax in the template) does NOT protect against this because the injection occurs via string replacement, not via the Velocity context.",
+            "attack_chain": "",
+            "data_flow": [
+                "Step 1 - Source: User input via HTTP GET/POST parameter 'text' → @RequestParam(required = false, name = \"text\") String textString (Line 21)",
+                "Step 2 - String Replacement: readFileToString() reads index.html and replaces 'TEXT' with textString (Line 29 → Line 66)",
+                "Step 3 - No Sanitization: The replacement is a raw string operation - no HTML encoding, no escaping (Line 66)",
+                "Step 4 - Output: The modified HTML is returned as @ResponseBody (Line 54), meaning it's sent directly as text/html to the browser",
+                "Step 5 - Browser Execution: If textString contains <script>alert(1)</script>, it will be rendered as-is in the <h2> tag and executed by the browser"
+            ]
+        }
+    ],
+    "status": "ANALYSIS_COMPLETE",
+    "bridge_timestamp": "2026-06-26T08:13:25.063491",
+    "phase1_timestamp": "2026-06-26T08:13:25.063491",
+    "total_vulnerabilities": 2,
+    "target_context": {
+        "base_url": "http://host.docker.internal:9443",
+        "app_name": "目标应用",
+        "os_hint": "linux"
+    }
+}

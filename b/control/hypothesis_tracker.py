@@ -446,9 +446,23 @@ class Hypothesis:
     last_positive_evidence_round: int | None = None
     last_outcome: str | None = None
 
+    # Legacy/pre-materialization evidence kept for audit, but excluded from
+    # active health and budget decisions after explicit quarantine.
+    quarantined_attempts: int = 0
+    quarantined_successes: int = 0
+    quarantined_failure_stages: Counter = field(default_factory=Counter)
+    quarantined_last_evidence: list[str] = field(default_factory=list)
+    quarantine_reason: str = ""
+    quarantined_at: str = ""
+    quarantined_from_rejected: bool = False
+
     def __post_init__(self) -> None:
         if isinstance(self.failure_stages, dict):
             self.failure_stages = Counter(self.failure_stages)
+        if isinstance(self.failure_classes, dict):
+            self.failure_classes = Counter(self.failure_classes)
+        if isinstance(self.quarantined_failure_stages, dict):
+            self.quarantined_failure_stages = Counter(self.quarantined_failure_stages)
         now = datetime.now(timezone.utc).isoformat()
         if not self.first_seen:
             self.first_seen = now
@@ -507,6 +521,13 @@ class Hypothesis:
             "last_attempt_round": self.last_attempt_round,
             "last_positive_evidence_round": self.last_positive_evidence_round,
             "last_outcome": self.last_outcome,
+            "quarantined_attempts": self.quarantined_attempts,
+            "quarantined_successes": self.quarantined_successes,
+            "quarantined_failure_stages": dict(self.quarantined_failure_stages),
+            "quarantined_last_evidence": self.quarantined_last_evidence[-MAX_EVIDENCE_SNIPPETS:],
+            "quarantine_reason": self.quarantine_reason,
+            "quarantined_at": self.quarantined_at,
+            "quarantined_from_rejected": self.quarantined_from_rejected,
         }
 
     @classmethod
@@ -529,6 +550,13 @@ class Hypothesis:
             last_attempt_round=data.get("last_attempt_round"),
             last_positive_evidence_round=data.get("last_positive_evidence_round"),
             last_outcome=data.get("last_outcome"),
+            quarantined_attempts=data.get("quarantined_attempts", 0),
+            quarantined_successes=data.get("quarantined_successes", 0),
+            quarantined_failure_stages=Counter(data.get("quarantined_failure_stages", {})),
+            quarantined_last_evidence=data.get("quarantined_last_evidence", []),
+            quarantine_reason=data.get("quarantine_reason", ""),
+            quarantined_at=data.get("quarantined_at", ""),
+            quarantined_from_rejected=data.get("quarantined_from_rejected", False),
         )
 
 
@@ -658,6 +686,47 @@ class HypothesisTracker:
             del self._hypotheses[old_key]
             changed = True
         return changed
+
+    def quarantine_legacy_history(self, fingerprint: str, reason: str = "") -> bool:
+        """Move existing runtime history into audit-only quarantine fields.
+
+        Used for pre-materialization records whose evaluator facts are known to be
+        non-authoritative. The canonical strategy key is preserved, but active
+        attempts/reject state are reset so future materialized executions can be
+        judged from fresh evidence. Idempotent for already-quarantined entries.
+        """
+        key = (fingerprint or "").strip()
+        if not key or key not in self._hypotheses:
+            return False
+        h = self._hypotheses[key]
+        if h.attempts == 0 and h.quarantined_attempts > 0:
+            return False
+        if h.attempts == 0 and h.successes == 0 and not h.failure_stages and not h.rejected:
+            return False
+
+        h.quarantined_attempts += h.attempts
+        h.quarantined_successes += h.successes
+        h.quarantined_failure_stages.update(h.failure_stages)
+        h.quarantined_last_evidence = (h.quarantined_last_evidence + h.last_evidence)[-MAX_EVIDENCE_SNIPPETS:]
+        h.quarantine_reason = reason or "legacy_history_quarantined"
+        h.quarantined_at = datetime.now(timezone.utc).isoformat()
+        h.quarantined_from_rejected = h.quarantined_from_rejected or h.rejected
+
+        h.attempts = 0
+        h.successes = 0
+        h.failure_stages = Counter()
+        h.last_evidence = []
+        h.rejected = False
+        h.rejected_at = ""
+        h.rejected_reason = ""
+        h.consecutive_failures = 0
+        h.failure_classes = Counter()
+        h.last_attempt_round = None
+        h.last_positive_evidence_round = None
+        h.last_outcome = None
+        h.last_seen = datetime.now(timezone.utc).isoformat()
+        self._save()
+        return True
 
     def _save(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

@@ -72,6 +72,78 @@
       "source": "consolidator",
       "cwe": ""
     },
+    "7fb62b6d8242f530": {
+      "first_seen": 1782403122.288216,
+      "name": "velocity-template-injection-simple-probe",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "8db4930cf49cc585": {
+      "first_seen": 1782409893.0662851,
+      "name": "Velocity Server-Side Template Injection via #set + Class.forName reflective chai",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "1778456e57b56b43": {
+      "first_seen": 1782410371.8088593,
+      "name": "Velocity-SSTI-multi-vector-probe-with-OOB",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "351db46f8444b7fa": {
+      "first_seen": 1782410371.8102539,
+      "name": "Velocity-RCE-via-OOB-without-blocked-literals",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e413537d68ea8b74": {
+      "first_seen": 1782410648.3836985,
+      "name": "velocity-template-injection-rce-via-reflection",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "8cc61e92a4fd318b": {
+      "first_seen": 1782411233.5672011,
+      "name": "velocity-ssti-rce-via-reflection-and-output-capture",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "5f88e99f8d1950de": {
+      "first_seen": 1782411644.4646332,
+      "name": "Velocity SSTI → RCE via Java Reflection (CWE-1336)",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "c2fa48b40ea68c70": {
+      "first_seen": 1782412153.0082946,
+      "name": "Velocity Template Injection (CWE-1336) – Reflection-based RCE with Filter Bypass",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "68c650eea0648534": {
+      "first_seen": 1782412260.8754249,
+      "name": "velocity-ssti-to-rce-oob",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "1518e403cd0c586c": {
+      "first_seen": 1782412473.872535,
+      "name": "velocity-template-injection-reflection-rce",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "e3caa012702e0f59": {
+      "first_seen": 1782433522.2688024,
+      "name": "Velocity Server‑Side Template Injection (SSTI) leading to Remote Code Execution ",
+      "source": "consolidator",
+      "cwe": ""
+    },
+    "049b7a8700bd445f": {
+      "first_seen": 1782442873.3861914,
+      "name": "velocity-ssti-basic-probe",
+      "source": "consolidator",
+      "cwe": ""
+    },
     "0a796c0ae9a77c88": {
       "first_seen": 1781548704.3212757,
       "name": "memcached-crlf-injection-with-raw-bytes",
@@ -348,12 +420,12 @@
       "source": "consolidator",
       "cwe": ""
     },
-    "7fb62b6d8242f530": {
-      "first_seen": 1782403122.288216,
-      "name": "velocity-template-injection-simple-probe",
+    "b4b10062dca590c2": {
+      "first_seen": 1782447719.3436582,
+      "name": "velocity-ssti-rce-via-reflection",
       "source": "consolidator",
       "cwe": ""
     }
   },
-  "_updated": 1782403122.288216
+  "_updated": 1782447719.3436582
 }

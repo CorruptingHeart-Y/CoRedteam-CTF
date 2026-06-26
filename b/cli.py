@@ -158,12 +158,15 @@ def cmd_exploit(args: argparse.Namespace) -> int:
     # Set env vars BEFORE any b.* imports so Settings picks them up
     if getattr(args, "max_iter", None) is not None:
         os.environ["CO_REDTEAM_MAX_ITER"] = str(args.max_iter)
+    if getattr(args, "max_iters_cap", None) is not None:
+        os.environ["CO_REDTEAM_MAX_ITER_CAP"] = str(args.max_iters_cap)
     if getattr(args, "max_runs", None) is not None:
         os.environ["CO_REDTEAM_MAX_RUNS"] = str(args.max_runs)
     if getattr(args, "dry_run", False):
         os.environ["CO_REDTEAM_DRY_RUN"] = "1"
         os.environ["CO_REDTEAM_MOCK_LLM"] = "true"
         os.environ["CO_REDTEAM_MAX_ITER"] = "1"
+        os.environ["CO_REDTEAM_MAX_ITER_CAP"] = "1"
         os.environ["CO_REDTEAM_MAX_RUNS"] = "1"
         os.environ["CONSOLIDATOR_AUTO_EVOLVE_YAML"] = "0"
         muted("dry-run: Planner→Validator→gate only. No Executor/Docker/LLM/YAML write.")
@@ -224,6 +227,9 @@ def cmd_exploit(args: argparse.Namespace) -> int:
         if result == 0:
             ok(f"SUCCESS on outer run {run_idx}/{max_runs}! Flag captured.")
             return 0
+        if result == 4:
+            warn("No executable canonical strategy remains; not retrying outer runs without reviewed strategy evolution.")
+            return result
         else:
             if run_idx < max_runs:
                 warn(f"Run {run_idx}/{max_runs} ended without flag. Retrying with updated memory...")
@@ -891,6 +897,8 @@ Examples:
                            help="Challenge adapter name (default: generic)")
     p_exploit.add_argument("--max-iter", type=int, default=None, metavar="N",
                            help="Max exploit iterations per run (default: 8, overrides CO_REDTEAM_MAX_ITER)")
+    p_exploit.add_argument("--max-iters-cap", type=int, default=None, metavar="N",
+                           help="Hard cap: iterations will never exceed N, regardless of milestone rewards (default: 20, overrides CO_REDTEAM_MAX_ITER_CAP)")
     p_exploit.add_argument("--max-runs", type=int, default=None, metavar="N",
                            help="Max outer retry runs (default: 5, overrides CO_REDTEAM_MAX_RUNS)")
     p_exploit.add_argument("--dry-run", action="store_true",

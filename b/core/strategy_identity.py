@@ -28,16 +28,19 @@ def build_trusted_selection(
     round_index: int,
     template_selection: dict[str, Any],
 ) -> dict[str, Any]:
+    allowed_ids = sorted(set(template_selection.get("available_strategy_ids") or []))
+    rejected_ids = sorted(set(template_selection.get("rejected_strategy_ids") or []))
+    matched_ids = sorted(set(template_selection.get("matched_strategy_ids") or []))
+    status = str(template_selection.get("status", "") or "")
+    if status == "AVAILABLE_STRATEGY" and not allowed_ids:
+        status = "ALL_MATCHED_STRATEGIES_REJECTED" if matched_ids or rejected_ids else "NO_MATCHED_TEMPLATE"
+
     trusted = {
         "run_id": run_id,
         "round": round_index,
-        "status": template_selection.get("status", ""),
-        "allowed_canonical_strategy_ids": sorted(
-            set(template_selection.get("available_strategy_ids") or [])
-        ),
-        "rejected_canonical_strategy_ids": sorted(
-            set(template_selection.get("rejected_strategy_ids") or [])
-        ),
+        "status": status,
+        "allowed_canonical_strategy_ids": allowed_ids,
+        "rejected_canonical_strategy_ids": rejected_ids,
         "strategy_health": template_selection.get("strategy_health") or {},
         "strategy_descriptors": template_selection.get("strategy_descriptors") or {},
         "template_health": template_selection.get("template_health") or {},

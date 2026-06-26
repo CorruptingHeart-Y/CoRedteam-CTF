@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-25T16:42:49.118531+00:00",
+  "updated_at": "2026-06-26T04:58:10.942910+00:00",
   "hypotheses": {
     "crlf*memcached*pickle_rce": {
       "fingerprint": "crlf*memcached*pickle_rce",
@@ -28,7 +28,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*generic*exec": {
       "fingerprint": "ssti*generic*exec",
@@ -55,7 +62,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "path_traversal*fs*read": {
       "fingerprint": "path_traversal*fs*read",
@@ -79,7 +93,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*jinja2*exec": {
       "fingerprint": "ssti*jinja2*exec",
@@ -106,7 +127,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "no_reflection*fake*goal": {
       "fingerprint": "no_reflection*fake*goal",
@@ -129,7 +157,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*velocity*exec": {
       "fingerprint": "ssti*velocity*exec",
@@ -156,7 +191,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*mako*exec": {
       "fingerprint": "ssti*mako*exec",
@@ -183,7 +225,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "cwe-79-cwe-79": {
       "fingerprint": "cwe-79-cwe-79",
@@ -208,7 +257,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*velocity*reflection_exec": {
       "fingerprint": "ssti*velocity*reflection_exec",
@@ -231,7 +287,14 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "ssti*generic*arithmetic_probe": {
       "fingerprint": "ssti*generic*arithmetic_probe",
@@ -254,80 +317,130 @@
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": null
+      "last_outcome": null,
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "unit:http:rejected": {
       "fingerprint": "unit:http:rejected",
-      "attempts": 132,
+      "attempts": 198,
       "successes": 0,
       "failure_stages": {
-        "exec": 132
+        "exec": 198
       },
       "last_evidence": [],
       "first_seen": "2026-06-25T14:23:37.175199+00:00",
-      "last_seen": "2026-06-25T16:42:49.118531+00:00",
+      "last_seen": "2026-06-25T18:23:51.720345+00:00",
       "rejected": true,
       "rejected_at": "2026-06-25T14:23:37.179075+00:00",
       "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: exec (5/5 = 100%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
       "migration_version": 0,
-      "consecutive_failures": 66,
+      "consecutive_failures": 132,
       "failure_classes": {},
       "last_attempt_round": null,
       "last_positive_evidence_round": null,
-      "last_outcome": "no_positive_evidence"
+      "last_outcome": "no_positive_evidence",
+      "quarantined_attempts": 0,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {},
+      "quarantined_last_evidence": [],
+      "quarantine_reason": "",
+      "quarantined_at": "",
+      "quarantined_from_rejected": false
     },
     "cwe-1336:discovery:arithmetic-detection": {
       "fingerprint": "cwe-1336:discovery:arithmetic-detection",
-      "attempts": 3,
-      "successes": 0,
+      "attempts": 51,
+      "successes": 48,
       "failure_stages": {
-        "NoError": 2,
-        "AllStdoutEmpty": 1
+        "NoError": 3
       },
       "last_evidence": [
-        "[FAILED] 探测 payload 未触发 SSTI，无 49 回显，需要改用 POST 方式",
-        "[FAILED] 探测步骤未返回算术运算结果，payload未触发模板解析，需调整请求方式与参数传递。",
-        "[FAILED] 步骤因语法错误被跳过，未进行任何探测，无法评估漏洞存在性。"
+        "[FAILED] 未检测到 SSTI 算术反射，payload 未在响应中回显，无漏洞触发证据。",
+        "[FAILED] [PROGRESS] 成功探测到 SSTI 算术执行（A 级证据），但尚未获得 flag，需要继续利用提升至 RCE。",
+        "[FAILED] [A级] SSTI 算术反射成功（49），但未获取 flag，需执行 escalation 以获得 RCE。"
       ],
       "first_seen": "2026-06-25T15:40:19.011736+00:00",
-      "last_seen": "2026-06-25T15:58:07.116693+00:00",
+      "last_seen": "2026-06-26T04:58:10.942910+00:00",
       "rejected": false,
       "rejected_at": "",
       "rejected_reason": "",
       "migrated_from": [],
       "migration_version": 0,
       "consecutive_failures": 0,
-      "failure_classes": {},
-      "last_attempt_round": null,
-      "last_positive_evidence_round": null,
-      "last_outcome": null
+      "failure_classes": {
+        "expected_signal_missing": 3
+      },
+      "last_attempt_round": 2,
+      "last_positive_evidence_round": 2,
+      "last_outcome": "positive_evidence",
+      "quarantined_attempts": 5,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {
+        "NoError": 4,
+        "AllStdoutEmpty": 1
+      },
+      "quarantined_last_evidence": [
+        "[FAILED] 探测 payload 未触发 SSTI，无 49 回显，需要改用 POST 方式",
+        "[FAILED] 探测步骤未返回算术运算结果，payload未触发模板解析，需调整请求方式与参数传递。",
+        "[FAILED] 步骤因语法错误被跳过，未进行任何探测，无法评估漏洞存在性。",
+        "[FAILED] 算术探测未观察到 '49'，SSTI 未触发，参数传递可能有问题。",
+        "[FAILED] No evidence of SSTI; payload not reflected or evaluated; response is static HTML form."
+      ],
+      "quarantine_reason": "legacy_pre_materialized_evaluator_misattribution_quarantine_2026-06-26",
+      "quarantined_at": "2026-06-26T02:58:08.540511+00:00",
+      "quarantined_from_rejected": true
     },
     "cwe-1336:discovery:set-calc-probe": {
       "fingerprint": "cwe-1336:discovery:set-calc-probe",
-      "attempts": 2,
+      "attempts": 5,
       "successes": 0,
       "failure_stages": {
-        "NoError": 2
+        "NoError": 4,
+        "runtime_failure": 1
       },
       "last_evidence": [
-        "[FAILED] SSTI探测未触发，payload未在响应中回显，需改用POST方式提交。",
-        "[FAILED] 未检测到 SSTI 回显，payload 可能因请求方法错误未被处理。"
+        "[FAILED] payload 未触发任何反射，无 SSTI 探测证据",
+        "[FAILED] 未能触发SSTI反射，payload未在响应中回显",
+        "[FAILED] Arithmetic SSTI probe successful (49), but no command execution or flag retrieved. Next step: escalate to RCE payload.",
+        "[FAILED] 本轮成功探测到 SSTI 算术执行（49），确认模板注入点，尚未获得 RCE。",
+        "[FAILED] SSTI 算术探测成功（49），但未获得 flag。需进一步实施对象访问和 RCE。"
       ],
       "first_seen": "2026-06-25T15:44:01.574975+00:00",
-      "last_seen": "2026-06-25T16:42:35.514159+00:00",
-      "rejected": false,
-      "rejected_at": "",
-      "rejected_reason": "",
+      "last_seen": "2026-06-26T03:07:52.105420+00:00",
+      "rejected": true,
+      "rejected_at": "2026-06-26T03:07:52.105420+00:00",
+      "rejected_reason": "Hypothesis REJECTED: 5 attempts, 0 successes. Dominant failure stage: NoError (4/5 = 80%). Exploitation path is falsified — forced exploration required.",
       "migrated_from": [],
       "migration_version": 0,
-      "consecutive_failures": 1,
+      "consecutive_failures": 5,
       "failure_classes": {
-        "expected_signal_missing": 1
+        "expected_signal_missing": 5
       },
-      "last_attempt_round": 1,
+      "last_attempt_round": 4,
       "last_positive_evidence_round": null,
-      "last_outcome": "no_positive_evidence"
+      "last_outcome": "no_positive_evidence",
+      "quarantined_attempts": 5,
+      "quarantined_successes": 0,
+      "quarantined_failure_stages": {
+        "NoError": 5
+      },
+      "quarantined_last_evidence": [
+        "[FAILED] SSTI探测未触发，payload未在响应中回显，需改用POST方式提交。",
+        "[FAILED] 未检测到 SSTI 回显，payload 可能因请求方法错误未被处理。",
+        "[FAILED] SSTI 探测 payload 未触发，响应中无 '49'，判定为 init 状态。",
+        "[FAILED] SSTI 探测 payload 未触发任何回显，端点可达但漏洞利用未推进。",
+        "[FAILED] 本轮尝试触发 Velocity 算术计算未成功，响应中无任何计算证据，已确认端点可达但 payload 处理方式需调整。"
+      ],
+      "quarantine_reason": "legacy_pre_materialized_evaluator_misattribution_quarantine_2026-06-26",
+      "quarantined_at": "2026-06-26T02:58:08.542566+00:00",
+      "quarantined_from_rejected": true
     }
   }
 }

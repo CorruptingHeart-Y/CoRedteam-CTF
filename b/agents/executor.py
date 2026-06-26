@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import socket
@@ -515,13 +516,13 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
 
         if primitive == "HttpClient.get":
             lines.append(f'resp = s.get("{target}")')
-            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
+            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:2000]}")')
             lines.append('save_context("_last_response_text", resp.text[:2000])')
             lines.append('save_context("_last_status", resp.status_code)')
         elif primitive == "HttpClient.post":
             body_str = json.dumps(body) if body else "{}"
             lines.append(f'resp = s.post("{target}", json={body_str})')
-            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
+            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:2000]}")')
             lines.append('save_context("_last_response_text", resp.text[:2000])')
             lines.append('save_context("_last_status", resp.status_code)')
         elif primitive == "HttpClient.raw_request":
@@ -733,6 +734,57 @@ def _check_python_safety(code: str, step_id: int) -> list[str]:
 #  工作区准备：SDK + context.json + tmp 目录
 # ──────────────────────────────────────────────
 
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_text(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _build_materialized_execution_record(
+    selected_canonical_strategy_id: str,
+    method: str,
+    endpoint: str,
+    parameter: str,
+    payload: str,
+) -> dict[str, Any]:
+    normalized_method = str(method or "").strip().upper()
+    normalized_endpoint = str(endpoint or "/").strip() or "/"
+    normalized_parameter = str(parameter or "").strip()
+    normalized_body = {normalized_parameter: payload}
+    parameter_names = sorted(normalized_body.keys())
+    normalized_body_json = _stable_json(normalized_body)
+    execution_source = _stable_json({
+        "method": normalized_method,
+        "endpoint": normalized_endpoint,
+        "parameters": parameter_names,
+        "body": normalized_body,
+    })
+    return {
+        "selected_canonical_strategy_id": selected_canonical_strategy_id,
+        "materialized": True,
+        "request_method": normalized_method,
+        "request_endpoint": normalized_endpoint,
+        "request_parameters": parameter_names,
+        "normalized_request_body": normalized_body,
+        "request_body_fingerprint": _sha256_text(normalized_body_json),
+        "execution_fingerprint": _sha256_text(execution_source),
+        "request_sent": False,
+    }
+
+
+def _mark_materialized_request_sent(
+    record: dict[str, Any],
+    http_responses: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    out = dict(record)
+    out["request_sent"] = bool(http_responses)
+    out["http_responses"] = list(http_responses or [])
+    return out
+
+
 def _materialize_strategy_request(selected_sid: str, target: "TargetContext | None") -> dict | None:
     """Read YAML template + RuntimeTruths → synthesize exact HTTP request step."""
     import sys, yaml
@@ -766,8 +818,15 @@ def _materialize_strategy_request(selected_sid: str, target: "TargetContext | No
                     f"s = redteam_sdk.HttpClient('{target_url}')\n"
                     f"payload = {repr(tpl)}\n"
                     f"resp = s.{method.lower()}('{endpoint}', data={{'{param}': payload}})\n"
-                    f"print(f'HTTP {{resp.status_code}}: {{resp.text[:500]}}')\n"
+                    f"print(f'HTTP {{resp.status_code}}: {{resp.text[:2000]}}')\n"
                     f"print('STEP_OK')"
+                )
+                materialized_record = _build_materialized_execution_record(
+                    selected_canonical_strategy_id=selected_sid,
+                    method=method,
+                    endpoint=endpoint,
+                    parameter=param,
+                    payload=tpl,
                 )
                 print(f"[executor] materialized {selected_sid}: {method} {endpoint} {param}={repr(tpl)[:50]}")
                 return {
@@ -776,6 +835,7 @@ def _materialize_strategy_request(selected_sid: str, target: "TargetContext | No
                     "command": code,
                     "purpose": f"materialized {selected_sid} via {method} {endpoint}?{param}=...",
                     "expected_outcome": "STEP_OK",
+                    "_materialized_execution_record": materialized_record,
                 }
     print(f"[executor] materializer: {selected_sid} not found in any YAML")
     return None
@@ -1078,7 +1138,7 @@ def _extract_http_responses_from_stdout(stdout: str) -> list[dict[str, Any]]:
             "status_code": int(m.group(1)),
             "method": m.group(2),
             "url": m.group(3),
-            "response_body": m.group(4)[:500],
+            "response_body": m.group(4)[:2000],
         })
     return responses
 
@@ -1272,6 +1332,7 @@ def run_executor(
 
     plan   = data.get("plan") or {}
     steps  = plan.get("steps") or []
+    materialized_execution_record: dict[str, Any] | None = None
 
     # ── Materializer: if plan has selected_canonical_strategy_id, use YAML + RuntimeTruths ──
     selected_sid = plan.get("selected_canonical_strategy_id", "")
@@ -1279,6 +1340,7 @@ def run_executor(
         materialized_step = _materialize_strategy_request(selected_sid, target)
         if materialized_step:
             steps = [materialized_step]
+            materialized_execution_record = materialized_step.get("_materialized_execution_record")
             print(f"[executor] materialized {selected_sid} step cmd={materialized_step['command'][:200]}")
         else:
             print(f"[executor] materializer returned None for {selected_sid}, falling back to plan steps")
@@ -1378,15 +1440,20 @@ def run_executor(
             f"url_fragment={(raw_code or '')[:180]}"
         )
         if i in skip_indices:
-            step_results.append({
+            skipped_entry = {
                 "step_id": st.get("id"), "type": st.get("type"), "purpose": st.get("purpose"),
                 "result": {
                     "ok": False, "exit_code": -1, "stdout": "", "duration_sec": 0.0,
-                    "stderr": f"validator 检测到语法错误，已跳过: {syntax_warnings}",
+                    "stderr": f"validator ???????????: {syntax_warnings}",
                     "execution_mode": "skipped_syntax_error",
                 },
                 "chain_output": {},
-            })
+            }
+            step_record = st.get("_materialized_execution_record")
+            if isinstance(step_record, dict):
+                materialized_execution_record = _mark_materialized_request_sent(step_record, [])
+                skipped_entry["materialized_execution_record"] = materialized_execution_record
+            step_results.append(skipped_entry)
             continue
 
         try:
@@ -1448,14 +1515,19 @@ def run_executor(
                 f"{json.dumps(step_chain_output, ensure_ascii=False)[:200]}"
             )
 
-        step_results.append({
+        step_entry = {
             "step_id": st.get("id"),
             "type":    st.get("type"),
             "purpose": st.get("purpose"),
             "result":  result,
             "chain_output": step_chain_output,
             "http_responses": http_responses,
-        })
+        }
+        step_record = st.get("_materialized_execution_record")
+        if isinstance(step_record, dict):
+            materialized_execution_record = _mark_materialized_request_sent(step_record, http_responses)
+            step_entry["materialized_execution_record"] = materialized_execution_record
+        step_results.append(step_entry)
 
     fail_results = [r for r in step_results if not (r.get("result") or {}).get("ok")]
     if fail_results and len(fail_results) == len(step_results):
@@ -1477,6 +1549,8 @@ def run_executor(
         "total_steps":     len(steps),
         "blocked_steps":   blocked_count,
     }
+    if materialized_execution_record:
+        out["materialized_execution_record"] = materialized_execution_record
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     _audit_log.info(
