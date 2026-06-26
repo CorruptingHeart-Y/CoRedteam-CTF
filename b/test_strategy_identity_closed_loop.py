@@ -1448,7 +1448,9 @@ class ObservationDecisionIntegrationTests(unittest.TestCase):
             selected_strategy_id=sid, evidence_ledger_path=self.tmpdir,
         )
         self.assertTrue(d1.is_new_evidence)
-        self.assertTrue(d1.is_new_state_transition)
+        # is_new_state_transition defaults to False without template context
+        self.assertFalse(d1.is_new_state_transition,
+                         "is_new_state_transition requires active higher-stage route (not available in test)")
         self.assertIn("arithmetic_reflection_confirmed", d1.matched_signal_ids)
 
         # Write first signal to ledger
@@ -1774,6 +1776,118 @@ class ObservationDecisionIntegrationTests(unittest.TestCase):
         # the old code would have mapped it to arithmetic_reflection_confirmed.
         # Under the new system, that path is DEAD — only ObservationDecision writes signals.
         # This test verifies that the Evaluator's fb is visible but unused for signal creation.
+
+    # ── Test 1: first 49, no active next-stage route → no budget, terminal staged ──
+
+    def test_first_evidence_no_active_higher_route_no_budget_reward(self):
+        """First discovery evidence (49) with NO active higher-stage route:
+        Ledger writes once, success+1, surface positive;
+        is_new_state_transition=False; budget does NOT increase;
+        terminal=STAGE_BLOCKED_NO_APPROVED_ROUTE.
+        """
+        from core.observation_decision import make_observation_decision, resolve_state_transition
+        from core.evidence_ledger import reset_ledger, write_signals_deduped, load_confirmed_signals
+
+        reset_ledger(self.tmpdir, run_id=self._run_id)
+        sk = "cwe=CWE-1336|endpoint=/|parameter=text|context=template-expression"
+        es = ["arithmetic_reflection_confirmed"]
+        sid = "cwe-1336:discovery:arithmetic-detection"
+
+        exec_out = self._make_exec_out()
+        d = make_observation_decision(
+            exec_out=exec_out, expected_signals=es,
+            run_id=self._run_id, surface_key=sk,
+            selected_strategy_id=sid,
+            evidence_ledger_path=self.tmpdir,
+        )
+        self.assertTrue(d.is_new_evidence)
+        self.assertEqual(d.observation_status, "positive_evidence")
+        # Before resolve: is_new_state_transition defaults to False
+        self.assertFalse(d.is_new_state_transition)
+
+        # Simulate template selection: only draft higher-stage routes exist
+        strategy_descriptors = {
+            "cwe-1336:discovery:arithmetic-detection": {
+                "stage": "discovery", "activation_state": "active",
+            },
+            "cwe-1336:escalation:arithmetic-to-rce": {
+                "stage": "escalation", "activation_state": "draft",
+            },
+        }
+        available_strategy_ids = ["cwe-1336:discovery:arithmetic-detection"]
+        # (escalation route is draft → not in available_strategy_ids)
+
+        d = resolve_state_transition(d, strategy_descriptors, available_strategy_ids, sid)
+        # No active higher-stage route → is_new_state_transition remains False
+        self.assertFalse(d.is_new_state_transition,
+                         "No active higher-stage route → no state transition, no budget reward")
+
+        # Evidence Ledger: still writes the signal (is_new_evidence=True)
+        sigs = [{"signal_id": s, "evidence_key": k, "run_id": self._run_id,
+                  "round": 1, "surface_key": sk,
+                  "execution_fingerprint": d.execution_fingerprint,
+                  "source_strategy_id": sid}
+                 for s, k in zip(d.matched_signal_ids, d.evidence_keys)]
+        w, _ = write_signals_deduped(self.tmpdir, sigs)
+        self.assertEqual(w, 1, "Ledger must write discovery evidence")
+
+        signals = load_confirmed_signals(self.tmpdir)
+        self.assertIn("arithmetic_reflection_confirmed", signals)
+
+        # StrategyHealth: success counted
+        from control.hypothesis_tracker import get_hypothesis_tracker as _ght, reset_hypothesis_tracker
+        reset_hypothesis_tracker()
+        tracker = _ght(self.tmpdir / "hyp_no_active.json")
+        from coordinator import _record_strategy_attempt_if_executed
+        _record_strategy_attempt_if_executed(
+            tracker, sid, exec_out, {}, round_number=1,
+            expected_signals=es, obs_decision=d,
+        )
+        health = tracker.evaluate_strategy_health(sid)
+        self.assertEqual(health.successes, 1)
+        self.assertEqual(health.failures, 0)
+
+    # ── Test 2: first 49, active eligible higher-stage route → budget reward allowed ──
+
+    def test_first_evidence_with_active_higher_route_allows_budget_reward(self):
+        """First discovery evidence with active+eligible higher-stage route:
+        is_new_state_transition=True → budget reward permitted.
+        """
+        from core.observation_decision import make_observation_decision, resolve_state_transition
+        from core.evidence_ledger import reset_ledger
+
+        reset_ledger(self.tmpdir, run_id=self._run_id)
+        sk = "cwe=CWE-1336|endpoint=/|parameter=text|context=template-expression"
+        es = ["arithmetic_reflection_confirmed"]
+        sid = "cwe-1336:discovery:arithmetic-detection"
+
+        exec_out = self._make_exec_out()
+        d = make_observation_decision(
+            exec_out=exec_out, expected_signals=es,
+            run_id=self._run_id, surface_key=sk,
+            selected_strategy_id=sid,
+            evidence_ledger_path=self.tmpdir,
+        )
+        self.assertTrue(d.is_new_evidence)
+
+        # Simulate template selection WITH an active escalation route
+        strategy_descriptors = {
+            "cwe-1336:discovery:arithmetic-detection": {
+                "stage": "discovery", "activation_state": "active",
+            },
+            "cwe-1336:escalation:arithmetic-to-rce": {
+                "stage": "escalation", "activation_state": "active",
+            },
+        }
+        available_strategy_ids = [
+            "cwe-1336:discovery:arithmetic-detection",
+            "cwe-1336:escalation:arithmetic-to-rce",
+        ]
+
+        d = resolve_state_transition(d, strategy_descriptors, available_strategy_ids, sid)
+        # Active higher-stage route exists → is_new_state_transition = True
+        self.assertTrue(d.is_new_state_transition,
+                        "Active escalation route exists → state transition, budget reward allowed")
 
 
 if __name__ == "__main__":

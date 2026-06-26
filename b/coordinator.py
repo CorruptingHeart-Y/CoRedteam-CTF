@@ -1026,7 +1026,7 @@ def run_pipeline(
             template_selection.strategy_descriptors.get(selected_canonical_strategy_id, {})
             .get("expected_signals", []) if hasattr(template_selection, 'strategy_descriptors') else []
         )
-        from core.observation_decision import make_observation_decision
+        from core.observation_decision import make_observation_decision, resolve_state_transition
         _surface_key = build_surface_key(confirmed)
         _obs_decision = make_observation_decision(
             exec_out=exec_out,
@@ -1036,10 +1036,30 @@ def run_pipeline(
             selected_strategy_id=selected_canonical_strategy_id,
             evidence_ledger_path=ws,
         )
+        # Resolve is_new_state_transition: requires active higher-stage route
+        _obs_decision = resolve_state_transition(
+            _obs_decision,
+            strategy_descriptors=template_selection.strategy_descriptors if hasattr(template_selection, 'strategy_descriptors') else {},
+            available_strategy_ids=template_selection.available_strategy_ids if hasattr(template_selection, 'available_strategy_ids') else [],
+            current_strategy_id=selected_canonical_strategy_id,
+        )
         print(f"[observation_decision] status={_obs_decision.observation_status} "
               f"matched_signals={_obs_decision.matched_signal_ids} "
               f"is_new_evidence={_obs_decision.is_new_evidence} "
               f"is_new_state_transition={_obs_decision.is_new_state_transition}")
+
+        # ── STAGE_BLOCKED: discovery evidence confirmed but no active higher-stage route ──
+        if (_obs_decision.is_new_evidence
+                and _obs_decision.observation_status == "positive_evidence"
+                and not _obs_decision.is_new_state_transition):
+            from core.long_term_write_policy import write_terminal_condition
+            write_terminal_condition(ws, "STAGE_BLOCKED_NO_APPROVED_ROUTE", {
+                "reason": "discovery_confirmed_no_active_higher_stage_route",
+                "surface_key": _surface_key,
+                "current_strategy_id": selected_canonical_strategy_id,
+                "confirmed_signals": list(_obs_decision.matched_signal_ids),
+            }, round_number=iteration)
+            print(f"[coordinator] STAGE_BLOCKED_NO_APPROVED_ROUTE: discovery confirmed but no active higher-stage route for {_surface_key}")
 
         # ── Record strategy attempt BEFORE evaluator (consumes ObservationDecision) ──
         _record_strategy_attempt_if_executed(

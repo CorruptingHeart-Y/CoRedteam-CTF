@@ -12,9 +12,20 @@ Design contract:
   - evidence_key = (run_id, surface_key, execution_fingerprint, signal_id)
   - is_new_evidence is True only when this exact evidence_key has never been
     written to the Evidence Ledger.
-  - is_new_state_transition is True only when the confirmed signal represents
-    genuine progression (first time this signal is confirmed on this surface in
-    this run).
+  - is_new_state_transition is True ONLY when:
+      1. is_new_evidence == True (first time this signal is confirmed)
+      2. An active + eligible higher-stage route exists in strategy_descriptors
+      3. That route's execution fingerprint differs from the completed discovery
+
+  is_new_evidence ≠ is_new_state_transition ≠ budget reward.
+
+  First discovery evidence:
+    → Evidence Ledger writes once
+    → StrategyHealth success += 1
+    → SurfaceState receives positive evidence
+    → BUT no automatic iteration budget reward.
+
+  Budget reward ONLY when is_new_state_transition == True.
 """
 
 from __future__ import annotations
@@ -371,19 +382,19 @@ def make_observation_decision(
     # ── Step 6: Build evidence_keys and check is_new_evidence ──
     evidence_keys: list[str] = []
     is_new_evidence = False
-    is_new_state_transition = False
 
     if matched_signal_ids and evidence_ledger_path is not None:
-        from core.evidence_ledger import evidence_exists, has_signal_on_surface
+        from core.evidence_ledger import evidence_exists
 
         for sig in matched_signal_ids:
             ek = _make_evidence_key(run_id, surface_key, execution_fingerprint, sig)
             evidence_keys.append(ek)
             if not evidence_exists(evidence_ledger_path, ek):
                 is_new_evidence = True
-                # Check if this signal is genuinely new for this surface in this run
-                if not has_signal_on_surface(evidence_ledger_path, run_id, surface_key, sig):
-                    is_new_state_transition = True
+
+    # is_new_state_transition is NOT auto-detected here.
+    # It requires template-level context (active higher-stage routes).
+    # Call resolve_state_transition() separately with strategy_descriptors.
 
     return ObservationDecision(
         request_sent=True,
@@ -394,9 +405,102 @@ def make_observation_decision(
         execution_fingerprint=execution_fingerprint,
         evidence_keys=evidence_keys,
         is_new_evidence=is_new_evidence,
-        is_new_state_transition=is_new_state_transition,
+        is_new_state_transition=False,  # resolved later with template context
         selected_strategy_id=selected_strategy_id,
         payload=payload,
         response_bodies=response_bodies,
         diagnostic_notes=diagnostic,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# State transition resolution — requires template-level context
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Stages ordered by progression level
+_STAGE_ORDER: dict[str, int] = {
+    "discovery": 0,
+    "validation": 1,
+    "escalation": 2,
+    "execution": 3,
+    "post_execution": 4,
+}
+
+
+def resolve_state_transition(
+    obs_decision: ObservationDecision,
+    strategy_descriptors: dict[str, dict],
+    available_strategy_ids: list[str],
+    current_strategy_id: str = "",
+) -> ObservationDecision:
+    """Resolve is_new_state_transition using template-level context.
+
+    is_new_state_transition = True ONLY when ALL of:
+      1. is_new_evidence == True
+      2. At least one active + eligible higher-stage route exists
+         (activation_state == "active", stage > current stage, in available_strategy_ids)
+      3. That route's execution fingerprint would differ from the completed
+         discovery (always true for different-stage routes with different payloads)
+
+    Without an active higher-stage route, even genuine discovery evidence
+    does NOT trigger a budget reward. The pipeline should stop and write
+    STAGE_BLOCKED_NO_APPROVED_ROUTE.
+
+    Returns a NEW ObservationDecision with is_new_state_transition resolved.
+    The original is not mutated.
+    """
+    if not obs_decision.is_new_evidence:
+        # Not even new evidence → definitely not a state transition
+        return ObservationDecision(
+            request_sent=obs_decision.request_sent,
+            observation_status=obs_decision.observation_status,
+            matched_signal_ids=list(obs_decision.matched_signal_ids),
+            failure_class=obs_decision.failure_class,
+            surface_key=obs_decision.surface_key,
+            execution_fingerprint=obs_decision.execution_fingerprint,
+            evidence_keys=list(obs_decision.evidence_keys),
+            is_new_evidence=obs_decision.is_new_evidence,
+            is_new_state_transition=False,
+            selected_strategy_id=obs_decision.selected_strategy_id,
+            payload=obs_decision.payload,
+            response_bodies=list(obs_decision.response_bodies),
+            diagnostic_notes=list(obs_decision.diagnostic_notes),
+        )
+
+    # Determine the stage of the current strategy
+    current_desc = strategy_descriptors.get(current_strategy_id, {}) if current_strategy_id else {}
+    current_stage = str(current_desc.get("stage", "discovery") or "discovery")
+    current_level = _STAGE_ORDER.get(current_stage, 0)
+
+    # Find any active + eligible higher-stage route
+    has_active_higher_route = False
+    for sid in available_strategy_ids:
+        desc = strategy_descriptors.get(sid, {})
+        if not desc:
+            continue
+        activation = str(desc.get("activation_state", "") or "")
+        stage = str(desc.get("stage", "") or "")
+        stage_level = _STAGE_ORDER.get(stage, 0)
+
+        if activation == "active" and stage_level > current_level:
+            has_active_higher_route = True
+            break
+
+    return ObservationDecision(
+        request_sent=obs_decision.request_sent,
+        observation_status=obs_decision.observation_status,
+        matched_signal_ids=list(obs_decision.matched_signal_ids),
+        failure_class=obs_decision.failure_class,
+        surface_key=obs_decision.surface_key,
+        execution_fingerprint=obs_decision.execution_fingerprint,
+        evidence_keys=list(obs_decision.evidence_keys),
+        is_new_evidence=obs_decision.is_new_evidence,
+        is_new_state_transition=has_active_higher_route,
+        selected_strategy_id=obs_decision.selected_strategy_id,
+        payload=obs_decision.payload,
+        response_bodies=list(obs_decision.response_bodies),
+        diagnostic_notes=list(obs_decision.diagnostic_notes) + [
+            f"resolve_state_transition: is_new_evidence={obs_decision.is_new_evidence} "
+            f"current_stage={current_stage} has_active_higher_route={has_active_higher_route}"
+        ],
     )
