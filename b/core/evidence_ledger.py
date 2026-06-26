@@ -57,3 +57,92 @@ def reset_ledger(workspace: Path, run_id: str = "") -> None:
 
 def has_signal(workspace: Path, signal_id: str) -> bool:
     return signal_id in load_confirmed_signals(workspace)
+
+
+def evidence_exists(workspace: Path, evidence_key: str) -> bool:
+    """Check if an exact evidence_key has already been written to the ledger."""
+    path = workspace / LEDGER_FILENAME
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    existing_keys = {
+        s.get("evidence_key", "")
+        for s in data.get("signals", [])
+    }
+    return evidence_key in existing_keys
+
+
+def has_signal_on_surface(
+    workspace: Path,
+    run_id: str,
+    surface_key: str,
+    signal_id: str,
+) -> bool:
+    """Check if a signal has been confirmed on this surface in this run.
+
+    Used to determine is_new_state_transition — True only when the signal
+    has never been seen on this surface before.
+    """
+    path = workspace / LEDGER_FILENAME
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    for s in data.get("signals", []):
+        if (
+            s.get("signal_id") == signal_id
+            and s.get("run_id") == run_id
+            and s.get("surface_key") == surface_key
+        ):
+            return True
+    return False
+
+
+def write_signals_deduped(
+    workspace: Path,
+    new_signals: list[dict],
+) -> tuple[int, int]:
+    """Write signals with evidence_key dedup.
+
+    Returns (written_count, skipped_duplicate_count).
+    Each signal dict must include: signal_id, run_id, evidence_key, surface_key.
+    """
+    if not new_signals:
+        return 0, 0
+
+    path = workspace / LEDGER_FILENAME
+    data: dict = {"run_id": "", "signals": []}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    existing_keys = {
+        s.get("evidence_key", "")
+        for s in data.get("signals", [])
+    }
+
+    written = 0
+    skipped = 0
+    for sig in new_signals:
+        ek = sig.get("evidence_key", "")
+        if ek and ek in existing_keys:
+            skipped += 1
+            continue
+        sig.setdefault("observed_at", datetime.now(timezone.utc).isoformat())
+        data["signals"].append(sig)
+        if ek:
+            existing_keys.add(ek)
+        written += 1
+
+    if written:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return written, skipped

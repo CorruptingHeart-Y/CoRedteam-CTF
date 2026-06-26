@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import yaml
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1038,6 +1039,29 @@ def run_global_consolidation(
     print(f"[consolidator] [DIAG] 诊断结论:\n  {diagnosis[:300]}...")
 
     # ── 4. 持久化经验 ───────────────────────────────────────
+    # LongTermWritePolicy gate: check terminal conditions before any permanent write
+    from core.long_term_write_policy import is_long_term_write_blocked
+    _ltw_blocked, _ltw_reason = is_long_term_write_blocked(workdir)
+    if _ltw_blocked:
+        print(f"[consolidator] [POLICY] Long-term writes BLOCKED: {_ltw_reason}")
+        print(f"[consolidator] [POLICY] Writing only workspace-local diagnostics (strategy_gap / run_diagnostics)")
+        # Write workspace-local diagnostic artifact instead of permanent memory
+        _diag_path = workdir / "run_diagnostics.json"
+        _diag = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "blocked_by_terminal_condition": _ltw_reason,
+            "diagnosis": result.get("diagnosis", ""),
+            "llm_suggested_patterns_count": len(result.get("memory_patch", {}).get("patterns", [])),
+            "llm_suggested_techs_count": len(result.get("memory_patch", {}).get("techs", [])),
+            "_note": "Long-term writes were blocked. Patterns and techs below are for human review only.",
+            "patterns_not_persisted": result.get("memory_patch", {}).get("patterns", []),
+            "techs_not_persisted": result.get("memory_patch", {}).get("techs", []),
+        }
+        _diag_path.parent.mkdir(parents=True, exist_ok=True)
+        _diag_path.write_text(json.dumps(_diag, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[consolidator] [DIAG] Wrote run diagnostics to {_diag_path}")
+        return result
+
     memory_patch = result.get("memory_patch") or {}
     patterns: list[dict[str, Any]] = memory_patch.get("patterns") or []
     techs: list[dict[str, Any]] = memory_patch.get("techs") or []

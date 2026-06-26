@@ -59,15 +59,27 @@ def _signal_observer_available(expected_signals: list) -> bool:
     return bool(expected_signals)
 
 
+_SIGNAL_PRIMITIVE_ALIASES: dict[str, set[str]] = {
+    "arithmetic_reflection_confirmed": {"ssti_reflection", "ssti_arithmetic", "template_arithmetic"},
+    "template_directive_parsed": {"ssti_reflection", "ssti_arithmetic", "template_injection"},
+    "object_access_confirmed": {"object_access", "java_object_access"},
+    "command_execution_confirmed": {"command_execution", "rce", "runtime_exec"},
+    "file_read_confirmed": {"arbitrary_file_read", "file_read"},
+    "oob_callback_received": {"oob_callback", "oob_callback_received"},
+}
+
+
 def _signal_observer_confirm(expected_signals: list, stdout_text: str, evaluator_primitives: list) -> bool:
     """Check if any expected signal is confirmed. No generic keyword fallback."""
     if not expected_signals:
         return False
     stdout_lower = stdout_text.lower()
-    detected_set = {p.lower() for p in (evaluator_primitives or [])}
+    detected_set = {str(p).lower() for p in (evaluator_primitives or [])}
     for sig in expected_signals:
-        sig_lower = sig.lower().replace("_", " ")
-        if sig_lower in stdout_lower or sig in detected_set:
+        sig_key = str(sig).lower()
+        sig_lower = sig_key.replace("_", " ")
+        aliases = _SIGNAL_PRIMITIVE_ALIASES.get(sig_key, set())
+        if sig_lower in stdout_lower or sig_key in detected_set or detected_set.intersection(aliases):
             return True
     # repro_success flag from evaluator is the only external confirmation
     return False
@@ -139,19 +151,27 @@ def _record_strategy_attempt_if_executed(
     feedback: dict[str, Any],
     round_number: int = 0,
     expected_signals: list | None = None,
+    obs_decision: Any = None,
 ) -> None:
     if not selected_canonical_strategy_id or not should_record_strategy_attempt(exec_out):
         return
-    sent, obs, fail_cls = _classify_observation(exec_out, feedback, expected_signals=expected_signals)
+    # Prefer ObservationDecision when available (deterministic); fall back to legacy classifier
+    if obs_decision is not None and hasattr(obs_decision, 'observation_status'):
+        obs = obs_decision.observation_status
+        fail_cls = obs_decision.failure_class
+        sent = obs_decision.request_sent
+    else:
+        sent, obs, fail_cls = _classify_observation(exec_out, feedback, expected_signals=expected_signals)
     if obs == "request_not_sent":
         print(f"[coordinator] strategy attempt not recorded: request_not_sent for {selected_canonical_strategy_id}")
         return
     if obs == "observation_unknown":
         print(f"[coordinator] observation_unknown for {selected_canonical_strategy_id}: no evidence, no strategy update")
         return
-    success = bool(feedback.get("repro_success")) or obs == "positive_evidence"
+    success = obs == "positive_evidence"
     failure_stage = "" if success else str(feedback.get("error_fingerprint") or "runtime_failure")
     evidence = str(feedback.get("summary") or feedback.get("feedback_for_planner") or "")[:300]
+    # Dedup: if this exact outcome was already recorded this round for this strategy, skip
     tracker.record_attempt(
         selected_canonical_strategy_id,
         success=success,
@@ -212,7 +232,13 @@ def _extract_injection_param(confirmed: dict[str, Any]) -> str:
     import re
     vulns = confirmed.get("vulnerabilities", [])
     for v in vulns:
-        code = str((v.get("source") or {}).get("code", ""))
+        source = v.get("source") if isinstance(v, dict) else None
+        if isinstance(source, dict):
+            code = str(source.get("code", ""))
+        elif isinstance(source, str):
+            code = source
+        else:
+            code = ""
         for pattern in [
             r'@RequestParam\s*\([^)]*name\s*=\s*"([^"]+)"',
             r'@RequestParam\s*\(\s*"([^"]+)"',
@@ -775,6 +801,7 @@ def run_pipeline(
     _iter_history: list[dict[str, Any]] = []           # [{iteration, summary, guidance, ok_count}]
 
     iteration = 0
+    _strategy_exhausted = False
     while iteration < _iter_budget and iteration < _MAX_HARD_LIMIT:
         iteration += 1
         render_iteration_header(iteration, _iter_budget)
@@ -812,6 +839,11 @@ def run_pipeline(
             }
             feedback_path.write_text(json.dumps(fb_block, ensure_ascii=False, indent=2), encoding="utf-8")
             warn(f"[coordinator] surface hard gate blocked: {_surface_key}")
+            from core.long_term_write_policy import write_terminal_condition
+            write_terminal_condition(ws, "surface_blocked", {
+                "surface_key": _surface_key,
+                "surface_blocked": True,
+            }, round_number=iteration)
             break
 
         # ── Planner ────────────────────────────────────────────────────────
@@ -870,14 +902,43 @@ def run_pipeline(
         if warnings:
             detail(f"自动修复/提示: {warnings}")
         if not v["validation"]["passed"]:
+            selection_status = str(trusted_selection.get("status") or "")
             feedback = {
                 "from": "validator",
                 "iteration": iteration,
                 "errors": v["validation"]["errors"],
                 "warnings": warnings,
-                "hint": "根据校验错误修订 plan.json 结构与安全策略",
+                "hint": "Revise plan.json according to validator errors.",
             }
-            warn(f"验证未通过，反馈规划智能体: {v['validation']['errors']}")
+            if selection_status in ("NO_MATCHED_TEMPLATE", "ALL_MATCHED_STRATEGIES_REJECTED"):
+                feedback.update({
+                    "reason": "trusted_selection_unavailable",
+                    "trusted_selection_status": selection_status,
+                    "strategy_exhausted": selection_status == "ALL_MATCHED_STRATEGIES_REJECTED",
+                    "needs_strategy_evolution": selection_status == "ALL_MATCHED_STRATEGIES_REJECTED",
+                    "feedback_for_planner": (
+                        "NO_AVAILABLE_STRATEGY_FOR_SURFACE: no executable canonical strategy "
+                        "is currently allowed for this confirmed surface."
+                    ),
+                })
+                feedback_path.write_text(json.dumps(feedback, ensure_ascii=False, indent=2), encoding="utf-8")
+                warn(f"trusted selection unavailable; stopping run: {selection_status}")
+                from core.long_term_write_policy import write_terminal_condition
+                write_terminal_condition(ws, "STAGE_BLOCKED_NO_APPROVED_ROUTE", {
+                    "selection_status": selection_status,
+                    "strategy_exhausted": selection_status == "ALL_MATCHED_STRATEGIES_REJECTED",
+                }, round_number=iteration)
+                if settings.dry_run:
+                    return _dry_run_return(
+                        ws, feedback_path,
+                        validation_passed=False,
+                        validation_errors=list(val.get("errors") or []),
+                        selected_canonical_strategy_id=str(last_plan.get("selected_canonical_strategy_id") or "").strip(),
+                        trusted_selection=trusted_selection,
+                    )
+                _strategy_exhausted = selection_status == "ALL_MATCHED_STRATEGIES_REJECTED"
+                break
+            warn(f"validator rejected plan: {v['validation']['errors']}")
             if settings.dry_run:
                 return _dry_run_return(
                     ws, feedback_path,
@@ -888,7 +949,7 @@ def run_pipeline(
                 )
             continue
 
-        # ── Executor ───────────────────────────────────────────────────────
+        # Executor
         selected_canonical_strategy_id = str(last_plan.get("selected_canonical_strategy_id") or "").strip()
         pre_gate_errors = evaluate_pre_execution_gate(last_plan, trusted_selection, _hypothesis_tracker)
         if pre_gate_errors:
@@ -993,6 +1054,7 @@ def run_pipeline(
             http_feedback_parts.append(f"POLYGLOT: {err_msg}")
             print(f"[coordinator] POLYGLOT construction errors: {len(polyglot_errors)} detected")
 
+        from memory.runtime_truths import get_runtime_truths as _get_runtime_truths_for_eval
         fb = run_evaluator(
             settings=settings,
             memory=memory,
@@ -1002,12 +1064,33 @@ def run_pipeline(
             feedback_path=feedback_path,
             llm=llm,
             adapter=adapter,
+            runtime_truths=_get_runtime_truths_for_eval().data,
+            template_selection=template_selection.to_dict(),
         )
         feedback = fb
         _expected_signals = (
             template_selection.strategy_descriptors.get(selected_canonical_strategy_id, {})
             .get("expected_signals", []) if hasattr(template_selection, 'strategy_descriptors') else []
         )
+        render_evaluator_feedback(fb)
+
+        # ── ObservationDecision: single deterministic source of truth ──
+        from core.observation_decision import make_observation_decision
+        _surface_key = build_surface_key(confirmed)
+        _obs_decision = make_observation_decision(
+            exec_out=exec_out,
+            expected_signals=_expected_signals,
+            run_id=run_id,
+            surface_key=_surface_key,
+            selected_strategy_id=selected_canonical_strategy_id,
+            evidence_ledger_path=ws,
+        )
+        print(f"[observation_decision] status={_obs_decision.observation_status} "
+              f"matched_signals={_obs_decision.matched_signal_ids} "
+              f"is_new_evidence={_obs_decision.is_new_evidence} "
+              f"is_new_state_transition={_obs_decision.is_new_state_transition}")
+
+        # ── Record strategy attempt (consumes ObservationDecision) ──
         _record_strategy_attempt_if_executed(
             _hypothesis_tracker,
             selected_canonical_strategy_id,
@@ -1015,43 +1098,75 @@ def run_pipeline(
             fb,
             round_number=iteration,
             expected_signals=_expected_signals,
+            obs_decision=_obs_decision,
         )
-        render_evaluator_feedback(fb)
 
-        # ── Evidence Ledger: write confirmed signals from evaluator output ──
-        _primitive_to_signal = {
-            "ssti_reflection": "arithmetic_reflection_confirmed",
-            "template_injection": "template_directive_parsed",
-            "command_execution": "command_execution_confirmed",
-            "arbitrary_file_read": "file_read_confirmed",
-        }
-        _new_signals: list[dict] = []
-        for _prim in (fb.get("detected_primitives") or []):
-            _sig = _primitive_to_signal.get(str(_prim))
-            if _sig and fb.get("primitive_confidence", {}).get(_prim, 0) >= 0.5:
+        # ── OUTCOME_CONSISTENCY_VIOLATION check ──
+        _old_sent, _old_obs, _old_fail = _classify_observation(exec_out, fb, expected_signals=_expected_signals)
+        if _obs_decision.observation_status != _old_obs:
+            _violation_msg = (
+                f"OUTCOME_CONSISTENCY_VIOLATION: deterministic={_obs_decision.observation_status} "
+                f"vs legacy_classifier={_old_obs} for {selected_canonical_strategy_id} "
+                f"surface={_surface_key} fp={_obs_decision.execution_fingerprint}"
+            )
+            print(f"[coordinator] ⚠️ {_violation_msg}")
+            # Use ObservationDecision as authority; log legacy discrepancy for audit
+            fb.setdefault("_consistency_violations", []).append(_violation_msg)
+            from core.long_term_write_policy import write_terminal_condition
+            write_terminal_condition(ws, "OUTCOME_CONSISTENCY_VIOLATION", {
+                "deterministic": _obs_decision.observation_status,
+                "legacy_classifier": _old_obs,
+                "strategy_id": selected_canonical_strategy_id,
+            }, round_number=iteration)
+
+        # ── Evidence Ledger: write signals from ObservationDecision only ──
+        if _obs_decision.is_new_evidence and _obs_decision.matched_signal_ids:
+            from core.evidence_ledger import write_signals_deduped
+            _new_signals: list[dict] = []
+            for i, sig in enumerate(_obs_decision.matched_signal_ids):
+                ek = _obs_decision.evidence_keys[i] if i < len(_obs_decision.evidence_keys) else ""
                 _new_signals.append({
-                    "signal_id": _sig,
+                    "signal_id": sig,
+                    "evidence_key": ek,
                     "run_id": run_id,
                     "round": iteration,
+                    "surface_key": _surface_key,
+                    "execution_fingerprint": _obs_decision.execution_fingerprint,
                     "source_strategy_id": selected_canonical_strategy_id,
-                    "evidence_reference": f"evaluator detected primitive: {_prim}",
-                    "confidence": float(fb.get("primitive_confidence", {}).get(_prim, 0)),
+                    "evidence_reference": f"deterministic observer confirmed: {sig}",
                 })
-        if _new_signals:
-            from core.evidence_ledger import write_signals
-            write_signals(ws, _new_signals)
-            print(f"[evidence_ledger] {len(_new_signals)} new signals: {[s['signal_id'] for s in _new_signals]}")
+            if _new_signals:
+                _written, _skipped = write_signals_deduped(ws, _new_signals)
+                print(f"[evidence_ledger] {_written} new signals, {_skipped} duplicates: "
+                      f"{[s['signal_id'] for s in _new_signals]}")
+        elif _obs_decision.matched_signal_ids and not _obs_decision.is_new_evidence:
+            print(f"[evidence_ledger] duplicate_evidence: all signals already in ledger for "
+                  f"fp={_obs_decision.execution_fingerprint}, skipping write")
+            from core.long_term_write_policy import write_terminal_condition
+            write_terminal_condition(ws, "duplicate_evidence", {
+                "execution_fingerprint": _obs_decision.execution_fingerprint,
+                "signal_ids": _obs_decision.matched_signal_ids,
+            }, round_number=iteration)
 
-        # ── Surface State update ──
+        # ── Surface State update (consumes ObservationDecision) ──
         from control.surface_state import (
-            build_surface_key, update_surface_after_strategy_failure, boost_surface_after_positive_evidence
+            update_surface_after_strategy_failure, boost_surface_after_positive_evidence
         )
-        _surface_key = build_surface_key(confirmed)
-        _sent, _obs, _fail_cls = _classify_observation(exec_out, fb)
-        if _sent and _obs == "no_positive_evidence":
-            update_surface_after_strategy_failure(ws, _surface_key, selected_canonical_strategy_id, iteration)
-            print(f"[surface_state] negative evidence: {selected_canonical_strategy_id} on {_surface_key}")
-        elif _sent and _obs == "positive_evidence":
+        if _obs_decision.request_sent and _obs_decision.observation_status == "no_positive_evidence":
+            _surface_state = update_surface_after_strategy_failure(
+                ws,
+                _surface_key,
+                selected_canonical_strategy_id,
+                iteration,
+                execution_fingerprint=_obs_decision.execution_fingerprint or None,
+                request_sent=True,
+                observation_status="no_positive_evidence",
+            )
+            print(
+                f"[surface_state] negative evidence: {selected_canonical_strategy_id} "
+                f"on {_surface_key} reason={_surface_state.decision_reason}"
+            )
+        elif _obs_decision.request_sent and _obs_decision.observation_status == "positive_evidence":
             boost_surface_after_positive_evidence(ws, _surface_key, iteration)
             print(f"[surface_state] positive evidence on {_surface_key}")
 
@@ -1081,8 +1196,8 @@ def run_pipeline(
             fb["_collapsed_history"] = collapsed
             print(f"[coordinator] 📦 上下文折叠：{len(old_entries)} 轮旧历史已压缩为摘要")
 
-        # ── 衰减式里程碑奖励（Decaying Extension）────────────────────────
-        if fb.get("is_milestone"):
+        # ── 衰减式里程碑奖励 (consumes ObservationDecision.is_new_state_transition) ──
+        if _obs_decision.is_new_state_transition:
             _milestone_count += 1
             extension = max(1, 5 - _milestone_count)
             old_budget = _iter_budget
@@ -1102,18 +1217,20 @@ def run_pipeline(
             fail(f"[coordinator] 连续 {_NO_PROGRESS_ABORT} 轮无质变进展，主动终止迭代。")
             break
 
-        # ── 熔断器逻辑（论文 §3.3 Long-Term Memory & 纠偏机制）────────────
-        if fb.get("repro_success"):
+        # ── 熔断器逻辑 (consumes ObservationDecision.observation_status) ──
+        if _obs_decision.observation_status == "positive_evidence":
             _consecutive_failures = 0
             _breaker_triggered    = False
             _error_fingerprints.clear()
-        else:
+            print(f"[coordinator] ✅ positive_evidence: consecutive_failures reset to 0")
+        elif _obs_decision.observation_status == "no_positive_evidence":
             _consecutive_failures += 1
             fp = _extract_step_error_fingerprint(step_results)
             _error_fingerprints.append(fp)
             if len(_error_fingerprints) > _BREAKER_THRESHOLD:
                 _error_fingerprints.pop(0)
             print(f"[coordinator] ⚠️  连续失败计数: {_consecutive_failures}/{_BREAKER_THRESHOLD} | 错误指纹: {fp}")
+        # request_not_sent / observation_unknown: do not modify failure counter
 
         # Stagnation check: same error fingerprint repeated across the window
         # "no_failures" excluded (no step ran). "http_ok_no_reflection" IS stagnation.
@@ -1151,6 +1268,12 @@ def run_pipeline(
             _breaker_triggered = True
             trigger_reason = "策略停滞（相同错误重复）" if _stagnating else f"连续 {_BREAKER_THRESHOLD} 次失败"
             print(f"[coordinator] 🔴 熔断器触发！{trigger_reason}，强制策略切换！")
+            from core.long_term_write_policy import write_terminal_condition
+            write_terminal_condition(ws, "breaker_triggered", {
+                "trigger_reason": trigger_reason,
+                "consecutive_failures": _consecutive_failures,
+                "error_fingerprints": list(_error_fingerprints),
+            }, round_number=iteration)
 
             vuln_summary = (
                 confirmed.get("title", "")
@@ -1289,6 +1412,11 @@ def run_pipeline(
             break
 
     # ── 迭代循环结束 — 唤醒全局复盘导师 ───────────────────────────
+    if _strategy_exhausted:
+        _cleanup_sandbox_workspace(ws)
+        fail("No executable canonical strategy remains; waiting for reviewed strategy evolution.")
+        return 4
+
     final_is_success = len(success_log) > 0
     final_max_iter = iteration >= _iter_budget or iteration >= _MAX_HARD_LIMIT
 
