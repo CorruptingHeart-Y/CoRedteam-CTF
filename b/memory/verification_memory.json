@@ -1,0 +1,52 @@
+{
+  "confirmed_base_url": "",
+  "confirmable_endpoints": [
+    "/api/options",
+    "/api/monitor"
+  ],
+  "injectable_params": {},
+  "injectable_endpoints": [],
+  "accepted_fields": [],
+  "rejected_fields": [],
+  "template_engine": "",
+  "reflection_confirmed": false,
+  "payload_blacklist": [],
+  "payload_bypass_techniques": [],
+  "working_primitives": [
+    {
+      "primitive_id": "information_disclosure",
+      "confidence": 1.0,
+      "evidence": "GET /api/options 返回 secret_phrase 在 allPossibleCommands.secret 中",
+      "engine": ""
+    },
+    {
+      "primitive_id": "authentication_bypass",
+      "confidence": 1.0,
+      "evidence": "Step 2: POST /api/monitor with secret_phrase returned flag without authentication",
+      "engine": ""
+    },
+    {
+      "primitive_id": "unauthorized_access",
+      "confidence": 1.0,
+      "evidence": "POST /api/monitor with secret_phrase returns flag without authentication",
+      "engine": ""
+    },
+    {
+      "primitive_id": "missing_authentication",
+      "confidence": 1.0,
+      "evidence": "POST /api/monitor 无需认证直接返回 flag",
+      "engine": ""
+    }
+  ],
+  "primitive_knowledge": {},
+  "confirmed_cve": "",
+  "target_app": "",
+  "target_framework": "",
+  "auth_status": "unknown",
+  "csrf_token_required": false,
+  "waf_detected": false,
+  "waf_type": "",
+  "confirmed_flags": [
+    "HTB{D3v3l0p3r_t00l5_4r3_b35t_wh4t_y0u_Th1nk??!}"
+  ]
+}

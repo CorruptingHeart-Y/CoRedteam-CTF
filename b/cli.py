@@ -130,8 +130,17 @@ def cmd_exploit(args: argparse.Namespace) -> int:
 
     import core.adapters  # noqa: F401
     from coordinator import run_pipeline
+    from agents.consolidator import run_seed_warmup
 
-    max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "3"))
+    # ── Phase 2 预热：在 Planner 循环前生成可执行种子模板 ──
+    warmup_results = run_seed_warmup(confirmed_path)
+    if warmup_results:
+        ok(f"Seed warmup generated {len(warmup_results)} executable templates: "
+           f"{', '.join(warmup_results.keys())}")
+    else:
+        muted("Seed warmup skipped or produced no templates — Planner will start cold.")
+
+    max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "5"))
     stage("CLI", f"Starting Phase 2 pipeline (challenge={challenge}, max_runs={max_runs})...")
 
     best_result = 3

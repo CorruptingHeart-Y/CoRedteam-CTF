@@ -15,7 +15,46 @@ from agents.executor import run_executor
 from agents.planner import run_planner
 from agents.validator import run_validator
 from core.challenge_adapter import ChallengeAdapter, get_adapter, list_adapters
+from memory.exploit_trajectory import get_trajectory, reset_trajectory
+from memory.verification_memory import get_verification, reset_verification
+from memory.primitive_learning import get_learning_engine, PrimitiveObservation
+from memory.primitive_transition_graph import get_transition_graph
 from core.llm_client import DeepSeekClient
+
+# ═══════════════════════════════════════════════════════════════════
+# Runtime Manifest — 显式能力注册 (Constrained Agency §1)
+# 唯一可信的运行时能力清单。Validator 和 Planner 必须对齐此清单。
+# 禁止扫描 Docker 镜像隐式 pip 依赖；所有能力必须在此显式声明。
+# ═══════════════════════════════════════════════════════════════════
+RUNTIME_MANIFEST: dict[str, Any] = {
+    "version": 1,
+    "sdk_primitives": [
+        # HTTP 高层编排（禁止直接 import requests / urllib3 / socket）
+        "HttpClient.get",
+        "HttpClient.post",
+        "HttpClient.raw_request",
+        "HttpClient.last_response",
+    ],
+    "safe_modules": [
+        # 最小可用能力闭包 — 协议数据处理辅助工具集
+        # Validator AST 检查 100% 与此清单对齐
+        "json", "base64", "re", "time", "struct",
+        "urllib.parse", "http.cookies",
+        "hashlib", "hmac",
+        # 高阶数据处理（禁原生通信，仅 SDK 封装内可用）
+        "redteam_sdk",
+    ],
+    "blocked_modules": [
+        "os", "subprocess", "socket", "ctypes", "cffi", "pty",
+        "signal", "multiprocessing", "importlib", "pickle", "marshal",
+        "builtins", "gc", "inspect", "ast", "code", "codeop",
+        "compileall", "dis", "types", "weakref",
+        # 原生通信库禁直接导入 — 必须通过 redteam_sdk.HttpClient
+        "requests", "urllib3", "urllib",
+    ],
+    "network_mode": "bridge",
+    "target_access_mode": "container_ip_only",
+}
 from core.memory_store import LayeredMemory
 from core.settings import get_settings
 from core.target_context import TargetContext
@@ -29,6 +68,7 @@ from core.ui import (
     render_evaluator_feedback,
     render_iteration_header,
     render_summary_table,
+    render_victory_banner,
     stage,
     warn,
 )
@@ -438,6 +478,168 @@ class _VulnRotator:
         )
 
 
+def _compute_progress_signals(
+    fb: dict[str, Any],
+    last_plan: dict[str, Any],
+    step_results: list[dict[str, Any]],
+    prev_state: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Multi-dimensional progress detection beyond binary is_milestone.
+
+    Returns (has_progress, list_of_reasons).
+    """
+    reasons: list[str] = []
+
+    if prev_state is None:
+        return True, ["initial_round"]
+
+    # 1. State machine advancement
+    state_order = ["init", "probe_success", "payload_injected", "gadget_triggered", "oob_received"]
+    cur_state = fb.get("current_exploit_state", "init")
+    prev_es = prev_state.get("exploit_state", "init")
+    try:
+        if state_order.index(cur_state) > state_order.index(prev_es):
+            reasons.append(f"state_advance: {prev_es} → {cur_state}")
+    except (ValueError, IndexError):
+        pass
+
+    # 2. New primitive detected (or confidence increase on existing)
+    cur_prims = set(fb.get("detected_primitives", []))
+    prev_prims = prev_state.get("primitives", set())
+    new_prims = cur_prims - prev_prims
+    if new_prims:
+        reasons.append(f"new_primitive: {new_prims}")
+
+    cur_conf = fb.get("primitive_confidence", {})
+    prev_conf = prev_state.get("primitive_confidence", {})
+    for pid, conf in cur_conf.items():
+        prev_c = prev_conf.get(pid, 0.0)
+        if conf - prev_c >= 0.1:
+            reasons.append(f"confidence_increase: {pid} {prev_c:.2f}→{conf:.2f}")
+
+    # 3. New endpoint accessed
+    cur_endpoints: set[str] = set()
+    for sr in step_results:
+        for h in sr.get("http_responses") or []:
+            url = h.get("url", "")
+            if url:
+                cur_endpoints.add(url)
+    prev_endpoints = prev_state.get("endpoints", set())
+    new_eps = cur_endpoints - prev_endpoints
+    if new_eps:
+        reasons.append(f"new_endpoint: {new_eps}")
+
+    # 4. New HTTP status code observed
+    cur_codes: set[int] = set()
+    for sr in step_results:
+        for h in sr.get("http_responses") or []:
+            code = h.get("status_code", 0)
+            if code:
+                cur_codes.add(code)
+    prev_codes = prev_state.get("http_codes", set())
+    new_codes = cur_codes - prev_codes
+    if new_codes:
+        reasons.append(f"new_status_code: {new_codes}")
+
+    # 5. Payload mutation: significant change from previous plan
+    cur_payloads = " ".join(
+        st.get("command", "") for st in (last_plan.get("steps") or [])
+    )
+    prev_payloads = prev_state.get("payloads", "")
+    if cur_payloads and prev_payloads:
+        # Simple similarity heuristic: if <60% of tokens overlap, it's a mutation
+        cur_tokens = set(cur_payloads.lower().split())
+        prev_tokens = set(prev_payloads.lower().split())
+        if cur_tokens and prev_tokens:
+            overlap = len(cur_tokens & prev_tokens) / max(len(cur_tokens), len(prev_tokens))
+            if overlap < 0.6:
+                reasons.append(f"payload_mutation: overlap={overlap:.1%}")
+
+    # 6. New verified fact recorded (from verification_memory module)
+    try:
+        from memory.verification_memory import get_verification
+        verif = get_verification()
+        fresh = getattr(verif, '_last_round_new_facts', 0)
+        if fresh > 0:
+            reasons.append(f"verified_facts: {fresh} new")
+    except Exception:
+        pass
+
+    # 7. is_milestone from Evaluator (existing signal — always counts)
+    if fb.get("is_milestone"):
+        reasons.append("evaluator_milestone")
+
+    # 8. Partial primitive confidence sum ≥ 0.30 (incremental progress)
+    partial_keys = (
+        "response_length_change", "payload_reflection", "oob_attempt",
+        "error_triggered", "timing_anomaly", "uid_fragment",
+        "file_listing_fragment", "command_usage_fragment",
+    )
+    partial_sum = sum(cur_conf.get(k, 0.0) for k in partial_keys)
+    prev_partial_sum = sum(prev_conf.get(k, 0.0) for k in partial_keys)
+    if partial_sum - prev_partial_sum >= 0.20:
+        reasons.append(f"partial_progress: +{partial_sum - prev_partial_sum:.2f}")
+
+    # 9. ok_count increase (more steps succeeding)
+    cur_ok = sum(1 for r in step_results if (r.get("result") or {}).get("ok"))
+    prev_ok = prev_state.get("ok_count", 0)
+    if cur_ok > prev_ok:
+        reasons.append(f"ok_count: {prev_ok} → {cur_ok}")
+
+    # 10. EPE progress_score increase (Exploit Progress Engine)
+    cur_ps = fb.get("progress_score", 0.0)
+    prev_ps = prev_state.get("progress_score", 0.0)
+    if cur_ps > prev_ps + 0.03:
+        reasons.append(f"progress_score: {prev_ps:.2f}→{cur_ps:.2f}")
+
+    # 11. EPE exploit_momentum (strongest signal — surface perturbation confirmed)
+    if fb.get("exploit_momentum"):
+        reasons.append("exploit_momentum_active")
+
+    # 12. State transition probability increase
+    cur_stp = fb.get("state_transition_probability", 0.0)
+    prev_stp = prev_state.get("state_transition_probability", 0.0)
+    if cur_stp > prev_stp + 0.05:
+        reasons.append(f"stp_increase: {prev_stp:.2f}→{cur_stp:.2f}")
+
+    return bool(reasons), reasons
+
+
+def _snapshot_round_state(
+    fb: dict[str, Any],
+    last_plan: dict[str, Any],
+    step_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Capture round state for next-iteration comparison."""
+    endpoints: set[str] = set()
+    http_codes: set[int] = set()
+    for sr in step_results:
+        for h in sr.get("http_responses") or []:
+            if h.get("url"):
+                endpoints.add(h["url"])
+            code = h.get("status_code", 0)
+            if code:
+                http_codes.add(code)
+
+    payloads = " ".join(
+        st.get("command", "") for st in (last_plan.get("steps") or [])
+    )
+
+    return {
+        "exploit_state": fb.get("current_exploit_state", "init"),
+        "primitives": set(fb.get("detected_primitives", [])),
+        "primitive_confidence": fb.get("primitive_confidence", {}),
+        "endpoints": endpoints,
+        "http_codes": http_codes,
+        "payloads": payloads,
+        "ok_count": sum(1 for r in step_results if (r.get("result") or {}).get("ok")),
+        "progress_score": fb.get("progress_score", 0.0),
+        "state_transition_probability": fb.get("state_transition_probability", 0.0),
+        "exploit_momentum": fb.get("exploit_momentum", False),
+        "suggested_next_action": fb.get("suggested_next_action", ""),
+    }
+
+
 def _is_plan_fully_blocked(plan: dict[str, Any]) -> bool:
     """Return True if every step in the plan has status BLOCKED."""
     steps = plan.get("steps") or []
@@ -447,6 +649,299 @@ def _is_plan_fully_blocked(plan: dict[str, Any]) -> bool:
         isinstance(st, dict) and st.get("status") == "BLOCKED"
         for st in steps
     )
+
+
+def _build_last_exec_raw(exec_out: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact raw execution summary from executor output for Planner injection.
+
+    Token budget: each step keeps tail 500 chars of stdout/stderr + first 300 chars of HTTP body.
+    """
+    steps_raw = []
+    for r in exec_out.get("step_results") or []:
+        res = r.get("result") or {}
+        stdout_full = res.get("stdout", "")
+        stderr_full = res.get("stderr", "")
+        http_responses = r.get("http_responses") or []
+        entry = {
+            "step_id": r.get("step_id"),
+            "ok": res.get("ok", False),
+            "exit_code": res.get("exit_code", -1),
+            "stdout_tail": stdout_full[-500:] if len(stdout_full) > 500 else stdout_full,
+            "stderr_tail": stderr_full[-500:] if len(stderr_full) > 500 else stderr_full,
+        }
+        if http_responses:
+            entry["http_responses"] = [
+                {
+                    "status_code": h.get("status_code"),
+                    "method": h.get("method", ""),
+                    "url": h.get("url", ""),
+                    "response_body": (h.get("response_body", "") or "")[:300],
+                }
+                for h in http_responses[:5]
+            ]
+        # Extract exception from STEP_FAIL marker
+        if "STEP_FAIL:" in stdout_full:
+            idx = stdout_full.index("STEP_FAIL:")
+            entry["exception_snippet"] = stdout_full[idx:idx + 500]
+        steps_raw.append(entry)
+    return {"steps": steps_raw}
+
+
+def _record_trajectory_entry(
+    iteration: int,
+    fb: dict[str, Any],
+    plan: dict[str, Any],
+    exec_out: dict[str, Any],
+    step_results: list[dict[str, Any]],
+) -> None:
+    """每轮结束后记录 exploit 路径节点到 trajectory memory (含 primitive 信息)。"""
+    traj = get_trajectory()
+
+    # 从 feedback 提取状态机字段
+    current_state = fb.get("current_exploit_state", "init")
+    blocker = fb.get("state_transition_blocker", "")
+    milestones = fb.get("milestones_achieved", [])
+    next_action = fb.get("next_required_action", "")
+    success = fb.get("repro_success", False)
+
+    # Primitive detection from feedback
+    detected_primitives = fb.get("detected_primitives", [])
+    primitive_confidence = fb.get("primitive_confidence", {})
+    primitive_evidence = fb.get("primitive_evidence", {})
+    primary_primitive = detected_primitives[0] if detected_primitives else ""
+    primary_primitive_conf = primitive_confidence.get(primary_primitive, 0.0) if primary_primitive else 0.0
+    primary_primitive_ev = primitive_evidence.get(primary_primitive, "") if primary_primitive else ""
+
+    # 确定 target_state（下一个目标状态）
+    state_order = ["init", "probe_success", "payload_injected", "gadget_triggered", "oob_received"]
+    try:
+        cur_idx = state_order.index(current_state) if current_state in state_order else 0
+        target_state = state_order[min(cur_idx + 1, len(state_order) - 1)]
+    except ValueError:
+        target_state = "probe_success"
+
+    # 从 plan 中提取 action_type / endpoint / method
+    action_type = "probe"
+    endpoint = ""
+    method = ""
+    payload = ""
+    for st in plan.get("steps", []):
+        cmd = st.get("command", "")
+        purpose = (st.get("purpose") or "").lower()
+        # Detect action_type from purpose
+        if any(kw in purpose for kw in ("inject", "注入", "payload", "exploit", "trigger", "触发")):
+            action_type = "inject"
+        elif any(kw in purpose for kw in ("exfiltrate", "外传", "oob", "flag", "读取", "read")):
+            action_type = "exfiltrate"
+        elif any(kw in purpose for kw in ("trigger", "gadget", "rce", "执行", "execute")):
+            action_type = "trigger"
+        # Extract first endpoint from command
+        if not endpoint:
+            import re
+            ep_match = re.search(r"['\"](/[\w/\-._]+)['\"]", cmd)
+            if ep_match:
+                endpoint = ep_match.group(1)
+        if not method:
+            for m in ("post", "get", "put", "delete"):
+                if f".{m}(" in cmd.lower():
+                    method = m.upper()
+                    break
+        if not payload:
+            # Capture first meaningful payload pattern
+            payload_match = re.search(r"payload\s*=\s*['\"]([^'\"]+)['\"]", cmd)
+            if payload_match:
+                payload = payload_match.group(1)[:200]
+
+    # 构建 evidence
+    all_http = []
+    for r in exec_out.get("step_results") or []:
+        for h in r.get("http_responses") or []:
+            all_http.append(f"HTTP {h.get('status_code')} {h.get('method')} {h.get('url', '')}")
+
+    evidence = "; ".join(all_http[:3]) if all_http else "no HTTP responses"
+
+    # 检测是否产生了状态转换
+    state_transition = ""
+    if milestones and isinstance(milestones, list):
+        for m in milestones:
+            if isinstance(m, str) and ":" in m:
+                state_transition = f"{current_state} -> {m.split(':')[0].strip()}"
+                break
+
+    # 失败原因
+    why_failed = ""
+    if not success:
+        why_failed = f"{fb.get('error_fingerprint', '')}: {blocker}"
+
+    traj.append(
+        round_id=iteration,
+        current_state=current_state,
+        target_state=target_state,
+        action_type=action_type,
+        payload=payload,
+        endpoint=endpoint,
+        method=method,
+        evidence=evidence,
+        success=success,
+        blocker=blocker,
+        state_transition=state_transition,
+        why_failed=why_failed,
+        reusable=success and len(payload) > 0,
+        detected_primitive=primary_primitive,
+        primitive_confidence=primary_primitive_conf,
+        primitive_evidence=primary_primitive_ev,
+    )
+
+    traj_stats = traj.get_stats()
+    print(
+        f"[coordinator] 📈 轨迹已记录: R{iteration} | state={current_state} | "
+        f"primitive={primary_primitive}({primary_primitive_conf:.0%}) | "
+        f"success={success} | chain={' -> '.join(traj_stats['chain'])}"
+    )
+
+
+def _record_primitive_learning(
+    fb: dict[str, Any],
+    plan: dict[str, Any],
+    step_results: list[dict[str, Any]],
+) -> None:
+    """从单轮的执行结果中学习 exploit primitive。"""
+    engine = get_learning_engine()
+    detected_primitives = fb.get("detected_primitives", [])
+    primitive_confidence = fb.get("primitive_confidence", {})
+    primitive_evidence = fb.get("primitive_evidence", {})
+
+    if not detected_primitives:
+        return
+
+    # 构建 observation
+    all_stdout = " ".join(
+        (r.get("result") or {}).get("stdout", "") for r in step_results
+    )
+    all_http_bodies = " ".join(
+        h.get("response_body", "")
+        for r in step_results
+        for h in r.get("http_responses") or []
+    )
+
+    endpoint = ""
+    method = "GET"
+    payload = ""
+    for st in plan.get("steps", []):
+        cmd = st.get("command", "")
+        if not endpoint:
+            import re
+            ep_match = re.search(r"['\"](/[\w/\-._]+)['\"]", cmd)
+            if ep_match:
+                endpoint = ep_match.group(1)
+        if not payload:
+            payload_match = re.search(r"payload\s*=\s*['\"]([^'\"]+)['\"]", cmd)
+            if payload_match:
+                payload = payload_match.group(1)[:300]
+
+    obs = PrimitiveObservation(
+        payload=payload,
+        endpoint=endpoint,
+        method=method,
+        response_status=200,
+        response_body_snippet=all_http_bodies[:500],
+        stdout_snippet=all_stdout[:500],
+        success=fb.get("repro_success", False),
+    )
+
+    learned = engine.learn_from_observation(obs)
+    if learned:
+        learned_ids = [lp.primitive_id for lp in learned]
+        print(f"[coordinator] 🧠 Primitive 学习引擎: 新学习到 {' | '.join(learned_ids)}")
+        # Auto-generalize high-confidence primitives
+        for lp in learned:
+            if lp.confidence >= 0.7:
+                engine.generalize_primitive(lp.primitive_id)
+
+
+def _record_verified_facts(
+    fb: dict[str, Any],
+    step_results: list[dict[str, Any]],
+) -> None:
+    """从单轮的执行结果中提取已确认的事实并写入 verification memory。"""
+    verif = get_verification()
+    success = fb.get("repro_success", False)
+    milestones = fb.get("milestones_achieved", [])
+    state = fb.get("current_exploit_state", "init")
+    detected_primitives = fb.get("detected_primitives", [])
+    primitive_confidence = fb.get("primitive_confidence", {})
+    primitive_evidence = fb.get("primitive_evidence", {})
+
+    all_stdout = " ".join(
+        (r.get("result") or {}).get("stdout", "") for r in step_results
+    )
+
+    # 至少 probe_success 才记录端点
+    if state in ("probe_success", "payload_injected", "gadget_triggered", "oob_received"):
+        # 从 HTTP 日志中提取确认可达的端点
+        for r in step_results:
+            for h in r.get("http_responses") or []:
+                status = h.get("status_code", 0)
+                url = h.get("url", "")
+                if 200 <= status < 400 and url:
+                    verif.confirm_endpoint(url)
+
+    # 如果至少 payload_injected，记录 template engine / reflection
+    if state in ("payload_injected", "gadget_triggered", "oob_received"):
+        if "49" in all_stdout and ("7*7" in all_stdout or "multiply" in all_stdout.lower()):
+            verif.confirm("reflection_confirmed", True)
+            verif.confirm("template_engine", "jinja2")
+
+    # Record structured primitive knowledge from evaluator
+    for pid in detected_primitives:
+        conf = primitive_confidence.get(pid, 0.6)
+        ev = primitive_evidence.get(pid, "")
+        engine_hint = ""
+        if "jinja" in all_stdout.lower() or "flask" in all_stdout.lower() or "werkzeug" in all_stdout.lower():
+            engine_hint = "jinja2"
+        verif.add_working_primitive({
+            "primitive_id": pid,
+            "confidence": conf,
+            "evidence": ev[:200],
+            "engine": engine_hint,
+        })
+
+    # gadged_triggered/oob_received: record working primitives
+    if state in ("gadget_triggered", "oob_received"):
+        all_stdout = " ".join(
+            (r.get("result") or {}).get("stdout", "") for r in step_results
+        )
+        if any(kw in all_stdout.lower() for kw in ("uid=", "root:", "www-data")):
+            verif.add_working_primitive({
+                "primitive_id": "command_execution",
+                "confidence": 0.95,
+                "evidence": "System command output detected in stdout",
+                "engine": "",
+            })
+        if "flag{" in all_stdout.lower() or "htb{" in all_stdout.lower():
+            import re
+            flag_match = re.search(r'(?:flag|htb|ctf)\{[^}]+\}', all_stdout, re.IGNORECASE)
+            if flag_match:
+                verif.add_flag(flag_match.group(0))
+
+    # Record payload blacklist from error fingerprint
+    error_fp = fb.get("error_fingerprint", "")
+    if error_fp == "AllFieldsRequired":
+        verif.add_rejected_field("email" if "email" in fb.get("raw_evidence", "") else "username")
+
+    # Record WAF detection
+    evidence = fb.get("raw_evidence", "").lower()
+    if any(kw in evidence for kw in ("waf", "cloudflare", "modsecurity", "blocked by")):
+        verif.confirm("waf_detected", True)
+
+    verif_stats = verif.get_stats()
+    if verif_stats["facts_count"] > 0:
+        print(
+            f"[coordinator] 🔬 已验证事实: {verif_stats['facts_count']} 条 "
+            f"(端点:{verif_stats['confirmed_endpoints']}, "
+            f"注入点:{verif_stats['injectable_endpoints']}, "
+            f"原语:{verif_stats['working_primitives']})"
+        )
 
 
 def _cleanup_sandbox_workspace(ws: Path) -> None:
@@ -531,11 +1026,15 @@ def run_pipeline(
     _milestone_count  = 0                              # 累计质变次数（用于衰减）
     _no_progress_streak = 0                            # 连续无任何进展计数
     _NO_PROGRESS_ABORT  = 4                            # 连续 N 次无进展则主动放弃
+    _SUGGEST_ABORT_MIN_ITER = 4                         # AI 熔断最低迭代次数：前 N 轮强制忽略
 
     # ── 滑动窗口上下文（防上下文爆炸）────────────────────
     # 保留最近 3 轮的完整执行摘要；更早的只保留 summary 一行。
     _CONTEXT_WINDOW   = 3
     _iter_history: list[dict[str, Any]] = []           # [{iteration, summary, guidance, ok_count}]
+
+    # ── Multi-dimensional progress tracking ──
+    _prev_round_state: dict[str, Any] | None = None
 
     iteration = 0
     while iteration < _iter_budget and iteration < _MAX_HARD_LIMIT:
@@ -577,7 +1076,7 @@ def run_pipeline(
         )
         if warnings:
             detail(f"自动修复/提示: {warnings}")
-        if not v["validation"]["passed"]:
+        if not (val.get("passed") if isinstance(val, dict) else True):
             feedback = {
                 "from": "validator",
                 "iteration": iteration,
@@ -585,7 +1084,7 @@ def run_pipeline(
                 "warnings": warnings,
                 "hint": "根据校验错误修订 plan.json 结构与安全策略",
             }
-            warn(f"验证未通过，反馈规划智能体: {v['validation']['errors']}")
+            warn(f"验证未通过，反馈规划智能体: {val.get('errors', [])}")
             continue
 
         # ── Executor ───────────────────────────────────────────────────────
@@ -671,12 +1170,45 @@ def run_pipeline(
             adapter=adapter,
         )
         feedback = fb
+
+        # 注入上一轮原始执行结果到 feedback，供 Planner 参考
+        fb["last_execution_raw"] = _build_last_exec_raw(exec_out)
+        print(f"[coordinator] 📋 已注入原始执行数据到 feedback ({len(fb['last_execution_raw'].get('steps', []))} 步)")
+
+        # ── Exploit Trajectory Recording ──
+        _record_trajectory_entry(iteration, fb, last_plan, exec_out, step_results)
+
+        # ── Primitive Learning Engine ──
+        _record_primitive_learning(fb, last_plan, step_results)
+
+        # ── Verification Facts Recording ──
+        _record_verified_facts(fb, step_results)
+
         render_evaluator_feedback(fb)
 
-        # ── AI 主动熔断（suggest_abort）────────────────────────────────────
+        # ── 成功检测：优先于熔断判断 ──────────────────────────
+        if fb and (fb.get("repro_success") or fb.get("success")):
+            render_victory_banner(
+                fb=fb,
+                iteration=iteration,
+                iter_budget=_iter_budget,
+                milestone_count=_milestone_count,
+                iter_history=_iter_history,
+                last_plan=last_plan,
+                step_results=step_results,
+                confirmed=confirmed,
+                challenge_name=challenge_name,
+            )
+            return 0  # 成功退出，传播到 cli.py 外层循环
+
+        # ── AI 主动熔断（suggest_abort） — 前 N 轮强制忽略 ──────
         if fb.get("suggest_abort"):
-            fail("[coordinator] AI 判断已无利用可能，主动终止迭代。")
-            break
+            if iteration < _SUGGEST_ABORT_MIN_ITER:
+                print(f"[coordinator] ⚠️ AI 建议熔断，但迭代次数({iteration}) < 最低阈值({_SUGGEST_ABORT_MIN_ITER})，强制忽略")
+                fb["suggest_abort"] = False
+            else:
+                print("✗ AI 判断已无利用可能")
+                break
 
         # ── 滑动窗口：记录本轮摘要，裁剪旧历史 ──────────────────────────
         cur_ok_count = sum(
@@ -699,6 +1231,16 @@ def run_pipeline(
             fb["_collapsed_history"] = collapsed
             print(f"[coordinator] 📦 上下文折叠：{len(old_entries)} 轮旧历史已压缩为摘要")
 
+        # ── Multi-dimensional progress detection ────────────────────────
+        has_progress, progress_reasons = _compute_progress_signals(
+            fb, last_plan, step_results, _prev_round_state,
+        )
+        _prev_round_state = _snapshot_round_state(fb, last_plan, step_results)
+
+        if progress_reasons:
+            progress_label = "; ".join(progress_reasons[:4])
+            print(f"[coordinator] 📈 多维进展信号: {progress_label}")
+
         # ── 衰减式里程碑奖励（Decaying Extension）────────────────────────
         if fb.get("is_milestone"):
             _milestone_count += 1
@@ -711,13 +1253,16 @@ def run_pipeline(
                 f"质变里程碑 #{_milestone_count}！奖励 +{extension} 次迭代。"
                 f"预算 {old_budget}→{_iter_budget}（上限 {_MAX_HARD_LIMIT}）",
             )
+        elif has_progress:
+            _no_progress_streak = 0
+            print(f"[coordinator] 🔄 非质变进展已记录，重置无进展计数")
         else:
             _no_progress_streak += 1
-            print(f"[coordinator] ⏳ 无质变进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
+            print(f"[coordinator] ⏳ 无任何进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
 
         # ── 连续无进展主动放弃 ────────────────────────────────────────────
         if _no_progress_streak >= _NO_PROGRESS_ABORT:
-            fail(f"[coordinator] 连续 {_NO_PROGRESS_ABORT} 轮无质变进展，主动终止迭代。")
+            fail(f"[coordinator] 连续 {_NO_PROGRESS_ABORT} 轮无任何多维进展信号，主动终止迭代。")
             break
 
         # ── 熔断器逻辑（论文 §3.3 Long-Term Memory & 纠偏机制）────────────
@@ -820,6 +1365,30 @@ def run_pipeline(
             print("[coordinator] 熔断器指令已注入 feedback_for_planner")
 
         elif not fb.get("repro_success") and _consecutive_failures < _BREAKER_THRESHOLD:
+            # ── EPE Momentum Anti-Regression ──────────────────────────────
+            if fb.get("exploit_momentum"):
+                cur_ps = fb.get("progress_score", 0.0)
+                prev_ps = _prev_round_state.get("progress_score", 0.0) if _prev_round_state else 0.0
+                suggested = fb.get("suggested_next_action", "DEEP_DIVE")
+                momentum_injection = (
+                    "\n\n"
+                    "╔══════════════════════════════════════════════════════════════╗\n"
+                    f"║  🔵 EPE Momentum Active — exploit chain continuity enforced  ║\n"
+                    "╚══════════════════════════════════════════════════════════════╝\n"
+                    f"[progress_score={cur_ps:.2f} | Δ={cur_ps - prev_ps:+.2f} | action={suggested}]\n"
+                    "Side-effect signals detected — payload is perturbing backend state.\n"
+                    "🛑 ANTI-REGRESSION CONSTRAINT:\n"
+                    "  1. DO NOT restart fuzzing from scratch\n"
+                    "  2. DO NOT pivot to a different vulnerability type\n"
+                    "  3. DO NOT abandon the current injection point/endpoint\n"
+                    "  4. STAY on the current chain and incrementally escalate payload complexity\n"
+                    "  5. Refine: add more stages, tune encoding, or amplify the side-effect\n"
+                )
+                existing = fb.get("feedback_for_planner") or ""
+                fb["feedback_for_planner"] = momentum_injection + "\n" + existing
+                feedback = fb
+                print(f"[coordinator] 🔵 EPE 动量锁定: 禁止路径回退 (score={cur_ps:.2f})")
+
             # ── 未达熔断阈值的普通失败：注入记忆经验辅助决策 ─────────────
             vuln_summary = (
                 confirmed.get("title", "")
@@ -901,8 +1470,14 @@ def run_pipeline(
             continue
 
         if fb.get("should_continue") is False:
-            warn("评估建议终止迭代。")
-            break
+            if iteration < _SUGGEST_ABORT_MIN_ITER:
+                warn(
+                    f"评估建议终止迭代，但迭代次数({iteration}) < 最低阈值({_SUGGEST_ABORT_MIN_ITER})，强制忽略"
+                )
+                fb["should_continue"] = True
+            else:
+                warn("评估建议终止迭代。")
+                break
 
     # ── 迭代循环结束 — 唤醒全局复盘导师 ───────────────────────────
     final_is_success = len(success_log) > 0

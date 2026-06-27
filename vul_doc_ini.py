@@ -18,7 +18,7 @@ def init_vulnerability_database():
     cwe_entries = [
     {
         "id": "CWE-89",
-        "content": "名称: SQL Injection (SQL注入)\n描述: 应用程序在未正确清理外部输入的情况下，将其直接拼接到 SQL 语句中。\n影响: 数据泄露、数据库被篡改、潜在的服务器控制。\n代码表象: 字符串拼接构建的 SQL 查询 (如 `\"SELECT * FROM users WHERE name = '\" + username + \"'\"`)。\n审计策略: 追踪 HTTP 请求参数，查看其是否未经预编译 (Prepared Statements) 或 ORM 参数化绑定就直接传入了数据库执行函数 (如 `cursor.execute`, `jdbcTemplate.query`)。"
+        "content": "CWE-89 SQL Injection (SQL注入) SQLi 数据库注入\n名称: SQL Injection (SQL注入)\n描述: 应用程序在未正确清理外部输入的情况下，将其直接拼接到 SQL 语句中。\n影响: 数据泄露、数据库被篡改、潜在的服务器控制。\n代码表象: 字符串拼接构建的 SQL 查询 (如 `\"SELECT * FROM users WHERE name = '\" + username + \"'\"`)。\n审计策略: 追踪 HTTP 请求参数，查看其是否未经预编译 (Prepared Statements) 或 ORM 参数化绑定就直接传入了数据库执行函数 (如 `cursor.execute`, `jdbcTemplate.query`)。"
     },
     {
         "id": "CWE-79",

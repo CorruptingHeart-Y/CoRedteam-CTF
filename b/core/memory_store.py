@@ -225,6 +225,7 @@ class LayeredMemory:
         self._client = chromadb.PersistentClient(path=str(db_path))
         self._collections: dict[str, Any] = {}
         self._seen_ids: dict[str, set[str]] = {}
+        self._fallback_printed: set[str] = set()
         self._ensure_collections()
 
     def _get_collection(self, name: str):
@@ -753,7 +754,10 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter fallback for: {filter_tags[:8]}...")
         return self.query_tech_payloads(query_text, n_results)
 
     def query_strategies_filtered(
@@ -789,7 +793,10 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter fallback for: {filter_tags[:8]}...")
         return self.query_strategies(query_text, n_results)
 
     def query_patterns_filtered(
@@ -825,7 +832,10 @@ class LayeredMemory:
                     return items
             except Exception:
                 pass
-            print(f"[memory] tag-filter fallback for: {filter_tags}")
+            tags_key = ",".join(sorted(filter_tags))
+            if tags_key not in self._fallback_printed:
+                self._fallback_printed.add(tags_key)
+                print(f"[memory] tag-filter fallback for: {filter_tags[:8]}...")
         return self.query_patterns(query_text, n_results)
 
     def get_stats(self) -> dict[str, int]:

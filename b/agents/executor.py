@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import socket
+import textwrap
 import time
 import uuid
 from pathlib import Path
@@ -357,6 +358,10 @@ class OOBReceiver:
         with self._lock:
             return list(self._hits)
 
+    def get_callbacks(self) -> list[dict]:
+        \"\"\"Backward-compat alias for get_all_hits().\"\"\"
+        return self.get_all_hits()
+
     def stop(self) -> None:
         if self._server:
             self._server.shutdown()
@@ -454,12 +459,90 @@ def _deser(value: Any) -> Any:
 """
 
 # ──────────────────────────────────────────────
+#  Task 6: AST → code inflater
+# ──────────────────────────────────────────────
+
+def _inflate_ast_to_script(step: dict[str, Any]) -> str:
+    """Generate a runnable Python script from structured sdk_calls + imports.
+
+    When Planner outputs declarative AST (imports + sdk_calls) without raw
+    command code, this inflater generates the executable Python.
+    Execution priority (enforced by _run_docker): sdk_calls > code > command.
+    """
+    imports = step.get("imports") or []
+    sdk_calls = step.get("sdk_calls") or []
+
+    # If no sdk_calls, return raw command/code unchanged
+    if not sdk_calls:
+        return step.get("code") or step.get("command", "")
+
+    # Build from sdk_calls
+    lines: list[str] = []
+
+    # Deduplicate imports (wrapper already does "from redteam_sdk import *")
+    # json is already inlined below; don't duplicate
+    seen_imports: set[str] = {"redteam_sdk", "json"}
+    for imp in imports:
+        if imp not in seen_imports:
+            seen_imports.add(imp)
+            lines.append(f"import {imp}")
+
+    # SDK already injected by wrapper, just reference it
+    lines.extend([
+        "",
+        "import json",
+        "# Load prior step context (RW tmp copy has save_context() data; RO copy has base_url)",
+        "try:",
+        "    with open('/workspace/tmp/context.json') as f: _prior_ctx = json.load(f)",
+        "except (FileNotFoundError, json.JSONDecodeError):",
+        "    with open('/workspace/context.json') as f: _prior_ctx = json.load(f)",
+        "target_base = _prior_ctx.get('target_context', {}).get('base_url', '')",
+        "s = HttpClient(target_base)",
+        "",
+    ])
+
+    for call in sdk_calls:
+        if isinstance(call, dict):
+            primitive = call.get("primitive", "")
+            target = call.get("target", "/")
+            body = call.get("body")
+            raw = call.get("raw", b"")
+        else:
+            primitive = str(call)
+            target = "/"
+            body = None
+            raw = b""
+
+        if primitive == "HttpClient.get":
+            lines.append(f'resp = s.get("{target}")')
+            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
+            lines.append('save_context("_last_response_text", resp.text[:2000])')
+            lines.append('save_context("_last_status", resp.status_code)')
+        elif primitive == "HttpClient.post":
+            body_str = json.dumps(body) if body else "{}"
+            lines.append(f'resp = s.post("{target}", json={body_str})')
+            lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
+            lines.append('save_context("_last_response_text", resp.text[:2000])')
+            lines.append('save_context("_last_status", resp.status_code)')
+        elif primitive == "HttpClient.raw_request":
+            raw_val = json.dumps(raw.decode() if isinstance(raw, bytes) else str(raw))
+            lines.append(f'resp = s.raw_request("{target}", {raw_val})')
+            lines.append('print(resp)')
+            lines.append('save_context("_last_raw_response", resp.text[:2000])')
+        elif primitive == "HttpClient.last_response":
+            lines.append('print(f"Last response: {s.last_response}")')
+
+    lines.append("print('STEP_OK')")
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────
 #  物理硬截断（防上下文爆满 / 注意力涣散）
 # ──────────────────────────────────────────────
 
-_HARD_TRUNC_THRESHOLD = 3000
-_HARD_TRUNC_HEAD      = 1000
-_HARD_TRUNC_TAIL      = 1500
+_HARD_TRUNC_THRESHOLD = 8000
+_HARD_TRUNC_HEAD      = 2000
+_HARD_TRUNC_TAIL      = 4000
 
 
 def _hard_truncate(text: str, threshold: int = _HARD_TRUNC_THRESHOLD,
@@ -922,6 +1005,25 @@ class DockerSandbox:
 #  步骤执行
 # ──────────────────────────────────────────────
 
+_HTTP_LOG_RE = re.compile(
+    r"\[HTTP\]\s+(\d{3})\s+(\w+)\s+(\S+?)\s*=>\s*(.*?)(?=\n\[HTTP\]|\nSTEP_OK|\nSTEP_FAIL|\Z)",
+    re.DOTALL,
+)
+
+
+def _extract_http_responses_from_stdout(stdout: str) -> list[dict[str, Any]]:
+    """Parse [HTTP] markers injected by the auto-logging wrapper and extract structured HTTP response data."""
+    responses: list[dict[str, Any]] = []
+    for m in _HTTP_LOG_RE.finditer(stdout):
+        responses.append({
+            "status_code": int(m.group(1)),
+            "method": m.group(2),
+            "url": m.group(3),
+            "response_body": m.group(4)[:500],
+        })
+    return responses
+
+
 def _run_docker(
     step: dict[str, Any],
     sandbox: DockerSandbox,
@@ -931,12 +1033,34 @@ def _run_docker(
     target: "TargetContext | None" = None,
 ) -> tuple[dict[str, Any], dict]:
     stype   = step.get("type")
-    code    = (step.get("command", "") or "").strip()
     step_id = step.get("id", 0)
+
+    # ── Protocol Unification: execution priority ──
+    # sdk_calls > code > command (no fallback mixing)
+    sdk_calls = step.get("sdk_calls") or []
+    if sdk_calls:
+        code = _inflate_ast_to_script(step)
+        print(f"[executor] using AST compiler path step[{step_id}] ({len(code)} chars)")
+    elif step.get("code"):
+        code = step["code"]
+        print(f"[executor] using code field step[{step_id}] ({len(code)} chars)")
+    elif step.get("command"):
+        code = (step["command"] or "").strip()
+        print(f"[executor] using command field step[{step_id}] (LEGACY) ({len(code)} chars)")
+    else:
+        code = ""
+        print(f"[executor] step[{step_id}] no executable payload (no sdk_calls/code/command)")
 
     if stype != "python":
         return {
             "ok": False, "exit_code": -1, "stdout": "", "stderr": f"不支持的 type: {stype}",
+            "duration_sec": 0.0, "execution_mode": "docker",
+        }, {}
+
+    if not code or not code.strip():
+        return {
+            "ok": False, "exit_code": -1, "stdout": "",
+            "stderr": "步骤无可执行代码（sdk_calls/code/command 均为空）",
             "duration_sec": 0.0, "execution_mode": "docker",
         }, {}
 
@@ -951,12 +1075,38 @@ def _run_docker(
 
     script_name = f"step_{step_id}.py"
     script_path = exec_workspace / script_name
+    import textwrap
+    indented_code = textwrap.indent(code, "    ")
     wrapped_code = (
-        "import sys\n"
+        "import sys, traceback, json as _json\n"
         "sys.path.insert(0, '/workspace')\n"
-        "from redteam_sdk import *\n\n"
-        + code
-        + "\n\ntry:\n    ensure_session_persisted()\nexcept Exception:\n    pass\n"
+        "from redteam_sdk import *\n"
+        "# ── Cross-step context restore (auto-injected by Executor) ──\n"
+        "_prior = load_all_context()\n"
+        "# ── HTTP auto-logging instrumentation (injected by Executor) ──\n"
+        "_hc_req_orig = HttpClient.request\n"
+        "def _hc_req(self, method, url, *a, **kw):\n"
+        "    try:\n"
+        "        resp = _hc_req_orig(self, method, url, *a, **kw)\n"
+        "        body = (resp.text or '')[:500]\n"
+        "        print(f'[HTTP] {resp.status_code} {method} {url} => {body}')\n"
+        "        return resp\n"
+        "    except Exception as _e:\n"
+        "        print(f'[HTTP_ERR] {method} {url}: {_e}')\n"
+        "        raise\n"
+        "HttpClient.request = _hc_req\n"
+        "# ── User script ──\n"
+        "try:\n"
+        + indented_code +
+        "\n    print('STEP_OK')\n"
+        "except Exception as _exec_e:\n"
+        "    _script_err = _json.dumps({'error': str(_exec_e), 'traceback': traceback.format_exc()}, ensure_ascii=False)\n"
+        "    print('STEP_FAIL: ' + _script_err)\n"
+        "finally:\n"
+        "    try:\n"
+        "        ensure_session_persisted()\n"
+        "    except Exception:\n"
+        "        pass\n"
     )
     script_path.write_text(wrapped_code, encoding="utf-8")
 
@@ -1140,6 +1290,7 @@ def run_executor(
 
         # 从 stdout 中提取 ###CHAIN_OUTPUT###
         stdout = result.get("stdout", "")
+        stderr = result.get("stderr", "")
         fallback_chain: dict = {}
         marker = "###CHAIN_OUTPUT###"
         if stdout and marker in stdout:
@@ -1163,6 +1314,17 @@ def run_executor(
                     except json.JSONDecodeError:
                         pass
 
+        # 从 stdout 中提取 HTTP 响应记录
+        http_responses = _extract_http_responses_from_stdout(stdout)
+
+        # 将 stdout / stderr / HTTP 响应合并进 chain_output，使 Evaluator/Planner 能读取真实输出
+        if stdout:
+            step_chain_output["_stdout"] = stdout[-3000:]
+        if stderr:
+            step_chain_output["_stderr"] = stderr[-1000:]
+        if http_responses:
+            step_chain_output["_http_responses"] = http_responses
+
         if step_chain_output:
             print(
                 f"[executor] step {st.get('id')} chain_output: "
@@ -1175,6 +1337,7 @@ def run_executor(
             "purpose": st.get("purpose"),
             "result":  result,
             "chain_output": step_chain_output,
+            "http_responses": http_responses,
         })
 
     fail_results = [r for r in step_results if not (r.get("result") or {}).get("ok")]

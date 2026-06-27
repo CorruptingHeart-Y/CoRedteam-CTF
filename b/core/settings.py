@@ -29,7 +29,6 @@ class Settings:
     docker_memory_limit: str
     docker_cpu_quota: int
     json_mode: bool
-    max_runs: int
 
 
 def get_settings() -> Settings:
@@ -53,5 +52,4 @@ def get_settings() -> Settings:
         docker_memory_limit=os.getenv("CO_REDTEAM_DOCKER_MEMORY", "512m"),
         docker_cpu_quota=int(os.getenv("CO_REDTEAM_DOCKER_CPU_QUOTA", "100000")),
         json_mode=json_mode,
-        max_runs=int(os.getenv("CO_REDTEAM_MAX_RUNS", "3")),
     )
