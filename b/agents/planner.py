@@ -31,7 +31,7 @@ from control.anti_regression import PayloadEvolutionEngine, AntiRegressionContro
 # 每一层在物理字符级别被硬截断，不再只是 "打印预算"；总 payload 死锁在 ~4000 chars。
 MEMORY_BUDGET: dict[str, int] = {
     "runtime_constraints": 800,    # L1 Manifest — 必须保持紧凑
-    "hard_constraints": 600,       # L2 Hard Constraints & Bans
+    "hard_constraints": 800,       # L2 Hard Constraints & Bans (includes no-urllib rules)
     "sdk_contract": 500,           # L3 SDK API Contract
     "verified_facts": 800,         # L4 Verified Facts + Memory context
     "trajectory_state": 300,       # L5 Dehydrated trajectory (compact JSON)
@@ -42,31 +42,174 @@ MEMORY_BUDGET: dict[str, int] = {
 _FINAL_PAYLOAD_HARD_CAP = 5000
 
 
-def _physical_truncate(content: str, limit: int) -> str:
-    """Hard character-level truncation — no head/tail, straight slice.
+def _enforce_section_budget(content: str, limit: int, section: str) -> tuple[str, int]:
+    """Enforce per-section budget with section-aware compaction.
 
-    Keeps the beginning of the content up to *limit* characters,
-    appending a compact truncation marker.
+    Returns (content, dropped_item_count).  Never uses text[:N] mid-character
+    slicing — only whole-entry deletion or fixed-field re-rendering.
+
+    Section types:
+      - "critical": L1/L2/L3 — must fit; single entry > limit raises ValueError.
+      - "memory": L4 — drops whole entries; single oversized → fixed summary.
+      - "trajectory": L5 — drops whole entries; single oversized → fixed summary.
+      - "user_goal": L6 — drops whole sections; oversized → fixed-field re-render.
+
+    INVARIANT: len(result) <= limit (required for budget-loop convergence).
     """
+    if not content or len(content) <= limit:
+        return content, 0
+    if section == "critical":
+        raise ValueError(
+            f"[planner] FATAL: critical section ({section}) exceeds budget "
+            f"({len(content)} > {limit}). This is a hard construction error."
+        )
+    if section == "user_goal":
+        return _compact_user_goal(content, limit)
+    # memory / trajectory: split into entries, keep first N that fit
+    entries = re.split(r'\n(?:\n|(?=═══|╔|──))', content)
+    kept: list[str] = []
+    kept_len = 0  # tracks actual joined length (accounting for "\n\n" join)
+    dropped = 0
+    for entry in entries:
+        if not entry and not kept:
+            continue  # skip leading blank
+        sep = len("\n\n") if kept else 0
+        entry_len = len(entry) + sep
+        if kept_len + entry_len <= limit:
+            kept.append(entry)
+            kept_len += entry_len
+        else:
+            dropped += 1
+    if not kept:
+        # Single oversized entry → compact to fixed summary fields
+        return _compact_memory_entry(content, limit)
+    # Note: per-section dropped count logged once at end of budget loop, not here
+    result = "\n\n".join(kept)
+    # Hard invariant: result must fit within limit
+    if len(result) > limit:
+        # Trim kept list until it fits
+        while kept and len("\n\n".join(kept)) > limit:
+            kept.pop()
+            dropped += 1
+        result = "\n\n".join(kept)
+    return result, dropped
+
+
+def _compact_memory_entry(content: str, limit: int) -> tuple[str, int]:
+    """Single oversized memory entry: keep only fixed summary fields.
+
+    INVARIANTS (required for budget-loop convergence):
+      1. len(result) <= limit
+      2. len(result) < len(content) when content > limit
+    Violating either invariant causes infinite re-compaction of the same entry.
+    """
+    if limit <= 0:
+        return "", 1
     if len(content) <= limit:
-        return content
-    # Keep first (limit - 50) chars to make room for the marker
-    keep = limit - 50
-    if keep <= 0:
-        keep = limit // 2
-    return content[:keep] + f"\n...[TRUNCATED {len(content)}→{limit} chars]..."
+        return content, 0
+
+    kept_lines: list[str] = []
+    budget_remaining = limit - 10  # safety margin for join overhead
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if len(stripped) < 4:
+            continue
+        if any(kw in stripped for kw in ("CWE", "payload", "command", "pattern",
+                                          "strategy", "exploit", "inject", "name",
+                                          "type", "id", "title", "error", "root_cause")):
+            # Truncate line to remaining budget, not a fixed 200
+            max_line = max(min(len(stripped), budget_remaining - sum(len(l) + 1 for l in kept_lines)), 10)
+            if max_line > 10:
+                kept_lines.append(stripped[:max_line])
+        if sum(len(l) + 1 for l in kept_lines) >= budget_remaining:
+            break
+
+    if kept_lines:
+        result = "\n".join(kept_lines)
+        # Drop complete lines from end if still over budget — never raw-slice
+        while len(result) > limit and kept_lines:
+            kept_lines.pop()
+            result = "\n".join(kept_lines)
+        if not kept_lines:
+            result = "[Memory entry omitted: exceeded budget]"
+    else:
+        result = "[Memory entry omitted: exceeded budget]"
+
+    # Final safeguard: marker must fit; if not, return empty
+    if len(result) > limit:
+        result = ""
+    return result, 1
+
+
+def _compact_user_goal(content: str, limit: int) -> tuple[str, int]:
+    """Re-render L6 as fixed-field summary: only contract-critical lines.
+
+    INVARIANTS:
+      1. len(result) <= limit
+      2. len(result) < len(content) when content > limit
+    """
+    if limit <= 0:
+        return "", 1
+    if len(content) <= limit:
+        return content, 0
+
+    critical_keywords = (
+        "target", "endpoint", "/", "text", "query", "form", "body_format",
+        "sdk_calls", "HttpClient", "imports", "data=", "json=", "params=",
+        "parameter", "contract", "JSON", "AST", "primitive", "body",
+        "target_base", "base_url", "CWE-94", "Velocity", "SSTI",
+    )
+    kept_lines: list[str] = []
+    budget_remaining = limit - 10
+    for line in content.split("\n"):
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if any(kw in line_stripped for kw in critical_keywords):
+            max_line = max(min(len(line_stripped), budget_remaining - sum(len(l) + 1 for l in kept_lines)), 10)
+            if max_line > 10:
+                kept_lines.append(line_stripped[:max_line])
+        if sum(len(l) + 1 for l in kept_lines) >= budget_remaining:
+            break
+    if not kept_lines:
+        # No contract-critical lines found → fixed minimal schema summary
+        result = (
+            "sdk_calls:[{primitive:HttpClient,target:/,query|body,body_format:form|json}];"
+            "imports:[json,re];HttpClient handles encoding;no urllib/requests"
+        )
+    else:
+        result = "\n".join(kept_lines)
+        # Drop complete lines from end if over budget — never raw-slice
+        while len(result) > limit and kept_lines:
+            kept_lines.pop()
+            result = "\n".join(kept_lines)
+    if len(result) > limit:
+        # If even one complete line doesn't fit, use the fixed minimal summary
+        result = (
+            "sdk_calls:[{primitive:HttpClient,target:/,query|body,body_format:form|json}];"
+            "imports:[json,re];HttpClient handles encoding;no urllib/requests"
+        )
+    if len(result) > limit:
+        result = ""  # absolute last resort
+    return result, 1 if len(result) < len(content) else 0
 
 
 def _apply_memory_budget(section_id: str, content: str) -> str:
-    """Physically enforce the per-layer character budget defined by MEMORY_BUDGET.
-
-    Uses hard slicing (not head/tail) to guarantee deterministic character limits.
-    If *section_id* is not registered, passes through unchanged (caller must handle).
-    """
+    """Enforce per-layer budget via _enforce_section_budget (discards dropped count)."""
     limit = MEMORY_BUDGET.get(section_id)
     if limit is None:
         return content
-    return _physical_truncate(content, limit)
+    if section_id == "runtime_constraints" or section_id == "hard_constraints" or section_id == "sdk_contract":
+        trimmed, _ = _enforce_section_budget(content, limit, "critical")
+    elif section_id == "verified_facts":
+        trimmed, _ = _enforce_section_budget(content, limit, "memory")
+    elif section_id == "trajectory_state":
+        trimmed, _ = _enforce_section_budget(content, limit, "trajectory")
+    elif section_id == "user_goal":
+        trimmed, _ = _enforce_section_budget(content, limit, "user_goal")
+    else:
+        trimmed, _ = _enforce_section_budget(content, limit, "memory")
+    return trimmed
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -117,16 +260,25 @@ def _build_runtime_manifest_block() -> str:
 
 
 def _build_hard_constraints_block() -> str:
-    """[Layer 2] Hard Constraints — 绝对禁令（不可违反的物理约束）。"""
+    """[Layer 2] Hard Constraints — 绝对禁令（不可违反的物理约束）。
+
+    L2 is a static critical zone — it will NEVER be truncated under budget pressure.
+    All rules here are guaranteed to survive into the final prompt.
+    """
     return (
-        "HARD CONSTRAINTS (绝对禁令)\n"
-        "  ❌ import os, subprocess, socket, pickle, ctypes, requests, urllib3\n"
+        "HARD CONSTRAINTS (绝对禁令 — 不可截断)\n"
+        "  ❌ import os, subprocess, socket, pickle, ctypes, requests, urllib3, urllib\n"
+        "  ❌ import urllib.parse — HttpClient handles all encoding; do not import\n"
         "  ❌ os.system() / subprocess.run() / __import__() — 文本也被拦截\n"
         "  ❌ shell 禁止 bash/sh/zsh；❌ curl|sh, wget|sh\n"
         "  ❌ 单行分号串联 (SyntaxError)\n"
-        "  ✅ import: json, re, base64, hashlib, hmac, struct, urllib.parse, http.cookies\n"
+        "  ✅ import: json, re, base64, hashlib, hmac, struct, http.cookies\n"
         "  ✅ HTTP 唯一通道: redteam_sdk.HttpClient\n"
-        "  ✅ OOB 唯一通道: redteam_sdk.OOBReceiver"
+        "  ✅ OOB 唯一通道: redteam_sdk.OOBReceiver\n"
+        "  HttpClient handles query and form encoding.\n"
+        "  Do not import urllib, urllib.parse, requests, or raw networking libraries.\n"
+        "  For query parameters use sdk_call.query.\n"
+        "  For form parameters use sdk_call.body with body_format=\"form\"."
     )
 
 
@@ -894,8 +1046,27 @@ def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapte
 顶层: version(1), plan_id, vuln_summary, rationale, chain_design, steps(list), history_state, primitive_context
 每step必须声明: id(int), status("PLANNED"), type("python"|"shell"), purpose, expected_outcome, depends_on, on_failure("BLOCK_AND_DEBUG"|"SKIP"), why_this_step_advances_state, why_this_payload_is_a_mutation, why_this_is_not_regression, target_primitive, why_this_primitive_advances_chain
 每step必须声明结构化数组（Validator 静态期校验，不通过则 valid:false 拒绝）：
-  imports: [str] — 此步骤所使用的所有 Python import 模块（如 ["json","re","redteam_sdk"]），严禁包含 safe_modules 之外的模块！
-  sdk_calls: [str] — 此步骤调用的 SDK 原语（如 ["HttpClient.get","HttpClient.post"]），必须来自 Manifest sdk_primitives，严禁空数组绕过！
+  imports: [str]
+  sdk_calls: [dict] — 结构化请求声明，支持两种形式：
+    旧字符串形式（兼容，但不含参数契约）: ["HttpClient.get", "HttpClient.post"]
+    新字典形式（推荐，必须包含参数）:
+      {"primitive": "HttpClient.get", "target": "/", "query": {"text": "<value>"}}
+      {"primitive": "HttpClient.post", "target": "/", "body": {"text": "<value>"}, "body_format": "form"}
+      {"primitive": "HttpClient.post", "target": "/", "body": {"key": "<value>"}, "body_format": "json"}
+  body_format 规则:
+    "form" → request body 以 application/x-www-form-urlencoded 发送（等价于 requests.post(data={...})）
+    "json" → request body 以 application/json 发送（等价于 requests.post(json={...})）
+    省略 body_format 时默认为 "form"
+  ⚠️ CRITICAL — Request Contract 保真:
+    当 confirmed_vuln 指明参数位置为 query/form body/header 时，必须使用对应的结构化字段。
+    例如 confirmed_vuln 说 "@RequestParam(name='text')" → 必须使用 body_format="form" 且 body 含 "text" 键。
+    禁止 body=None 而声称已发送payload——这将导致计划被 Gate 拒绝。
+  🚫 IMPORT 禁令 — HttpClient 负责所有编码:
+    HttpClient 已处理 query/form 参数编码、URL 构造、session 管理。
+    不得导入 urllib、urllib.parse、urllib3、requests 或其他原生网络/编码库。
+    需要 query 参数时使用 sdk_call.query 字段；
+    需要 form body 时使用 sdk_call.body + body_format="form"；
+    需要访问响应内容时使用 save_context / HttpClient.last_response。
 【协议统一强制规则 — AST 纯模式】：
   当 sdk_calls 非空时，系统进入 AST 纯模式。在此模式下：
   ❌ 禁止输出 command 字段（包括占位符如 "command": "placeholder"、"command": ""）
@@ -911,11 +1082,11 @@ history_state: {tried_payloads:[], failed_reasons:[], consecutive_failures_per_c
     # ── 追加 CWE 模板和公共规则（但限制体积）──
     cwe_templates = _build_cwe_templates(vulns, confirmed)
     if cwe_templates:
-        core += f"\n\n【CWE模板】\n{_physical_truncate(cwe_templates, 600)}"
+        core += f"\n\n【CWE模板】\n{_enforce_section_budget(cwe_templates, 600, 'memory')[0]}"
 
-    core += f"\n\n{_COMMON_RULES[:800]}"
+    core += f"\n\n{_enforce_section_budget(_COMMON_RULES, 800, 'memory')[0]}"
     if challenge_rules:
-        core += f"\n{challenge_rules[:500]}"
+        core += f"\n{_enforce_section_budget(challenge_rules, 500, 'memory')[0]}"
 
     return core
 
@@ -1412,12 +1583,13 @@ def _build_memory_context(
 
     # ── 组装最终记忆块 ──
     body = "\n".join(context_parts) if context_parts else ""
-    # 硬截断：memory_block 是增量注入到 system prompt 的，不是核心攻击逻辑，
-    # 一旦超过 5000 字符就说明 tag-filter 大面积 fallback 导致噪音涌入，必须物理截断。
+    # Whole-entry budget: drop entries when memory body spills.
+    # No character slicing — only complete entry removal.
     _MAX_MEM_BODY = 5000
     if len(body) > _MAX_MEM_BODY:
-        body = body[:_MAX_MEM_BODY // 3] + f"\n...[TRUNCATED memory body {len(body)} → {_MAX_MEM_BODY} chars]...\n" + body[-_MAX_MEM_BODY * 2 // 3:]
-        print(f"[planner] ⚠️ memory_body 超限 ({len(body)} > {_MAX_MEM_BODY})，已硬截断")
+        body, mem_dropped = _enforce_section_budget(body, _MAX_MEM_BODY, "memory")
+        print(f"[planner] [MEMORY] memory_body trimmed ({len(body)}/{_MAX_MEM_BODY}), "
+              f"dropped={mem_dropped}")
 
     filter_note = ""
     if target_tags:
@@ -1495,6 +1667,9 @@ def _build_forbidden_techniques_block(feedback: dict[str, Any]) -> str:
     来源 1：Evaluator 的 memory_patch.strategy.add_failures（历史证伪的技术）
     来源 2：Validator 的 rejection errors（本轮的 AST/策略拒绝记录）
     返回一个高可见度的禁止块，直接拼入 system prompt。
+
+    关键不变式：最新一次 Validator 拒绝以固定字段摘要置于块首，
+    保证在预算压缩时不被删除。更旧的失败项可按条目删除。
     """
     memory_patch = feedback.get("memory_patch", {})
     strategy_patch = memory_patch.get("strategy", {})
@@ -1517,32 +1692,54 @@ def _build_forbidden_techniques_block(feedback: dict[str, Any]) -> str:
     if not failures:
         return ""
 
+    # ── 最新一次拒绝的固定字段摘要（块首，不可删除）──
+    latest = failures[-1]  # last entry = most recent
+    latest_error = (latest.get("error") or "unknown").strip()
+    latest_root = (latest.get("root_cause") or "").strip()
+    if len(latest_root) > 300:
+        latest_root = latest_root[:300] + "..."
+
+    # Build a compact but complete summary — always fits within 400 chars
+    latest_summary_lines = [
+        "Latest validator rejection:",
+        f"  {latest_error}: {latest_root}",
+        "  Use HttpClient query/body; do not import urllib.",
+    ]
+    latest_summary = "\n".join(latest_summary_lines)
+
     lines: list[str] = []
     lines.append("╔══════════════════════════════════════════════════════════════╗")
-    lines.append("║  🔴 失败指纹黑名单 — 绝对禁止重用以下已证伪的技术！      ║")
+    lines.append("║  🔴 RETRY CONSTRAINTS — 最新拒绝摘要（不可删除）         ║")
     lines.append("╚══════════════════════════════════════════════════════════════╝")
     lines.append("")
-    lines.append("以下技术在上轮执行中已被证伪。你在本轮【绝对禁止】以任何形式复现：")
+    lines.append(latest_summary)
     lines.append("")
 
-    for i, f in enumerate(failures, 1):
-        step_id = f.get("step_id", "?")
-        error = f.get("error", "未知错误")
-        root_cause = f.get("root_cause", "")
-        lines.append(f"  🚫 禁止项 #{i}（上轮 step {step_id} — {error}）")
-        if root_cause:
-            lines.append(f"     根因: {root_cause}")
-        payload_text = f.get("payload", "")
-        if payload_text:
-            lines.append(f"     已证伪载荷: {payload_text[:200]}")
+    # ── 更旧失败项（可按完整条目删除以节省预算）──
+    older_count = len(failures) - 1
+    if older_count > 0:
+        lines.append("── Older failures (may be dropped under budget pressure) ──")
+        lines.append("以下技术在上轮执行中已被证伪。你在本轮【绝对禁止】以任何形式复现：")
+        lines.append("")
 
-    lines.append("")
-    lines.append("【强制反省要求】：")
-    lines.append("  1. 在 rationale 中逐项列出上述禁止项，并说明本轮如何避免")
-    lines.append("  2. 如果你在本轮生成了包含上述载荷的 step，你的计划将被直接拒绝")
-    lines.append("  3. 如果某个禁止项是本轮成功的关键，你必须设计全新的替代方案")
-    lines.append("  4. 若前序步骤（如获取 token）本身未完成，严禁构造依赖它的后续步骤")
-    lines.append("")
+        for i, f in enumerate(failures[:-1], 1):  # exclude latest (already summarized)
+            step_id = f.get("step_id", "?")
+            error = f.get("error", "未知错误")
+            root_cause = f.get("root_cause", "")
+            lines.append(f"  🚫 禁止项 #{i}（上轮 step {step_id} — {error}）")
+            if root_cause:
+                lines.append(f"     根因: {root_cause[:300]}")
+            payload_text = f.get("payload", "")
+            if payload_text:
+                lines.append(f"     已证伪载荷: {payload_text[:200]}")
+
+        lines.append("")
+        lines.append("【强制反省要求】：")
+        lines.append("  1. 在 rationale 中逐项列出上述禁止项，并说明本轮如何避免")
+        lines.append("  2. 如果你在本轮生成了包含上述载荷的 step，你的计划将被直接拒绝")
+        lines.append("  3. 如果某个禁止项是本轮成功的关键，你必须设计全新的替代方案")
+        lines.append("  4. 若前序步骤（如获取 token）本身未完成，严禁构造依赖它的后续步骤")
+        lines.append("")
 
     # Also extract bypass-level failures from patterns
     pattern_patch = memory_patch.get("pattern", {})
@@ -1679,6 +1876,79 @@ def _build_primitive_context(confirmed: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_feedback_block(feedback: dict[str, Any]) -> str:
+    fb_parts: list[str] = [
+        f"confidence={feedback.get('confidence', 0)} | repro_success={feedback.get('repro_success', False)}",
+    ]
+    fb_state = feedback.get("current_exploit_state", "")
+    fb_milestones = feedback.get("milestones_achieved", [])
+    fb_blocker = feedback.get("state_transition_blocker", "")
+    fb_next_action = feedback.get("next_required_action", "")
+    if fb_state:
+        fb_parts.append(f"当前攻击状态: {fb_state}")
+    if fb_milestones:
+        fb_parts.append(f"已达成里程碑: {'; '.join(fb_milestones[:3])}")
+    if fb_blocker:
+        fb_parts.append(f"状态阻塞点: {fb_blocker}")
+    if fb_next_action:
+        fb_parts.append(f"下一步: {fb_next_action}")
+    fb_summary = feedback.get("summary", "")
+    if fb_summary:
+        fb_parts.append(f"summary: {fb_summary[:200]}")
+    fb_planner = feedback.get("feedback_for_planner", "")
+    if fb_planner:
+        fb_parts.append(f"feedback: {fb_planner[:500]}")
+    fb_errors = feedback.get("errors", [])
+    if isinstance(fb_errors, list) and fb_errors:
+        fb_parts.append(f"errors: {'; '.join(str(e)[:100] for e in fb_errors[:3])}")
+
+    prior_history = feedback.get("prior_history_state")
+    if prior_history and isinstance(prior_history, dict):
+        tried = prior_history.get("tried_payloads", [])
+        failed = prior_history.get("failed_reasons", [])
+        cat_fails = prior_history.get("consecutive_failures_per_category", {})
+        history_lines = []
+        if tried:
+            history_lines.append(f"  已尝试Payload（严禁重复!）: {', '.join(tried[:5])}")
+        if failed:
+            history_lines.append(f"  历史失败原因: {'; '.join(failed[:3])}")
+        if cat_fails:
+            cat_str = ", ".join(f"{k}={v}次" for k, v in cat_fails.items())
+            history_lines.append(f"  分类失败计数: {cat_str}")
+            over_threshold = [k for k, v in cat_fails.items() if v >= 3]
+            if over_threshold:
+                history_lines.append(f"  以下路径已达失败上限，强制切换: {', '.join(over_threshold)}")
+        if history_lines:
+            fb_parts.append("history_state:\n" + "\n".join(history_lines))
+
+    last_exec_raw = feedback.get("last_execution_raw", {})
+    raw_steps = last_exec_raw.get("steps", [])
+    if raw_steps:
+        raw_lines = ["【上一轮执行输出 trace】"]
+        for s in raw_steps[:3]:
+            sid = s.get("step_id", "?")
+            ok = s.get("ok", False)
+            ec = s.get("exit_code", 0)
+            st = str(s.get("stdout_tail", "") or "")[:200]
+            se = str(s.get("stderr_tail", "") or "")[:200]
+            exc = str(s.get("exception_snippet", "") or "")[:200]
+            raw_lines.append(f"  step[{sid}] {'OK' if ok else 'FAIL'} (exit={ec}): stdout={st} stderr={se}")
+            if exc:
+                raw_lines.append(f"    exception={exc}")
+            for h in (s.get("http_responses") or [])[:1]:
+                raw_lines.append(
+                    f"    HTTP {h.get('status_code')} {h.get('method')} "
+                    f"{h.get('url', '')}: {(str(h.get('response_body', '') or '') or '')[:150]}"
+                )
+        fb_parts.append("\n".join(raw_lines))
+
+    return (
+        "\n\n【上一轮执行反馈 — 必须阅读并修正！】\n"
+        + "\n".join(f"  • {p}" for p in fb_parts)
+        + "\n\n请根据以上反馈修正攻击计划。必须优先考虑当前攻击状态和状态转换阻塞点。"
+    )
+
+
 def run_planner(
     settings: Settings,
     memory: LayeredMemory,
@@ -1744,14 +2014,17 @@ def run_planner(
     # ── L1: Runtime Manifest (absolute head — zero hallucination) ──
     l1 = _apply_memory_budget("runtime_constraints", _build_runtime_manifest_block())
 
-    # ── L2: Hard Constraints (bans + forbidden techniques blacklist) ──
-    l2 = _build_hard_constraints_block()
+    # ── L2: Hard Constraints (static only — Manifest/SDK bans, immutable) ──
+    l2 = _apply_memory_budget("hard_constraints", _build_hard_constraints_block())
+
+    # ── L2b: Retry Constraints (dynamic — Validator rejections, failure blacklist) ──
+    # NOT critical: can be compacted or have old items dropped without fatal error.
+    _retry_block = ""
     if feedback:
         forbidden_block = _build_forbidden_techniques_block(feedback)
         if forbidden_block:
-            l2 = forbidden_block + "\n\n" + l2
-            print(f"[planner] 失败指纹黑名单已合并到 L2 硬约束")
-    l2 = _apply_memory_budget("hard_constraints", l2)
+            _retry_block = _enforce_section_budget(forbidden_block, 700, "memory")[0]
+            print(f"[planner] 失败指纹黑名单独立为 retry_constraints ({len(_retry_block)} chars)")
 
     # ── L3: SDK API Contract ──
     l3 = _apply_memory_budget("sdk_contract", _build_sdk_contract_block())
@@ -1761,15 +2034,15 @@ def run_planner(
 
     primitive_context = _build_primitive_context(confirmed)
     if primitive_context:
-        l4_parts.append(_physical_truncate(primitive_context, 500))
+        l4_parts.append(_enforce_section_budget(primitive_context, 500, "memory")[0])
 
     verif = get_verification()
     verif_context = verif.build_planner_context()
     if verif_context and verif.get_stats()["facts_count"] > 0:
-        l4_parts.append(_physical_truncate(verif_context, 300))
+        l4_parts.append(_enforce_section_budget(verif_context, 300, "memory")[0])
 
     if memory_context:
-        l4_parts.append(_physical_truncate(memory_context, 400))
+        l4_parts.append(_enforce_section_budget(memory_context, 400, "memory")[0])
 
     l4 = _apply_memory_budget("verified_facts", "\n\n".join(l4_parts)) if l4_parts else ""
 
@@ -1778,110 +2051,218 @@ def run_planner(
     traj_context = _build_trajectory_context(traj)
     l5 = _apply_memory_budget("trajectory_state", traj_context) if traj_context else ""
 
-    # ── L6: User Goal (absolute tail — dense extract, ~2500 char budget) ──
-    l6 = _apply_memory_budget("user_goal", core_logic)
+    # ── L6: User Goal (never mid-text sliced — compacted by section if needed) ──
+    l6 = core_logic
 
-    # Strict order assembly: L1→L2→L3→L4→L5→L6
-    system_prompt_with_memory = "\n\n".join(
-        p for p in [l1, l2, l3, l4, l5, l6] if p
-    )
+    # ── Explicit layer ordering: L1 → L2(static) → RETRY(dynamic) → L3 → L4 → L5 → L6 ──
+    _retry_key = "RETRY"
+    _layers: dict[str, str] = {}
+    _layers["L1"] = l1
+    _layers["L2"] = l2
+    if _retry_block:
+        _layers[_retry_key] = _retry_block
+    _layers["L3"] = l3
+    _layers["L4"] = l4
+    _layers["L5"] = l5
+    _layers["L6"] = l6
+    # Drop priority: RETRY first (compact older entries, keep latest summary), then L4, L5, compact L6
+    _drop_order = [_retry_key, "L4", "L5", "L6"]
+    _drop_idx = 0
 
-    # ── 双保险：物理硬截断到 _FINAL_PAYLOAD_HARD_CAP ──
-    if len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
-        system_prompt_with_memory = _physical_truncate(system_prompt_with_memory, _FINAL_PAYLOAD_HARD_CAP)
-        print(f"[planner] ⚠️ 双保险触发！total > {_FINAL_PAYLOAD_HARD_CAP}，已强制物理截断")
+    def _assemble() -> str:
+        return "\n\n".join(v for v in _layers.values() if v)
 
-    print(
-        f"[planner] 内存预算: L1={len(l1)} L2={len(l2)} L3={len(l3)} "
-        f"L4={len(l4)} L5={len(l5)} L6={len(l6)} total={len(system_prompt_with_memory)}"
-    )
+    system_prompt_with_memory = _assemble()
 
+    # ── Strict budget loop: drop whole entries until within HARD_LIMIT ──
+    # Progress protection: max iterations + monotonic-length guard prevent
+    # infinite re-compaction when _compact_memory_entry returns non-shrinking output.
+    _MAX_BUDGET_ITERS = 32
+    _budget_iter = 0
+    _budget_diag: dict[str, dict[str, int]] = {}  # aggregated diagnostics per layer
+    while len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
+        _budget_iter += 1
+        if _budget_iter > _MAX_BUDGET_ITERS:
+            raise RuntimeError(
+                f"[planner] FATAL: budget loop exceeded {_MAX_BUDGET_ITERS} iterations "
+                f"without convergence (final_len={len(system_prompt_with_memory)} > "
+                f"HARD_LIMIT={_FINAL_PAYLOAD_HARD_CAP}). This is a construction bug."
+            )
+
+        before_total = len(system_prompt_with_memory)
+
+        if _drop_idx >= len(_drop_order):
+            # All layers dropped/compacted — force-compact L6 as last resort
+            l6_compacted, _ = _enforce_section_budget(
+                _layers["L6"], _FINAL_PAYLOAD_HARD_CAP - len(l1) - len(l2) - len(l3) - 10,
+                "user_goal",
+            )
+            _layers["L6"] = l6_compacted
+            _layers["L4"] = ""
+            _layers["L5"] = ""
+            system_prompt_with_memory = _assemble()
+            break
+
+        layer_key = _drop_order[_drop_idx]
+        layer_content = _layers.get(layer_key, "")
+        if not layer_content:
+            _drop_idx += 1
+            continue
+
+        before_layer = len(layer_content)
+        made_progress = False
+
+        # Drop entries from this layer
+        if layer_key == _retry_key:
+            target_limit = max(len(layer_content) // 2, 200)
+            trimmed, dropped = _enforce_section_budget(layer_content, target_limit, "memory")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                _layers[layer_key] = trimmed
+                made_progress = True
+            else:
+                # No reduction — keep latest summary only or drop entirely
+                parts = layer_content.split("\n── Older")
+                if len(parts) >= 2 and len(parts[0]) < before_layer:
+                    _layers[layer_key] = parts[0]
+                    after_layer = len(parts[0])
+                    made_progress = after_layer < before_layer
+                else:
+                    _layers[layer_key] = ""
+                    after_layer = 0
+                    _drop_idx += 1
+                    made_progress = True
+            _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
+            _budget_diag[layer_key]["passes"] += 1
+            _budget_diag[layer_key]["rendered"] = after_layer
+        elif layer_key in ("L4", "L5"):
+            section_type = "memory" if layer_key == "L4" else "trajectory"
+            target_limit = max(len(layer_content) // 2, 100)
+            trimmed, dropped = _enforce_section_budget(layer_content, target_limit, section_type)
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                _layers[layer_key] = trimmed
+                made_progress = True
+            else:
+                # No reduction — drop entirely
+                _layers[layer_key] = ""
+                after_layer = 0
+                _drop_idx += 1
+                made_progress = True
+            _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
+            _budget_diag[layer_key]["passes"] += 1
+            _budget_diag[layer_key]["rendered"] = after_layer
+        elif layer_key == "L6":
+            target_limit = max(len(layer_content) * 3 // 4, 500)
+            trimmed, _ = _enforce_section_budget(layer_content, target_limit, "user_goal")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                _layers[layer_key] = trimmed
+                made_progress = True
+            else:
+                _drop_idx += 1
+            _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
+            _budget_diag[layer_key]["passes"] += 1
+            _budget_diag[layer_key]["rendered"] = after_layer
+
+        system_prompt_with_memory = _assemble()
+        after_total = len(system_prompt_with_memory)
+
+        # Monotonic-length guard: if total didn't shrink AND no layer progress, force advance
+        if after_total >= before_total and not made_progress:
+            # Force-drop current layer and advance
+            if _layers.get(layer_key):
+                _layers[layer_key] = ""
+            _drop_idx += 1
+            system_prompt_with_memory = _assemble()
+
+    # ── Aggregated budget diagnostic (at most one line per compacted section) ──
+    if _budget_diag:
+        diag_parts = []
+        for lk in ("RETRY", "L4", "L5", "L6"):
+            d = _budget_diag.get(lk)
+            if d and d["passes"] > 0:
+                diag_parts.append(
+                    f"{lk} orig={d['original']}→{d['rendered']} passes={d['passes']}"
+                )
+        if diag_parts:
+            print(f"[planner][budget] compacted: " + " | ".join(diag_parts)
+                  + f" | total={len(system_prompt_with_memory)}/{_FINAL_PAYLOAD_HARD_CAP}")
+
+    # ── Append feedback, then re-enforce ──
     if feedback:
-        fb_planner = feedback.get("feedback_for_planner", "")
-        fb_summary = feedback.get("summary", "")
-        fb_confidence = feedback.get("confidence", 0)
-        fb_success = feedback.get("repro_success", False)
-        fb_errors = feedback.get("errors", []) if isinstance(feedback.get("errors"), list) else []
-        fb_parts = [
-            f"confidence={fb_confidence} | repro_success={fb_success}",
-        ]
-        # 🔑 攻击状态机字段 — 最高优先级展示，Planner 必须据此决定本轮策略
-        fb_state = feedback.get("current_exploit_state", "")
-        fb_milestones = feedback.get("milestones_achieved", [])
-        fb_blocker = feedback.get("state_transition_blocker", "")
-        fb_next_action = feedback.get("next_required_action", "")
-        if fb_state:
-            fb_parts.append(f"当前攻击状态: {fb_state}")
-        if fb_milestones:
-            fb_parts.append(f"已达成里程碑: {'; '.join(fb_milestones[:3])}")
-        if fb_blocker:
-            fb_parts.append(f"状态阻塞点: {fb_blocker}")
-        if fb_next_action:
-            fb_parts.append(f"下一步: {fb_next_action}")
-        if fb_summary:
-            fb_parts.append(f"summary: {fb_summary[:200]}")
-        if fb_planner:
-            fb_parts.append(f"feedback: {fb_planner[:500]}")
-        if fb_errors:
-            fb_parts.append(f"errors: {'; '.join(str(e)[:100] for e in fb_errors[:3])}")
-
-        # 🔑 前轮 history_state 注入：强制 Planner 感知已尝试的 payload 历史
-        prior_history = feedback.get("prior_history_state")
-        if prior_history and isinstance(prior_history, dict):
-            tried = prior_history.get("tried_payloads", [])
-            failed = prior_history.get("failed_reasons", [])
-            cat_fails = prior_history.get("consecutive_failures_per_category", {})
-            history_lines = []
-            if tried:
-                history_lines.append(f"  已尝试Payload（严禁重复!）: {', '.join(tried[:5])}")
-            if failed:
-                history_lines.append(f"  历史失败原因: {'; '.join(failed[:3])}")
-            if cat_fails:
-                cat_str = ", ".join(f"{k}={v}次" for k, v in cat_fails.items())
-                history_lines.append(f"  分类失败计数: {cat_str}")
-                over_threshold = [k for k, v in cat_fails.items() if v >= 3]
-                if over_threshold:
-                    history_lines.append(
-                        f"  以下路径已达失败上限，强制切换: {', '.join(over_threshold)}"
+        fb_block = _build_feedback_block(feedback)
+        system_prompt_with_memory += "\n" + fb_block
+        # Re-enforce: drop from feedback first if needed (max 16 iterations)
+        _fb_iter = 0
+        _FB_MAX_ITERS = 16
+        while len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
+            _fb_iter += 1
+            if _fb_iter > _FB_MAX_ITERS:
+                # Hard fallback: drop feedback block
+                system_prompt_with_memory = _assemble()
+                break
+            fb_before = len(system_prompt_with_memory)
+            # Split off feedback, try dropping from it
+            parts = system_prompt_with_memory.rsplit("\n【上一轮执行反馈", 1)
+            if len(parts) == 2 and len(parts[0]) < _FINAL_PAYLOAD_HARD_CAP:
+                fb_remaining = _FINAL_PAYLOAD_HARD_CAP - len(parts[0]) - 5
+                fb_trimmed, _ = _enforce_section_budget(parts[1], fb_remaining, "memory")
+                system_prompt_with_memory = parts[0] + "\n" + fb_trimmed
+                if len(system_prompt_with_memory) >= fb_before:
+                    # No progress — drop feedback entirely
+                    system_prompt_with_memory = _assemble()
+                break
+            else:
+                # Drop L4, then L5, then compact L6
+                dropped_one = False
+                for lk in ("L4", "L5"):
+                    if _layers.get(lk):
+                        _layers[lk] = ""
+                        dropped_one = True
+                        break
+                if not dropped_one:
+                    prev_l6 = len(_layers.get("L6", ""))
+                    _layers["L6"], _ = _enforce_section_budget(
+                        _layers["L6"], max(len(_layers.get("L6", "")) // 2, 400), "user_goal"
                     )
-            if history_lines:
-                fb_parts.append("history_state:\n" + "\n".join(history_lines))
+                    if len(_layers.get("L6", "")) >= prev_l6:
+                        # Can't compact L6 further — drop feedback
+                        system_prompt_with_memory = _assemble()
+                        break
+                system_prompt_with_memory = _assemble()
+                if feedback:
+                    system_prompt_with_memory += "\n" + fb_block
 
-        # 注入上一轮原始执行输出（严格裁剪）
-        last_exec_raw = (feedback or {}).get("last_execution_raw", {})
-        raw_steps = last_exec_raw.get("steps", [])
-        if raw_steps:
-            raw_lines = []
-            raw_lines.append("【上一轮执行输出 trace】")
-            for s in raw_steps[:3]:  # 最多 3 步，每步数据严格裁剪
-                sid = s.get("step_id", "?")
-                ok = s.get("ok", False)
-                ec = s.get("exit_code", 0)
-                st = s.get("stdout_tail", "")[:200]
-                se = s.get("stderr_tail", "")[:200]
-                exc = s.get("exception_snippet", "")[:200]
-                raw_lines.append(f"  step[{sid}] {'OK' if ok else 'FAIL'} (exit={ec}): stdout={st} stderr={se}")
-                if exc:
-                    raw_lines.append(f"    exception={exc}")
-                http_resps = s.get("http_responses", [])
-                for h in http_resps[:1]:  # 仅第一条 HTTP 响应
-                    raw_lines.append(
-                        f"    HTTP {h.get('status_code')} {h.get('method')} "
-                        f"{h.get('url', '')}: {(h.get('response_body', '') or '')[:150]}"
-                    )
-            system_prompt_with_memory += "\n" + _physical_truncate("\n".join(raw_lines), 600)
+    # ── Final invariant assertion ──
+    assert len(system_prompt_with_memory) <= _FINAL_PAYLOAD_HARD_CAP, (
+        f"[planner] FATAL: prompt length {len(system_prompt_with_memory)} > "
+        f"HARD_LIMIT {_FINAL_PAYLOAD_HARD_CAP} after all compactions"
+    )
 
-        system_prompt_with_memory += _physical_truncate(
-            "\n\n【上一轮执行反馈 — 必须阅读并修正！】\n"
-            + "\n".join(f"  • {p}" for p in fb_parts)
-            + "\n\n请根据以上反馈修正攻击计划。必须优先考虑当前攻击状态和状态转换阻塞点。",
-            800,
-        )
+    # ── Diagnostics ──
+    _diag: dict[str, dict[str, Any]] = {}
+    for key, orig_content in [("L1", l1), ("L2", l2), ("L3", l3),
+                               ("L4", l4), ("L5", l5), ("L6", l6)]:
+        rendered = _layers.get(key, "")
+        _diag[key] = {
+            "original": len(orig_content),
+            "allocated": MEMORY_BUDGET.get({
+                "L1": "runtime_constraints", "L2": "hard_constraints",
+                "L3": "sdk_contract", "L4": "verified_facts",
+                "L5": "trajectory_state", "L6": "user_goal",
+            }.get(key, ""), 0),
+            "rendered": len(rendered),
+            "dropped": len(orig_content) - len(rendered) if orig_content and rendered else 0,
+        }
+    _dropped_total = sum(d["dropped"] for d in _diag.values())
+    print(
+        f"[planner] memory budget: "
+        + " ".join(f"{k}={d['rendered']}/{d['allocated']}" for k, d in _diag.items())
+        + f" total={len(system_prompt_with_memory)}/{_FINAL_PAYLOAD_HARD_CAP}"
+        + f" dropped_total={_dropped_total} global_cutoff=false"
+    )
 
-    # ── 最终双保险：所有内容拼接完毕后再次物理硬截断 ──
-    if len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
-        system_prompt_with_memory = _physical_truncate(system_prompt_with_memory, _FINAL_PAYLOAD_HARD_CAP)
-        print(f"[planner] ⚠️ 最终双保险触发！total > {_FINAL_PAYLOAD_HARD_CAP}，已强制物理截断")
 
     print(
         f"[planner] 最终 payload: total={len(system_prompt_with_memory)} chars "

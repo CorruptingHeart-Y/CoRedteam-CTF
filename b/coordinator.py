@@ -422,7 +422,33 @@ def _extract_step_error_fingerprint(step_results: list[dict[str, Any]]) -> str:
                 break
         else:
             error_tokens.append("unknown_error")
-    return "|".join(sorted(set(error_tokens))) or "no_failures"
+    return "|".join(sorted(set(error_tokens))) or "no_execution_error"
+
+
+def _has_execution_failure(step_results: list[dict[str, Any]], fb: dict[str, Any]) -> bool:
+    for r in step_results:
+        rr = r.get("result") or {}
+        if not rr.get("ok"):
+            return True
+    return fb.get("error_fingerprint") in {
+        "ConnectionRefused",
+        "ConnectionTimeout",
+        "NameError",
+        "SyntaxError",
+        "ImportError",
+        "security_blocked",
+        "skipped_syntax_error",
+    }
+
+
+def _coordinator_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 class _VulnRotator:
@@ -543,7 +569,7 @@ def _compute_progress_signals(
 
     # 5. Payload mutation: significant change from previous plan
     cur_payloads = " ".join(
-        st.get("command", "") for st in (last_plan.get("steps") or [])
+        _coordinator_text(st.get("command")) for st in (last_plan.get("steps") or [])
     )
     prev_payloads = prev_state.get("payloads", "")
     if cur_payloads and prev_payloads:
@@ -622,7 +648,7 @@ def _snapshot_round_state(
                 http_codes.add(code)
 
     payloads = " ".join(
-        st.get("command", "") for st in (last_plan.get("steps") or [])
+        _coordinator_text(st.get("command")) for st in (last_plan.get("steps") or [])
     )
 
     return {
@@ -726,8 +752,8 @@ def _record_trajectory_entry(
     method = ""
     payload = ""
     for st in plan.get("steps", []):
-        cmd = st.get("command", "")
-        purpose = (st.get("purpose") or "").lower()
+        cmd = _coordinator_text(st.get("command"))
+        purpose = (_coordinator_text(st.get("purpose"))).lower()
         # Detect action_type from purpose
         if any(kw in purpose for kw in ("inject", "注入", "payload", "exploit", "trigger", "触发")):
             action_type = "inject"
@@ -735,18 +761,18 @@ def _record_trajectory_entry(
             action_type = "exfiltrate"
         elif any(kw in purpose for kw in ("trigger", "gadget", "rce", "执行", "execute")):
             action_type = "trigger"
-        # Extract first endpoint from command
-        if not endpoint:
+        # Extract first endpoint from command (cmd="" for AST steps → no match)
+        if cmd and not endpoint:
             import re
             ep_match = re.search(r"['\"](/[\w/\-._]+)['\"]", cmd)
             if ep_match:
                 endpoint = ep_match.group(1)
-        if not method:
+        if cmd and not method:
             for m in ("post", "get", "put", "delete"):
                 if f".{m}(" in cmd.lower():
                     method = m.upper()
                     break
-        if not payload:
+        if cmd and not payload:
             # Capture first meaningful payload pattern
             payload_match = re.search(r"payload\s*=\s*['\"]([^'\"]+)['\"]", cmd)
             if payload_match:
@@ -816,7 +842,7 @@ def _record_primitive_learning(
 
     # 构建 observation
     all_stdout = " ".join(
-        (r.get("result") or {}).get("stdout", "") for r in step_results
+        _coordinator_text((r.get("result") or {}).get("stdout", "")) for r in step_results
     )
     all_http_bodies = " ".join(
         h.get("response_body", "")
@@ -828,13 +854,13 @@ def _record_primitive_learning(
     method = "GET"
     payload = ""
     for st in plan.get("steps", []):
-        cmd = st.get("command", "")
-        if not endpoint:
+        cmd = _coordinator_text(st.get("command"))
+        if cmd and not endpoint:
             import re
             ep_match = re.search(r"['\"](/[\w/\-._]+)['\"]", cmd)
             if ep_match:
                 endpoint = ep_match.group(1)
-        if not payload:
+        if cmd and not payload:
             payload_match = re.search(r"payload\s*=\s*['\"]([^'\"]+)['\"]", cmd)
             if payload_match:
                 payload = payload_match.group(1)[:300]
@@ -873,7 +899,7 @@ def _record_verified_facts(
     primitive_evidence = fb.get("primitive_evidence", {})
 
     all_stdout = " ".join(
-        (r.get("result") or {}).get("stdout", "") for r in step_results
+        _coordinator_text((r.get("result") or {}).get("stdout", "")) for r in step_results
     )
 
     # 至少 probe_success 才记录端点
@@ -909,7 +935,7 @@ def _record_verified_facts(
     # gadged_triggered/oob_received: record working primitives
     if state in ("gadget_triggered", "oob_received"):
         all_stdout = " ".join(
-            (r.get("result") or {}).get("stdout", "") for r in step_results
+            _coordinator_text((r.get("result") or {}).get("stdout", "")) for r in step_results
         )
         if any(kw in all_stdout.lower() for kw in ("uid=", "root:", "www-data")):
             verif.add_working_primitive({
@@ -968,10 +994,17 @@ def run_pipeline(
     challenge_name: str = "generic",
     target: TargetContext | None = None,
 ) -> int:
+    import time as _time
+    _pipeline_start = _time.time()
+
     settings = get_settings()
     memory = LayeredMemory(settings.memory_dir)
     ws = settings.workspace_dir
     ws.mkdir(parents=True, exist_ok=True)
+
+    reset_verification(settings.memory_dir / "memory" / "verification_memory.json", clear_current_run=True)
+    reset_trajectory(settings.memory_dir / "memory" / "exploit_trajectory.json", clear_current_run=True)
+    print("[coordinator] run isolation: reset current-run verification facts and trajectory")
 
     import core.adapters  # noqa: F401  trigger adapter registration
     adapter = get_adapter(challenge_name)
@@ -1067,7 +1100,10 @@ def run_pipeline(
         # ── Validator ──────────────────────────────────────────────────────
         _print_agent_header("validator")
         stage("Validator", "校验计划安全策略与语法...")
-        v = run_validator(plan_path, validated_path, prior_feedback=feedback)
+        from agents.validator import _extract_parameter_contract
+        parameter_contract = _extract_parameter_contract(confirmed)
+        v = run_validator(plan_path, validated_path, prior_feedback=feedback,
+                         parameter_contract=parameter_contract)
         val = v.get("validation", {})
         warnings = v.get("warnings") or []
         muted(
@@ -1125,7 +1161,47 @@ def run_pipeline(
                         f"stderr={(rr.get('stderr') or '')[:160]}"
                     )
 
-        # ── Evaluator ──────────────────────────────────────────────────────
+        # ── GoalVerifier: deterministic flag scan BEFORE Evaluator ──────────
+        # Runs first so a verified flag capture skips the Evaluator LLM call
+        # and terminates immediately — no wasted tokens, no [FAILED] override.
+        from core.goal_verifier import verify_goal
+        goal_verification = verify_goal(exec_out, plan=last_plan)
+
+        if goal_verification["verified"]:
+            # Build a minimal feedback block directly (Evaluator is skipped)
+            feedback = {
+                "repro_success": True,
+                "success_source": "goal_verifier",
+                "goal_verification": goal_verification,
+                "current_exploit_state": "objective_verified",
+                "should_continue": False,
+                "suggest_abort": True,
+                "is_milestone": False,
+                "confidence": 1.0,
+                "summary": (
+                    f"VERIFIED FLAG CAPTURED: {goal_verification['artifact']} "
+                    f"from HTTP response body (step {goal_verification['step_id']})"
+                ),
+                "last_execution_raw": _build_last_exec_raw(exec_out),
+            }
+            print(f"[coordinator] 🏆 GoalVerifier: flag confirmed in response body "
+                  f"(step {goal_verification['step_id']}, {goal_verification['source_kind']}) "
+                  f"— Evaluator skipped")
+
+            # Render victory screen and terminate immediately
+            from ui.victory_screen import render_victory_screen
+            render_victory_screen(
+                verification=goal_verification,
+                target_info=confirmed.get("target_context", {}),
+                plan=last_plan,
+                step_results=step_results,
+                runtime_sec=_time.time() - _pipeline_start,
+                workspace_dir=settings.workspace_dir,
+                challenge_name=challenge_name,
+            )
+            return 0  # IMMEDIATE STOP — Evaluator never called
+
+        # ── NOT verified — fall through to Evaluator ────────────────────────
         _print_agent_header("evaluator")
         stage("Evaluator", "评估复现结果...")
 
@@ -1186,21 +1262,6 @@ def run_pipeline(
 
         render_evaluator_feedback(fb)
 
-        # ── 成功检测：优先于熔断判断 ──────────────────────────
-        if fb and (fb.get("repro_success") or fb.get("success")):
-            render_victory_banner(
-                fb=fb,
-                iteration=iteration,
-                iter_budget=_iter_budget,
-                milestone_count=_milestone_count,
-                iter_history=_iter_history,
-                last_plan=last_plan,
-                step_results=step_results,
-                confirmed=confirmed,
-                challenge_name=challenge_name,
-            )
-            return 0  # 成功退出，传播到 cli.py 外层循环
-
         # ── AI 主动熔断（suggest_abort） — 前 N 轮强制忽略 ──────
         if fb.get("suggest_abort"):
             if iteration < _SUGGEST_ABORT_MIN_ITER:
@@ -1241,6 +1302,21 @@ def run_pipeline(
             progress_label = "; ".join(progress_reasons[:4])
             print(f"[coordinator] 📈 多维进展信号: {progress_label}")
 
+        # ── Classify progress signals: only hard evidence resets no-progress ──
+        # Hard evidence: new_primitive, deterministic response_delta,
+        # parameter_reached, deterministic capability/objective evidence.
+        # verified_facts is NOT included — facts lack source/provenance tracking.
+        _hard_evidence_prefixes = {
+            "new_primitive",
+        }
+        # Soft signals (never reset alone): state_advance, payload_mutation,
+        #   progress_score, exploit_momentum, stp_increase, evaluator_milestone,
+        #   ok_count, new_endpoint, new_status_code, initial_round,
+        #   verified_facts, confidence_increase, partial_progress
+        _hard_reasons = [r for r in progress_reasons
+                         if any(r.startswith(p) for p in _hard_evidence_prefixes)]
+        _has_hard_evidence = bool(_hard_reasons)
+
         # ── 衰减式里程碑奖励（Decaying Extension）────────────────────────
         if fb.get("is_milestone"):
             _milestone_count += 1
@@ -1254,8 +1330,13 @@ def run_pipeline(
                 f"预算 {old_budget}→{_iter_budget}（上限 {_MAX_HARD_LIMIT}）",
             )
         elif has_progress:
-            _no_progress_streak = 0
-            print(f"[coordinator] 🔄 非质变进展已记录，重置无进展计数")
+            if _has_hard_evidence:
+                _no_progress_streak = 0
+                print(f"[coordinator] 🔄 硬证据进展 ({'; '.join(_hard_reasons[:3])})，重置无进展计数")
+            else:
+                _no_progress_streak += 1
+                print(f"[coordinator] ⚙️ 仅软信号/执行健康 ({progress_label})，不算进展 "
+                      f"| 无进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
         else:
             _no_progress_streak += 1
             print(f"[coordinator] ⏳ 无任何进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
@@ -1271,18 +1352,22 @@ def run_pipeline(
             _breaker_triggered    = False
             _error_fingerprints.clear()
         else:
-            _consecutive_failures += 1
             fp = _extract_step_error_fingerprint(step_results)
-            _error_fingerprints.append(fp)
-            if len(_error_fingerprints) > _BREAKER_THRESHOLD:
-                _error_fingerprints.pop(0)
-            print(f"[coordinator] ⚠️  连续失败计数: {_consecutive_failures}/{_BREAKER_THRESHOLD} | 错误指纹: {fp}")
+            if _has_execution_failure(step_results, fb):
+                _consecutive_failures += 1
+                _error_fingerprints.append(fp)
+                if len(_error_fingerprints) > _BREAKER_THRESHOLD:
+                    _error_fingerprints.pop(0)
+            else:
+                _consecutive_failures = 0
+                _error_fingerprints.clear()
+            print(f"[coordinator] execution failure streak: {_consecutive_failures}/{_BREAKER_THRESHOLD} | fingerprint: {fp}")
 
         # Stagnation check: same error fingerprint repeated across the window
         _stagnating = (
             len(_error_fingerprints) >= _BREAKER_THRESHOLD
             and len(set(_error_fingerprints)) == 1
-            and _error_fingerprints[0] != "no_failures"
+            and _error_fingerprints[0] != "no_execution_error"
         )
 
         # ── 攻击面轮换：计划全部 BLOCKED 时强制切换漏洞 ──────────────────

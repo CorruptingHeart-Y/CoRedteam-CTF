@@ -792,6 +792,8 @@ def main() -> int:
         warn("\nCancelled")
         return 130
     except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
         fail(f"Error: {e}")
         return 1
 

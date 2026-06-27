@@ -107,6 +107,54 @@
       "error_type": "过度迭代导致任务超限，尽管最终步骤成功",
       "root_cause": "Planner 未优先使用 confirmed_vuln 中明确给出的漏洞链，在前几轮尝试了不必要的侦察或绕过手法，消耗了迭代配额。confirmed_vuln 已指明可公开提取 secret_phrase 并直接调用 /api/monitor 获取 flag，但 Planner 可能进行了冗余步骤（如尝试构造复杂 payload 或绕过沙箱），最终才回到最简单有效的路径。",
       "fix_suggestion": "【绝对优先】当 confirmed_vuln 中包含可直接利用的漏洞链（如信息泄露+缺失认证）时，Planner 不得进行任何额外的侦察、模糊测试或绕过尝试。必须直接按照漏洞描述构造最简请求链，一步完成利用。若涉及沙箱限制，只允许使用白名单模块（如 requests）发送 HTTP 请求，不得引入任何系统命令或文件操作。"
+    },
+    {
+      "id": "consolidator_c598",
+      "error_type": "ConnectionRefused Dead Loop — Planner repeatedly attempted HTTP requests to an unreachable target without diagnosing the network layer.",
+      "root_cause": "Planner 尚未建立‘网络可达性必须先于应用层攻击’的认知。其生成的计划将‘verify connectivity’与‘攻击’列为独立步骤，但在verify步骤失败时未添加任何分支逻辑，导致顺序执行直接打入后续攻击步骤。此外，Planner 忽略了feedback中‘使用curl -k测试’的明确指令，也未尝试切换协议、解析域名或检查防火墙状态。",
+      "fix_suggestion": "【绝对禁令】禁止在收到ECONNREFUSED、ConnectionRefused、No route to host等传输层错误后，继续执行任何依赖该连接的应用层操作。\n【新战术】必须立即转入‘环境诊断模式’：\n1. 使用httpx（白名单）构造超时极短（≤2s）的HEAD/OPTIONS请求，明确区分‘拒绝连接’‘超时’‘TLS握手失败’；\n2. 将诊断结果写入结构化日志，并主动向操作者或上游Agent发送`abort_with_network_error`信号；\n3. 若context.json中提供多个base_url，自动轮询备用地址；\n4. 如有可能，尝试通过redteam_sdk.OOBReceiver反向探测目标是否主动外连，以判断存活。\n严禁在未解决连通性的情况下继续注入SSTI Payload。"
+    },
+    {
+      "id": "consolidator_02ac",
+      "error_type": "HTTP 方法/参数位置错误导致 payload 未执行（query parameter 误用 POST data）",
+      "root_cause": "情报中明确标注“query parameter”，但特工未将其映射为 HTTP GET 方法，而是沿用常见 POST 习惯。同时未执行参数名与方法的快速模糊探测，遗漏了关键的环境确认步骤。",
+      "fix_suggestion": "【绝对禁令】当情报出现“query parameter”字样时，必须直接使用 GET 方法并通过 params 传递 payload。在正式利用前，务必执行一轮参数发现：对 `text`、`textString`、`input` 等候选名，分别尝试 GET 和 POST，确认反射点后再注入攻击载荷。"
+    },
+    {
+      "id": "consolidator_bcb3",
+      "error_type": "missing_or_misformatted_form_parameter — 攻击载荷未通过预期的 form field 发送",
+      "root_cause": "Planner 对目标 Web 应用接收输入的方式判断正确（'text' 参数），但实现时使用了不正确的 HTTP 客户端调用方式（如误用 JSON body 或空 data 参数），导致服务端从未接收到用户输入，始终渲染默认模板。同时未执行有效的探测信号（如 echo 数学表达式）来确认注入是否成功。",
+      "fix_suggestion": "【绝对禁令与新战术】禁止仅凭 200 状态码判断注入成功，必须检查响应正文中是否包含预期的注入输出。对所有依赖 form 参数的注入点，务必使用 requests.post(url, data={'param': payload}) 发送 form-urlencoded 数据。在进入复杂 RCE 前，先发送一个简单的数学表达式探测（如 `#set($x=7*7)$x`）并断言响应包含 49，若未出现则立即中止并报告请求构造错误。"
+    },
+    {
+      "id": "consolidator_2091",
+      "error_type": "Wrong HTTP method for form submission",
+      "root_cause": "Agent did not extract the form's method attribute from the HTML response and incorrectly assumed GET was sufficient. Even after feedback explicitly stated to use POST, the agent's execution pipeline did not adapt.",
+      "fix_suggestion": "在发送任何 payload 之前，必须解析目标返回的 HTML，提取所有 <form> 元素的 method 和 action 属性。对于通过表单提交触发的漏洞（如 'text' 参数），优先采用表单定义的方法。在接收评估反馈后，应立即检查并重写下一执行步骤的代码，确保 HTTP 方法正确。建立反馈-行动绑定机制，避免忽略反馈而重蹈覆辙。"
+    },
+    {
+      "id": "consolidator_0baf",
+      "error_type": "MISSING_QUERY_PARAMETER: 'text' parameter not included in GET request",
+      "root_cause": "Planner 在生成 Python 步时未将 POA 中声明的查询参数映射到代码的 params 参数，导致 HTTP 请求缺少关键输入，使 SSTI 点未被触及。缺乏自动审查机制（如 params 键是否与 confirmed_vuln 中的注入参数一致）。",
+      "fix_suggestion": "【绝对禁令与新战术】今后任何涉及已知注入点（如 confirmed_vuln 中注明的查询参数）的请求，必须在代码中使用 HttpClient.get(url=..., params={'参数名': payload}) 显式传递。绝不允许仅依赖 URL 拼接或空参数。构建探测 / 利用载荷前，必须读取 confirmed_vuln 的注入向量，并确保 params 中包含对应键。"
+    },
+    {
+      "id": "consolidator_039f",
+      "error_type": "MISSING_PAYLOAD_IN_REQUEST – Planner generated code that did not include the required attack payload in the HTTP request body/parameter",
+      "root_cause": "Planner 未能将攻击计划中的 SSTI 载荷（Velocity 模板注入）正确映射到 HTTP POST 的 'text' 参数上，导致代码虽然运行通过但未执行任何有效攻击。这不是沙箱约束导致，而是逻辑实现遗漏。",
+      "fix_suggestion": "【绝对禁令与新战术】绝对禁止在渗透步骤代码中提交空 payload 或仅做探测请求；必须严格按照计划载荷构造请求参数。推荐使用明确的数据字典，并在发送前通过日志输出 payload 摘要，以便沙箱反馈中快速定位是否缺参。对于 Velocity SSTI，使用 requests.post(url, data={'text': full_payload}) 是唯一的正确做法。"
+    },
+    {
+      "id": "consolidator_c9ec",
+      "error_type": "POST_PARAMETER_NOT_SENT — HTTP 200 but default response content unchanged",
+      "root_cause": "Planner 误认为 HTTP 200 即代表 payload 执行成功，未对响应正文做内容校验。实际代码中可能根本没有发送 'text' 参数，或者使用了错误的 key（如 'data'、'input'）或错误的提交方式（如 query string）。反馈明确指出需要使用 `data={'text': '<payload>'}`，但 Planner 未能在第一轮失败后立即调整。深层原因是缺乏‘自适应参数校验’的通用代码模板。",
+      "fix_suggestion": "【绝对禁令】绝对不能再假设 POST 请求默认已包含参数，也不能仅凭状态码判断成功。必须遵循新战术：(1) 发送 payload 后，用正则或关键词检测响应中是否出现了预期输出（如计算结果、flag 前缀）；(2) 若未出现预期输出，则自动尝试多种常见的 key（'text', 'input', 'data', 'payload'）并重新发送，直至成功或遍历结束；(3) 所有此类交互步骤都应使用统一的沙箱安全函数（基于 requests 或 HttpClient），并内置重试与验证逻辑。"
+    },
+    {
+      "id": "consolidator_154f",
+      "error_type": "EVIDENCE_LOSS_DUE_TO_STDOUT_TRUNCATION — 攻击成功，但关键证据未被完整的捕获在 raw_stdout 中",
+      "root_cause": "沙箱对 stdout 的长度限制或截断策略导致敏感数据（如 flag）未能完整呈现在执行日志中，触发系统的 '零信任覆写' 机制，即使 LLM 声明成功也会被降级为失败。",
+      "fix_suggestion": "【绝对禁令与新战术】禁止仅依赖 HTTP 响应正文回显来获取 flag 等敏感文件内容。必须使用带外数据外传（OOB exfiltration）手法，优先通过 DNS/HTTP 外带通道将 flag 安全传输至 OOBReceiver 或外部监听服务器，确保完整证据被记录。"
     }
   ]
 }

@@ -506,21 +506,39 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
             primitive = call.get("primitive", "")
             target = call.get("target", "/")
             body = call.get("body")
+            body_format = call.get("body_format", "form")  # default: form-encoded
+            query = call.get("query")
             raw = call.get("raw", b"")
         else:
             primitive = str(call)
             target = "/"
             body = None
+            body_format = "form"
+            query = None
             raw = b""
 
         if primitive == "HttpClient.get":
-            lines.append(f'resp = s.get("{target}")')
+            if query and isinstance(query, dict) and query:
+                # Normalise all values to str, then use repr() for safe Python literal
+                norm_query = {str(k): str(v) for k, v in query.items()}
+                lines.append(f'resp = s.get("{target}", params={repr(norm_query)})')
+            else:
+                lines.append(f'resp = s.get("{target}")')
             lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
             lines.append('save_context("_last_response_text", resp.text[:2000])')
             lines.append('save_context("_last_status", resp.status_code)')
         elif primitive == "HttpClient.post":
-            body_str = json.dumps(body) if body else "{}"
-            lines.append(f'resp = s.post("{target}", json={body_str})')
+            if body and isinstance(body, dict) and body:
+                norm_body = {str(k): str(v) for k, v in body.items()}
+                if body_format == "form":
+                    # form-encoded: data=dict (Content-Type: application/x-www-form-urlencoded)
+                    lines.append(f'resp = s.post("{target}", data={repr(norm_body)})')
+                else:
+                    # json body: use json.dumps for proper JSON escaping
+                    lines.append(f'resp = s.post("{target}", json={json.dumps(norm_body)})')
+            else:
+                # body=None or empty: send empty form POST (no silent json={})
+                lines.append(f'resp = s.post("{target}")')
             lines.append('print(f"HTTP {resp.status_code}: {resp.text[:500]}")')
             lines.append('save_context("_last_response_text", resp.text[:2000])')
             lines.append('save_context("_last_status", resp.status_code)')

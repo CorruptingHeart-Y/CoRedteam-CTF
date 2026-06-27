@@ -1,8 +1,7 @@
 {
   "confirmed_base_url": "",
   "confirmable_endpoints": [
-    "/api/options",
-    "/api/monitor"
+    "/"
   ],
   "injectable_params": {},
   "injectable_endpoints": [],
@@ -14,27 +13,21 @@
   "payload_bypass_techniques": [],
   "working_primitives": [
     {
-      "primitive_id": "information_disclosure",
+      "primitive_id": "ssti_reflection",
       "confidence": 1.0,
-      "evidence": "GET /api/options 返回 secret_phrase 在 allPossibleCommands.secret 中",
+      "evidence": "Step 1: {{7*7}} reflected as 49 — template expression evaluated and computed",
       "engine": ""
     },
     {
-      "primitive_id": "authentication_bypass",
+      "primitive_id": "ssti_rce",
       "confidence": 1.0,
-      "evidence": "Step 2: POST /api/monitor with secret_phrase returned flag without authentication",
+      "evidence": "Step 1: 'ls -la /' output returned in response body, confirming arbitrary command execution.",
       "engine": ""
     },
     {
-      "primitive_id": "unauthorized_access",
+      "primitive_id": "ssti_probe",
       "confidence": 1.0,
-      "evidence": "POST /api/monitor with secret_phrase returns flag without authentication",
-      "engine": ""
-    },
-    {
-      "primitive_id": "missing_authentication",
-      "confidence": 1.0,
-      "evidence": "POST /api/monitor 无需认证直接返回 flag",
+      "evidence": "Step 1: {{7*7}} reflected as 49 — template expression evaluated and computed",
       "engine": ""
     }
   ],
@@ -46,7 +39,5 @@
   "csrf_token_required": false,
   "waf_detected": false,
   "waf_type": "",
-  "confirmed_flags": [
-    "HTB{D3v3l0p3r_t00l5_4r3_b35t_wh4t_y0u_Th1nk??!}"
-  ]
+  "confirmed_flags": []
 }

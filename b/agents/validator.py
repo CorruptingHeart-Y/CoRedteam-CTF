@@ -56,6 +56,22 @@ def _load_manifest() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# Command text normalizer — None-safe for AST-mode steps
+# AST steps with sdk_calls have no raw command field; command=None
+# means "no raw-command evidence" and must not crash string ops.
+# ═══════════════════════════════════════════════════════════════════
+
+def _vtext(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Policy loader — reads sandbox_policy.yaml from disk every call
 # (no caching) so that Consolidator overrides take effect immediately.
 # ═══════════════════════════════════════════════════════════════════
@@ -329,10 +345,10 @@ def _validate_step(step: dict[str, Any], policies: dict[str, Any]) -> tuple[bool
             "  HTTP 请求/多步逻辑 → type=\"python\"；sqlmap 等 CLI → type=\"shell\""
         )
 
-    cmd = step.get("command")
+    cmd = _vtext(step.get("command")).strip()
     alt_code = step.get("code", "")
     alt_sdk = step.get("sdk_calls", [])
-    has_command = isinstance(cmd, str) and cmd.strip()
+    has_command = bool(cmd)
     has_code = isinstance(alt_code, str) and alt_code.strip()
     has_sdk = isinstance(alt_sdk, list) and len(alt_sdk) > 0
 
@@ -389,8 +405,8 @@ def _normalize_plan(plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     for st in steps:
         if not isinstance(st, dict) or st.get("type") != "python":
             continue
-        cmd = st.get("command")
-        if not isinstance(cmd, str) or not cmd.strip():
+        cmd = _vtext(st.get("command")).strip()
+        if not cmd:
             continue
         stripped = _strip_python_prefix(cmd)
         if stripped != cmd:
@@ -442,8 +458,8 @@ def _check_broken_dependency_chain(
         if not isinstance(st, dict):
             continue
         sid = st.get("id")
-        cmd = st.get("command", "")
-        if not isinstance(cmd, str):
+        cmd = _vtext(st.get("command"))
+        if not cmd:
             continue
         for match in re.finditer(
             r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
@@ -471,8 +487,8 @@ def _check_broken_dependency_chain(
                     f"请在 plan 中删除此步骤或增加一个能补齐缺失产物的替代步骤。"
                 )
 
-        cmd = st.get("command", "")
-        if not isinstance(cmd, str):
+        cmd = _vtext(st.get("command"))
+        if not cmd:
             continue
         for match in re.finditer(
             r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
@@ -522,14 +538,14 @@ def _check_broken_dependency_chain(
             )
 
     all_cmds = "\n".join(
-        st.get("command", "") for st in steps if isinstance(st, dict)
+        _vtext(st.get("command")) for st in steps if isinstance(st, dict)
     )
     for st in steps:
         if not isinstance(st, dict):
             continue
         sid = st.get("id")
-        cmd = st.get("command", "")
-        if not isinstance(cmd, str):
+        cmd = _vtext(st.get("command"))
+        if not cmd:
             continue
         for match in re.finditer(
             r"""['\"]?/tmp/(\w+\.(?:txt|json|jwt|jwk|token|secret|pem|key))['\"]?""",
@@ -591,7 +607,7 @@ def _validate_trajectory_awareness(
     for st in steps:
         if not isinstance(st, dict):
             continue
-        cmd = st.get("command", "")
+        cmd = _vtext(st.get("command"))
         if cmd:
             payload_ok, payload_err = controller.validate_payload_regression(cmd)
             if not payload_ok:
@@ -710,9 +726,148 @@ def _validate_step_ast_against_manifest(
     return len(errors) == 0, errors
 
 
+def _check_request_contract(
+    steps: list[dict[str, Any]],
+    parameter_contract: dict[str, Any] | None,
+) -> tuple[list[str], list[str]]:
+    """Verify that AST sdk_calls satisfy known request contracts from confirmed_vuln.
+
+    Returns (errors, warnings). Old string sdk_calls under a known parameter
+    contract are BLOCKING errors (parameter_contract_unverifiable).
+    Each parameter may have multiple accepted_locations (e.g. @RequestParam
+    accepts both query and form); the gate checks all of them.
+    """
+    if not parameter_contract or not parameter_contract.get("parameters"):
+        return [], []
+    required_params = parameter_contract.get("parameters", [])
+    endpoint = parameter_contract.get("endpoint", "")
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for st in steps:
+        if not isinstance(st, dict):
+            continue
+        sdk_calls = st.get("sdk_calls") or []
+        if not sdk_calls:
+            continue
+        step_id = st.get("id", "?")
+
+        for call in sdk_calls:
+            if isinstance(call, str):
+                # Old string form under known contract → BLOCKING error
+                for rp in required_params:
+                    pname = rp.get("name", "")
+                    accepted = rp.get("accepted_locations", ["query"])
+                    locs_hint = " or ".join(accepted)
+                    errors.append(
+                        f"step[{step_id}]: parameter_contract_unverifiable — "
+                        f"sdk_call 为旧字符串形式 '{call}'，"
+                        f"无法验证参数 '{pname}' ({locs_hint}) 是否已传递。"
+                        f"必须使用字典形式。"
+                    )
+                continue
+
+            if not isinstance(call, dict):
+                continue
+            primitive = call.get("primitive", "")
+            target = call.get("target", "/")
+
+            # Endpoint match: only enforce when contracted endpoint is non-empty
+            if endpoint and target and target.rstrip("/") not in (endpoint.rstrip("/"), ""):
+                continue  # not the contracted endpoint
+
+            for rp in required_params:
+                pname = rp.get("name", "")
+                accepted = rp.get("accepted_locations", ["query"])
+
+                # Check if parameter appears in ANY accepted location
+                found = False
+
+                if "query" in accepted:
+                    query_dict = call.get("query") or {}
+                    if pname in query_dict:
+                        found = True
+                if "form" in accepted:
+                    body_format = call.get("body_format", "form")
+                    body_dict = call.get("body") or {}
+                    if pname in body_dict:
+                        if body_format == "form":
+                            found = True
+                        else:
+                            warnings.append(
+                                f"step[{step_id}]: 参数 '{pname}' 在 body 中，"
+                                f"但 body_format='{body_format}' 而非 'form'。"
+                                f"parameter_location_mismatch"
+                            )
+                if "json" in accepted:
+                    body_format = call.get("body_format", "json")
+                    body_dict = call.get("body") or {}
+                    if pname in body_dict and body_format == "json":
+                        found = True
+
+                if not found:
+                    locs_hint = " or ".join(accepted)
+                    errors.append(
+                        f"step[{step_id}]: 已知参数 '{pname}' 应在 {locs_hint} 中传递，"
+                        f"但 sdk_call 的对应字段不含 '{pname}'。"
+                        f"parameter_missing: {pname}"
+                    )
+
+    return errors, warnings
+
+
+def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract known parameters from confirmed_vuln.json for Request Contract Gate."""
+    if not confirmed:
+        return None
+    vulns = confirmed.get("vulnerabilities", [])
+    if not vulns:
+        return None
+    params: list[dict[str, Any]] = []
+    endpoint = ""
+    method = ""
+    import re as _re
+    for v in vulns:
+        source = v.get("source", "")
+        # Parse: "HTTP GET/POST parameter `text`" or "@RequestParam(name = \"text\")"
+        for m in _re.finditer(r"[`'\"](\w+)[`'\"]", source):
+            pname = m.group(1)
+            if pname in ("param", "parameter", "name"):
+                continue
+            # Determine accepted locations from source hints
+            if "@RequestParam" in source:
+                # Spring MVC: accepts query AND form body — both are valid
+                accepted_locations = ["query", "form"]
+            elif "form" in source.lower() or "data=" in source.lower():
+                accepted_locations = ["form"]
+            elif "query" in source.lower():
+                accepted_locations = ["query"]
+            else:
+                accepted_locations = ["query", "form"]  # unknown → accept both
+            params.append({"name": pname, "accepted_locations": accepted_locations})
+        # Extract endpoint from evidence
+        evidence = v.get("evidence", "")
+        if isinstance(evidence, list):
+            for e in evidence:
+                code = e.get("code_snippet", "")
+                for m in _re.finditer(r'@(?:RequestMapping|GetMapping|PostMapping)\(["\']([^"\']+)["\']', code):
+                    endpoint = m.group(1)
+        # Extract method from exploitation hint (only when explicit)
+        exploitation = v.get("exploitation", "")
+        if "POST" in exploitation:
+            method = "POST"
+        elif "GET" in exploitation:
+            method = "GET"
+        # method="" means "not explicitly constrained" — Gate skips method check
+    if not params:
+        return None
+    return {"parameters": params, "endpoint": endpoint, "method": method}
+
+
 def validate_plan(
     plan: dict[str, Any],
     prior_feedback: dict[str, Any] | None = None,
+    parameter_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     policies = load_policies()
 
@@ -737,7 +892,7 @@ def validate_plan(
         if traj_warns:
             syntax_warnings.extend(traj_warns)
         if traj_errs or traj_warns:
-            print(f"[validator] 🛡️ 轨迹感知验证: {len(traj_errs)} 错误, {len(traj_warns)} 警告")
+            print(f"[validator] [TRAJECTORY] 轨迹感知验证: {len(traj_errs)} errors, {len(traj_warns)} warnings")
 
         # 🔑 Primitive context 验证（缺失字段自动推断，不阻断执行）
         primitive_ctx = plan.get("primitive_context")
@@ -772,9 +927,8 @@ def validate_plan(
 
             # ── Mixed protocol rejection: sdk_calls + command 不能共存 ──
             if is_ast_mode and isinstance(st, dict):
-                cmd = st.get("command", "")
-                has_command = isinstance(cmd, str) and cmd.strip()
-                if has_command:
+                cmd = _vtext(st.get("command")).strip()
+                if cmd:
                     errors.append(
                         f"{step_label}: 混合协议违规 — sdk_calls 与 command 字段同时存在。"
                         f"AST 纯模式下禁止输出 command 字段（包括占位符）。"
@@ -849,7 +1003,7 @@ def validate_plan(
             if step_warnings:
                 syntax_warnings.extend([f"{step_label}: {w}" for w in step_warnings])
 
-            cmd = st.get("command", "")
+            cmd = _vtext(st.get("command"))
             alt_code = st.get("code", "")
 
             # ── Python 步骤语法 + import 检查 ──
@@ -882,6 +1036,17 @@ def validate_plan(
                         print(f"[validator] [POLYGLOT] {msg}")
                         syntax_warnings.append(msg)
 
+    # ── Request Contract Gate — 验证 sdk_calls 是否满足 known parameter contract ──
+    contract_errs, contract_warns = _check_request_contract(steps, parameter_contract)
+    if contract_errs:
+        for cv in contract_errs:
+            errors.append(f"[request_contract] {cv}")
+        print(f"[validator] [CONTRACT] Request Contract Gate: {len(contract_errs)} blocking errors")
+    if contract_warns:
+        for cw in contract_warns:
+            syntax_warnings.append(f"[request_contract] {cw}")
+        print(f"[validator] [CONTRACT] Request Contract: {len(contract_warns)} warnings")
+
     passed = len(errors) == 0
     result: dict[str, Any] = {"passed": passed, "errors": errors}
     if syntax_warnings:
@@ -897,10 +1062,12 @@ def run_validator(
     plan_path: Path,
     validated_path: Path,
     prior_feedback: dict[str, Any] | None = None,
+    parameter_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_plan = json.loads(plan_path.read_text(encoding="utf-8"))
     normalized_plan, norm_warnings = _normalize_plan(raw_plan)
-    result = validate_plan(normalized_plan, prior_feedback=prior_feedback)
+    result = validate_plan(normalized_plan, prior_feedback=prior_feedback,
+                           parameter_contract=parameter_contract)
     payload = {
         "version": 1,
         "validation": result,

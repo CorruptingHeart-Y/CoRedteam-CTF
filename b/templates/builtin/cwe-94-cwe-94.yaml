@@ -1,0 +1,76 @@
+metadata:
+  id: cwe-94-cwe-94
+  name: CWE-94
+  cwe_ids:
+  - CWE-94
+  target_type: generic
+  tags:
+  - cwe-94
+  - cwe-94
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: Apache Velocity SSTI 通过反射调用 java.lang.Runtime.exec 实现命令注入的武器化模板，适用于 CWE-94
+  场景。该 entry 将包含参数发现和 RCE payload 两部分，以便后续任务直接调用。
+payload_templates:
+- name: velocity-ssti-rce-reflection
+  description: Apache Velocity SSTI 通过反射调用 java.lang.Runtime.exec 实现命令注入的武器化模板，适用于
+    CWE-94 场景。该 entry 将包含参数发现和 RCE payload 两部分，以便后续任务直接调用。
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-form-parameter-rce
+  description: Apache Velocity SSTI 利用 form 参数 'text' 注入模板表达式，包含探测与 Java 反射 RCE 两个步骤。规避了
+    HTML 模板中直接拼接导致的默认文本干扰，要求监控响应内容而非仅状态码。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity_reflection_rce
+  description: 针对 Apache Velocity 模板引擎的代码注入 RCE payload，利用反射调用 Runtime.exec。要求通过 POST
+    方法提交 'text' 参数。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-numeric-probe
+  description: 使用 {{7*7}} 检测 Velocity 模板注入，通过观察计算结果 49 是否出现在响应中判断漏洞存在。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-rce-runtime-exec
+  description: '通过 Velocity 的 #set 和 Class.forName 反射调用 java.lang.Runtime.exec() 执行系统命令，适用于
+    Java 目标环境。'
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-rce-payload
+  description: 为 Apache Velocity SSTI 创建 CWE-94 武器库模板，包含完整的 Velocity 反射链载荷。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-probe-and-rce
+  description: 针对 Apache Velocity 模板注入 (CWE-94) 的探测与命令执行武器库，包含算术表达式探测和通过 Runtime.exec
+    读取文件的 payload 模板，所有请求均使用沙箱白名单模块 requests 且内置结果校验逻辑。
+  lang: python
+  template: ''
+  tags: []
+  source: consolidator
+  severity: critical
+- name: velocity-rce-oob-curl-exfiltration
+  description: 基于 Velocity SSTI 命令执行，使用 curl 将敏感文件 base64 外带到 OOB 服务器的实战 payload，用于绕过回显截断问题。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical

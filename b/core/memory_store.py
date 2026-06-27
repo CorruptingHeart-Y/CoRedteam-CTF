@@ -757,7 +757,8 @@ class LayeredMemory:
             tags_key = ",".join(sorted(filter_tags))
             if tags_key not in self._fallback_printed:
                 self._fallback_printed.add(tags_key)
-                print(f"[memory] tag-filter fallback for: {filter_tags[:8]}...")
+                print("[memory] tag-filter miss; no unscoped fallback for executable memory")
+            return []
         return self.query_tech_payloads(query_text, n_results)
 
     def query_strategies_filtered(
@@ -796,7 +797,8 @@ class LayeredMemory:
             tags_key = ",".join(sorted(filter_tags))
             if tags_key not in self._fallback_printed:
                 self._fallback_printed.add(tags_key)
-                print(f"[memory] tag-filter fallback for: {filter_tags[:8]}...")
+                print("[memory] tag-filter miss; no unscoped fallback for executable memory")
+            return []
         return self.query_strategies(query_text, n_results)
 
     def query_patterns_filtered(

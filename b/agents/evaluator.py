@@ -278,10 +278,41 @@ is_milestone 代表本轮发生了"质变"级别的进展，而非仅仅置信�
 # 脏数据清洗
 # ────────────────────────────────────────────────────────────────
 
-def _clean_str(s: str, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
+def _safe_debug_repr(value: Any) -> str:
+    try:
+        return repr(value)
+    except Exception as exc:
+        return f"<repr failed: {type(exc).__name__}>"
+
+
+def _normalize_text_value(value: Any, step_id: Any = "?", field_path: str = "") -> str:
+    if value is None:
+        print(
+            "[evaluator][debug] non-string text value "
+            f"step_id={step_id!r} field={field_path} type=NoneType repr=None"
+        )
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        decoded = value.decode("utf-8", errors="replace")
+        print(
+            "[evaluator][debug] non-string text value "
+            f"step_id={step_id!r} field={field_path} "
+            f"type=bytes len={len(value)}"
+        )
+        return decoded
+    print(
+        "[evaluator][debug] non-string text value "
+        f"step_id={step_id!r} field={field_path} "
+        f"type={type(value).__name__} repr={_safe_debug_repr(value)}"
+    )
+    return str(value)
+
+
+def _clean_str(s: Any, max_chars: int = _MAX_OUTPUT_CHARS) -> str:
     """Strip ANSI escape codes and truncate to head+tail to prevent context flooding."""
-    if not isinstance(s, str):
-        s = str(s)
+    s = _normalize_text_value(s, "?", "_clean_str.input")
     s = _ANSI_RE.sub("", s)
     if len(s) > max_chars:
         head = s[:_HEAD_TAIL_CHARS]
@@ -313,11 +344,11 @@ def _sanitize_exec_output(exec_out: dict[str, Any], plan: dict[str, Any] | None 
 
     for sr in out.get("step_results") or []:
         res = sr.get("result") or {}
-        res["stdout"] = _clean_str(res.get("stdout", ""))
-        res["stderr"] = _clean_str(res.get("stderr", ""), max_chars=500)
+        step_id = sr.get("step_id", "?")
+        res["stdout"] = _clean_str(_normalize_text_value(res.get("stdout", ""), step_id, "result.stdout"))
+        res["stderr"] = _clean_str(_normalize_text_value(res.get("stderr", ""), step_id, "result.stderr"), max_chars=500)
         sr["result"] = res
         # Inject expected_outcome and purpose from plan so LLM can compare directly
-        step_id = sr.get("step_id")
         if step_id is not None:
             try:
                 key = str(step_id)
@@ -531,6 +562,106 @@ def _detect_blind_rce(step_results: list[dict[str, Any]]) -> bool:
         if res.get("ok") and _BLANK_STDOUT_RE.match(res.get("stdout", "")):
             return True
     return False
+
+
+def _joined_text_from_steps(step_results: list[dict[str, Any]], field_path: str) -> str:
+    parts: list[str] = []
+    for r in step_results:
+        step_id = r.get("step_id", "?")
+        if field_path == "result.stdout":
+            value = (r.get("result") or {}).get("stdout", "")
+        elif field_path == "chain_output._stdout":
+            value = (r.get("chain_output") or {}).get("_stdout", "")
+        elif field_path == "result.stderr":
+            value = (r.get("result") or {}).get("stderr", "")
+        else:
+            value = ""
+        parts.append(_normalize_text_value(value, step_id, field_path))
+    return " ".join(parts)
+
+
+def _local_evidence_state(
+    all_stdouts: str,
+    pre_primitives: dict[str, Any],
+    pre_flag: str,
+    pre_signal: str,
+    pre_blind: bool,
+    step_results: list[dict[str, Any]],
+) -> str:
+    detected = set(pre_primitives.get("detected_primitives") or [])
+    confidence = pre_primitives.get("primitive_confidence") or {}
+
+    if pre_flag or (
+        "blind_rce_oob" in detected and confidence.get("blind_rce_oob", 0.0) >= 0.8
+    ):
+        return "oob_received" if "blind_rce_oob" in detected or "oob" in all_stdouts.lower() else "gadget_triggered"
+
+    high_primitives = {
+        "command_execution",
+        "arbitrary_file_read",
+        "credential_dump",
+        "ssti_execution",
+    }
+    if pre_signal or any(confidence.get(pid, 0.0) >= 0.8 for pid in high_primitives):
+        return "gadget_triggered"
+
+    injected_primitives = {
+        "ssti_reflection",
+        "payload_reflection",
+        "error_triggered",
+        "timing_anomaly",
+        "oob_attempt",
+    }
+    if any(pid in detected for pid in injected_primitives):
+        return "payload_injected"
+
+    has_http_success = bool(re.search(r"\[HTTP\]\s*[23]\d{2}", all_stdouts))
+    if not has_http_success:
+        for r in step_results:
+            for h in r.get("http_responses") or []:
+                status = h.get("status_code", 0)
+                if isinstance(status, int) and 200 <= status < 400:
+                    has_http_success = True
+                    break
+            if has_http_success:
+                break
+    if has_http_success:
+        return "probe_success"
+
+    return "init"
+
+
+def _adjudicate_feedback_state(
+    fb: dict[str, Any],
+    all_stdouts: str,
+    pre_primitives: dict[str, Any],
+    pre_flag: str,
+    pre_signal: str,
+    pre_blind: bool,
+    step_results: list[dict[str, Any]],
+) -> None:
+    local_state = _local_evidence_state(
+        all_stdouts, pre_primitives, pre_flag, pre_signal, pre_blind, step_results
+    )
+    requested_state = fb.get("current_exploit_state", "init")
+    state_order = ["init", "probe_success", "payload_injected", "gadget_triggered", "oob_received"]
+    if requested_state not in state_order:
+        requested_state = "init"
+    if state_order.index(requested_state) <= state_order.index(local_state):
+        fb["current_exploit_state"] = requested_state
+        return
+
+    fb["current_exploit_state"] = local_state
+    if requested_state in ("gadget_triggered", "oob_received"):
+        fb["repro_success"] = False
+    fb.setdefault("analysis", {})
+    fb["analysis"]["what_happened"] = (
+        fb["analysis"].get("what_happened", "")
+        + f" (local state adjudication: LLM requested {requested_state}, "
+        f"but local evidence supports only {local_state})"
+    )
+    if local_state == "init":
+        fb.setdefault("milestones_achieved", ["init: no trusted local evidence"])
 
 
 # ────────────────────────────────────────────────────────────────
@@ -757,11 +888,9 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
         }
 
     results = exec_out.get("step_results") or []
-    all_stdouts = " ".join((r.get("result") or {}).get("stdout", "") for r in results)
-    # 同时扫描 chain_output._stdout（Executor 注入的上下文 stdout）
-    chain_stdouts = " ".join(
-        (r.get("chain_output") or {}).get("_stdout", "") for r in results
-    )
+    all_stdouts = _joined_text_from_steps(results, "result.stdout")
+    # Also scan chain_output._stdout from executor context.
+    chain_stdouts = _joined_text_from_steps(results, "chain_output._stdout")
     all_stdouts = f"{all_stdouts} {chain_stdouts}"
     flag = _detect_flag(all_stdouts)
     signal = _detect_success_signal(all_stdouts) if not flag else ""
@@ -861,7 +990,8 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
 
     # ── Partial primitive detection (even in MOCK mode) ──
     all_payloads = " ".join(
-        st.get("command", "") for st in (plan.get("steps") or [])
+        _normalize_text_value(st.get("command", ""), st.get("id", "?"), "plan.command")
+        for st in (plan.get("steps") or [])
     )
     mock_primitives = _detect_primitives(all_stdouts, all_payloads, results)
 
@@ -946,18 +1076,14 @@ def run_evaluator(
     clean_exec_out = _sanitize_exec_output(exec_out, plan=plan)
 
     # ── 2. 本地预判定（不依赖 LLM）────────────────────
-    all_stdouts = " ".join(
-        (r.get("result") or {}).get("stdout", "")
-        for r in clean_exec_out.get("step_results") or []
-    )
-    # 同时扫描 chain_output._stdout（Executor 注入的上下文 stdout）
-    chain_stdouts = " ".join(
-        (r.get("chain_output") or {}).get("_stdout", "")
-        for r in clean_exec_out.get("step_results") or []
-    )
+    step_results_for_text = clean_exec_out.get("step_results") or []
+    all_stdouts = _joined_text_from_steps(step_results_for_text, "result.stdout")
+    # Also scan chain_output._stdout from executor context.
+    chain_stdouts = _joined_text_from_steps(step_results_for_text, "chain_output._stdout")
     all_stdouts = f"{all_stdouts} {chain_stdouts}"
     all_payloads = " ".join(
-        st.get("command", "") for st in (plan.get("steps") or [])
+        _normalize_text_value(st.get("command", ""), st.get("id", "?"), "plan.command")
+        for st in (plan.get("steps") or [])
     )
     pre_flag    = _detect_flag(all_stdouts)
     pre_signal  = _detect_success_signal(all_stdouts) if not pre_flag else ""
@@ -967,6 +1093,9 @@ def run_evaluator(
     # ── 3. Mock 模式 ────────────────────────────────
     if settings.mock_llm or llm is None:
         fb = _mock_evaluate(confirmed, plan, clean_exec_out)
+        _adjudicate_feedback_state(
+            fb, all_stdouts, pre_primitives, pre_flag, pre_signal, pre_blind, step_results_for_text
+        )
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
         feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1110,7 +1239,7 @@ def run_evaluator(
     elif fb.get("error_fingerprint") == "unknown_error":
         # 有 stdout 但 LLM 返回了 unknown_error → 从 stdout 提取真实错误
         all_text = all_stdouts + " " + " ".join(
-            (r.get("result") or {}).get("stderr", "")[:200]
+            _normalize_text_value((r.get("result") or {}).get("stderr", ""), r.get("step_id", "?"), "result.stderr")[:200]
             for r in clean_exec_out.get("step_results") or []
         )
         if "STEP_FAIL:" in all_text:
@@ -1168,6 +1297,10 @@ def run_evaluator(
             fb["summary"] = "[FAILED·零信任覆写] LLM 已宣称成功，但 raw_stdout 中缺少 S 级物理铁证（uid=0、/etc/passwd、flag 等），已被系统强制判定为失败。"
 
     # ── 7.2 LLM 声称失败时强制 [FAILED] 前缀 ──
+    _adjudicate_feedback_state(
+        fb, all_stdouts, pre_primitives, pre_flag, pre_signal, pre_blind, step_results_for_text
+    )
+
     if not fb.get("repro_success"):
         existing_summary = fb.get("summary", "")
         if not existing_summary.startswith("[FAILED]"):

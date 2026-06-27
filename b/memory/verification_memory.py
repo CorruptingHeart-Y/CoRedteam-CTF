@@ -5,6 +5,31 @@ from pathlib import Path
 from typing import Any
 
 
+def _default_facts() -> dict[str, Any]:
+    return {
+        "confirmed_base_url": "",
+        "confirmable_endpoints": [],
+        "injectable_params": {},
+        "injectable_endpoints": [],
+        "accepted_fields": [],
+        "rejected_fields": [],
+        "template_engine": "",
+        "reflection_confirmed": False,
+        "payload_blacklist": [],
+        "payload_bypass_techniques": [],
+        "working_primitives": [],
+        "primitive_knowledge": {},
+        "confirmed_cve": "",
+        "target_app": "",
+        "target_framework": "",
+        "auth_status": "unknown",
+        "csrf_token_required": False,
+        "waf_detected": False,
+        "waf_type": "",
+        "confirmed_flags": [],
+    }
+
+
 class VerificationMemory:
     """持久化"已确认事实"（Confirmed Facts）——攻击过程中被反复验证、物理证据确凿的命题。
 
@@ -18,28 +43,7 @@ class VerificationMemory:
 
     def __init__(self, path: Path | str = "b/memory/verification_memory.json") -> None:
         self.path = Path(path)
-        self.facts: dict[str, Any] = {
-            "confirmed_base_url": "",
-            "confirmable_endpoints": [],          # 已确认可达的端点
-            "injectable_params": {},              # {"/endpoint": ["param1", "param2"]}
-            "injectable_endpoints": [],           # 已确认可注入的端点
-            "accepted_fields": [],                # 已接受的字段名列表
-            "rejected_fields": [],                # 已拒绝的字段名列表
-            "template_engine": "",                # e.g. "jinja2", "twig", "freemarker"
-            "reflection_confirmed": False,        # payload 是否被反射
-            "payload_blacklist": [],              # 已知被过滤的关键词
-            "payload_bypass_techniques": [],      # 已知绕过手法
-            "working_primitives": [],             # [{"primitive_id": str, "confidence": float, "evidence": str, "engine": str}]
-            "primitive_knowledge": {},             # 结构化 primitive 知识库 (migration target)
-            "confirmed_cve": "",                  # 确认存在的 CVE
-            "target_app": "",                     # 目标应用名称
-            "target_framework": "",               # 框架名称
-            "auth_status": "unknown",             # authenticated / unauthenticated / partial
-            "csrf_token_required": False,         # 是否需要 CSRF token
-            "waf_detected": False,                # 是否检测到 WAF
-            "waf_type": "",                       # WAF 类型
-            "confirmed_flags": [],                # 已捕获的 flag 列表
-        }
+        self.facts: dict[str, Any] = _default_facts()
         self._load()
 
     def _load(self) -> None:
@@ -295,6 +299,15 @@ def get_verification(path: Path | str = "b/memory/verification_memory.json") -> 
     return _verification
 
 
-def reset_verification() -> None:
+def reset_verification(
+    path: Path | str = "b/memory/verification_memory.json",
+    clear_current_run: bool = False,
+) -> VerificationMemory | None:
     global _verification
+    if clear_current_run:
+        _verification = VerificationMemory(path)
+        _verification.facts = _default_facts()
+        _verification._save()
+        return _verification
     _verification = None
+    return None

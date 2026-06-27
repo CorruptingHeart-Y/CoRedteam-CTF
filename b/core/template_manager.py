@@ -158,10 +158,17 @@ class TemplateManager:
 
         seen = set()
         unique = []
+        _skipped_candidate = 0
         for t in matched:
-            if t.id not in seen:
-                seen.add(t.id)
-                unique.append(t)
+            if t.id in seen:
+                continue
+            seen.add(t.id)
+            if "consolidator_reviewed:false" in t.tags:
+                _skipped_candidate += 1
+                continue
+            unique.append(t)
+        if _skipped_candidate > 0:
+            print(f"[template_manager] ⏭️ 跳过 {_skipped_candidate} 个未审核 consolidator YAML（candidate）")
 
         if unique:
             sections = [f"【Attack Templates — {len(unique)} available for CWEs: {', '.join(sorted(cwe_set))}】"]

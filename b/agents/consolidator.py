@@ -583,7 +583,7 @@ def _append_payload_to_yaml(yaml_path: Path, payload_entry: dict[str, Any]) -> b
         "description": payload_entry.get("description", ""),
         "lang": payload_entry.get("lang", "python"),
         "template": payload_entry.get("template", ""),
-        "tags": payload_entry.get("tags", []),
+        "tags": payload_entry.get("tags", []) + ["consolidator_reviewed:false"],
         "source": payload_entry.get("source", "consolidator"),
         "severity": payload_entry.get("severity", "critical"),
     }
@@ -637,7 +637,7 @@ def _create_new_cwe_yaml(
 
     # 构造 YAML 内容
     cwe_ids_list = [cwe_id]
-    tags = [slug, safe_name] if safe_name else [slug]
+    tags = [slug, safe_name, "consolidator_reviewed:false"] if safe_name else [slug, "consolidator_reviewed:false"]
     # 从 payload_entries 收集 tags
     for pe in payload_entries:
         for t in (pe.get("tags") or []):
