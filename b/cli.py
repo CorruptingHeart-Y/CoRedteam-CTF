@@ -75,9 +75,14 @@ def cmd_audit(args: argparse.Namespace) -> int:
         return 1
 
     target_dir = args.target or "target_codebase"
+    # Resolve to absolute path immediately for containment enforcement
+    resolved_target_root = str(Path(target_dir).resolve())
     stage("Audit", f"Starting Phase 1 discovery engine -> target={target_dir}")
+    muted(f"resolved_target_root={resolved_target_root}")
 
     env = os.environ.copy()
+    # ── Stage 1 Target Scope: lock all file reads to this directory ──
+    env["CO_REDTEAM_TARGET_ROOT"] = resolved_target_root
     if args.mock:
         env["CO_REDTEAM_MOCK_LLM"] = "true"
         muted("Mock mode enabled (no LLM calls)")
@@ -100,8 +105,39 @@ def cmd_audit(args: argparse.Namespace) -> int:
 #  exploit  (Phase 2 — dynamic exploitation with mandatory URL lock)
 # ---------------------------------------------------------------------------
 
+_EXPLOIT_LIMIT_ENV_VARS = (
+    ("max_iter", "CO_REDTEAM_MAX_ITER"),
+    ("max_iters_cap", "CO_REDTEAM_MAX_ITER_CAP"),
+    ("max_runs", "CO_REDTEAM_MAX_RUNS"),
+)
+
+
+def _configure_exploit_limits(args: argparse.Namespace) -> bool:
+    """Apply CLI limit overrides while keeping manual-route single-run only."""
+    manual_route = bool(getattr(args, "manual_route", False))
+    resolved: dict[str, int] = {}
+
+    for attr_name, env_name in _EXPLOIT_LIMIT_ENV_VARS:
+        value = getattr(args, attr_name, None)
+        if manual_route:
+            resolved[env_name] = 1 if value is None else value
+        elif value is not None:
+            resolved[env_name] = value
+
+    if manual_route and any(value != 1 for value in resolved.values()):
+        fail("MANUAL_ROUTE_SINGLE_RUN_REQUIRED")
+        return False
+
+    for env_name, value in resolved.items():
+        os.environ[env_name] = str(value)
+    return True
+
+
 def cmd_exploit(args: argparse.Namespace) -> int:
     """Run Phase 2 exploitation pipeline with a mandatory target URL lock."""
+    if not _configure_exploit_limits(args):
+        return 1
+
     try:
         target = lock_target(args.url)
     except TargetLockError as e:
@@ -143,6 +179,10 @@ def cmd_exploit(args: argparse.Namespace) -> int:
     max_runs = int(os.environ.get("CO_REDTEAM_MAX_RUNS", "5"))
     stage("CLI", f"Starting Phase 2 pipeline (challenge={challenge}, max_runs={max_runs})...")
 
+    # ── Manual Route Mode ───────────────────────────────────────────
+    if args.manual_route:
+        return _cmd_exploit_manual_route(target, confirmed_path, args)
+
     best_result = 3
     for run_idx in range(1, max_runs + 1):
         console.print(f"\n[bold cyan]========== OUTER RUN {run_idx}/{max_runs} ==========[/bold cyan]")
@@ -161,6 +201,105 @@ def cmd_exploit(args: argparse.Namespace) -> int:
 
     fail(f"All {max_runs} outer runs exhausted without confirmed success.")
     return best_result
+
+
+def _cmd_exploit_manual_route(
+    target: object,
+    confirmed_path: Path,
+    args: argparse.Namespace,
+) -> int:
+    """Execute a single manually-specified route through Validator→Executor→Evaluator."""
+    import json
+    import os as _os
+    from pathlib import Path as _Path
+
+    from core.settings import get_settings
+    from routes.manual_bridge import (
+        ManualRouteErrorCode,
+        run_manual_route,
+    )
+
+    settings = get_settings()
+
+    # ── Validate single-run constraint ────────────────────────────
+    max_iter = int(_os.environ.get("CO_REDTEAM_MAX_ITER", str(settings.max_iterations)))
+    max_iter_cap = int(_os.environ.get("CO_REDTEAM_MAX_ITER_CAP", str(settings.max_iterations_cap)))
+    max_runs_env = int(_os.environ.get("CO_REDTEAM_MAX_RUNS", "5"))
+
+    if max_iter != 1 or max_iter_cap != 1 or max_runs_env != 1:
+        fail(
+            f"[FATAL] MANUAL_ROUTE_SINGLE_RUN_REQUIRED\n"
+            f"  Manual route mode requires exactly 1 iteration/run.\n"
+            f"  Current: CO_REDTEAM_MAX_ITER={max_iter}, "
+            f"CO_REDTEAM_MAX_ITER_CAP={max_iter_cap}, "
+            f"CO_REDTEAM_MAX_RUNS={max_runs_env}\n"
+            f"  Set: CO_REDTEAM_MAX_ITER=1 CO_REDTEAM_MAX_ITER_CAP=1 CO_REDTEAM_MAX_RUNS=1"
+        )
+        return 1
+
+    # ── Validate required args ─────────────────────────────────────
+    if not args.route_dir:
+        fail("[FATAL] --manual-route requires --route-dir DIR")
+        return 1
+    if not args.route_id:
+        fail("[FATAL] --manual-route requires --route-id ID")
+        return 1
+
+    # ── Load confirmed ─────────────────────────────────────────────
+    confirmed = json.loads(confirmed_path.read_text(encoding="utf-8"))
+    if target is not None:
+        tc = confirmed.setdefault("target_context", {})
+        tc["base_url"] = target.url
+
+    # ── Banner ─────────────────────────────────────────────────────
+    from rich.panel import Panel
+    from rich.text import Text
+    body = Text()
+    body.append("Mode     ", style="grey50")
+    body.append("MANUAL ROUTE\n", style="bold yellow")
+    body.append("Route ID ", style="grey50")
+    body.append(args.route_id + "\n", style="bold white")
+    body.append("Route Dir", style="grey50")
+    body.append(args.route_dir + "\n", style="bold white")
+    if args.route_method:
+        body.append("Method   ", style="grey50")
+        body.append(args.route_method + "\n", style="bold white")
+    if args.route_location:
+        body.append("Location ", style="grey50")
+        body.append(args.route_location + "\n", style="bold white")
+    console.print(Panel(
+        body,
+        title="[bold yellow]Manual Route Bridge[/bold yellow]",
+        border_style="yellow",
+        padding=(0, 2),
+    ))
+
+    # ── Run ────────────────────────────────────────────────────────
+    result = run_manual_route(
+        route_dir=_Path(args.route_dir),
+        route_id=args.route_id,
+        confirmed=confirmed,
+        target=target,
+        settings=settings,
+        workspace_dir=settings.workspace_dir,
+        cli_method=args.route_method,
+        cli_location=args.route_location,
+    )
+
+    # ── Report ─────────────────────────────────────────────────────
+    if result.success:
+        console.print("\n[bold green]MANUAL_ROUTE_SUCCESS[/bold green]")
+        if result.evaluation:
+            fb = result.evaluation
+            console.print(f"  repro_success: {fb.get('repro_success')}")
+            console.print(f"  confidence: {fb.get('confidence')}")
+            console.print(f"  detected_primitives: {fb.get('detected_primitives')}")
+        return 0
+    else:
+        console.print(f"\n[bold red][FATAL][/bold red] {result.error_code.value if result.error_code else 'UNKNOWN'}")
+        for diag in result.diagnostics:
+            console.print(f"  [red]{diag}[/red]")
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +869,24 @@ Examples:
                            help="Path to confirmed_vuln.json (default: data/confirmed_vuln.json)")
     p_exploit.add_argument("--challenge", default="generic", metavar="NAME",
                            help="Challenge adapter name (default: generic)")
+    p_exploit.add_argument("--max-iter", type=int, default=None, metavar="N",
+                           help="Initial iteration budget (overrides CO_REDTEAM_MAX_ITER)")
+    p_exploit.add_argument("--max-iters-cap", type=int, default=None, metavar="N",
+                           help="Hard iteration cap (overrides CO_REDTEAM_MAX_ITER_CAP)")
+    p_exploit.add_argument("--max-runs", type=int, default=None, metavar="N",
+                           help="Outer run count (overrides CO_REDTEAM_MAX_RUNS)")
+    p_exploit.add_argument("--manual-route", action="store_true", default=False,
+                           help="Manual route mode: execute a specific candidate YAML route")
+    p_exploit.add_argument("--route-dir", default=None, metavar="DIR",
+                           help="Directory of candidate route YAML files (required with --manual-route)")
+    p_exploit.add_argument("--route-id", default=None, metavar="ID",
+                           help="Canonical route ID to execute (required with --manual-route)")
+    p_exploit.add_argument("--route-method", default=None, metavar="METHOD",
+                           choices=["GET", "POST"],
+                           help="HTTP method override: GET or POST")
+    p_exploit.add_argument("--route-location", default=None, metavar="LOCATION",
+                           choices=["query", "form", "json"],
+                           help="Request location override: query, form, or json")
     p_exploit.set_defaults(func=cmd_exploit)
 
     # -- memory --------------------------------------------------------------

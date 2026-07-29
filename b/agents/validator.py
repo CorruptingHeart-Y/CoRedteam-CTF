@@ -13,6 +13,7 @@ import yaml
 from memory.exploit_trajectory import get_trajectory
 from memory.verification_memory import get_verification
 from control.anti_regression import AntiRegressionController
+from core.plan_contract import validate_plan_structure
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -333,17 +334,17 @@ def _check_python_output_template(code: str, step_id: int | str) -> list[str]:
 
 
 def _validate_step(step: dict[str, Any], policies: dict[str, Any]) -> tuple[bool, list[str], list[str]]:
+    """Runtime-only step validation: text_scan, shell whitelist, output template.
+
+    Structural checks (type, empty step, mixed protocol) are handled by
+    ``validate_plan_structure()`` before this function is called.
+    """
     errors: list[str] = []
     warnings: list[str] = []
     if not isinstance(step, dict):
         return False, ["step 必须是对象（dict）"], warnings
 
-    step_type = step.get("type")
-    if step_type not in ("python", "shell"):
-        errors.append(
-            f"type 字段值 `{step_type}` 无效，必须是 \"python\" 或 \"shell\"\n"
-            "  HTTP 请求/多步逻辑 → type=\"python\"；sqlmap 等 CLI → type=\"shell\""
-        )
+    step_type = step.get("type", "python")
 
     cmd = _vtext(step.get("command")).strip()
     alt_code = step.get("code", "")
@@ -352,12 +353,8 @@ def _validate_step(step: dict[str, Any], policies: dict[str, Any]) -> tuple[bool
     has_code = isinstance(alt_code, str) and alt_code.strip()
     has_sdk = isinstance(alt_sdk, list) and len(alt_sdk) > 0
 
-    if not has_command and not has_code and not has_sdk:
-        errors.append(
-            "command 字段为空，且无 code/sdk_calls 替代字段。"
-            "旧版请提供 command 字符串，新版请提供 imports + sdk_calls 声明式数组。"
-        )
-        return False, errors, []
+    # validate_plan_structure() already verified step has at least one of
+    # {command, code, sdk_calls} and type is valid for LEGACY mode.
 
     if has_sdk and not step_type:
         # 声明式步骤默认视为 python 类型
@@ -829,6 +826,10 @@ def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, A
     import re as _re
     for v in vulns:
         source = v.get("source", "")
+        if isinstance(source, dict):
+            source = source.get("code", "")
+        if not isinstance(source, str):
+            source = ""
         # Parse: "HTTP GET/POST parameter `text`" or "@RequestParam(name = \"text\")"
         for m in _re.finditer(r"[`'\"](\w+)[`'\"]", source):
             pname = m.group(1)
@@ -869,18 +870,33 @@ def validate_plan(
     prior_feedback: dict[str, Any] | None = None,
     parameter_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # ── Shared structural contract (pure function, no runtime deps) ──
+    # The plan's static JSON structure must satisfy the shared contract that
+    # the Materializer also uses.  A structural failure rejects the plan in the
+    # Validator's normal result form BEFORE any dynamic gate runs.  This does
+    # NOT replace the dynamic gates below: Manifest, policy, trajectory,
+    # Verification Memory, anti-regression and request-contract checks still
+    # run when the structure is valid.  See b/core/plan_contract.py.
+    struct_result = validate_plan_structure(plan)
+    if not struct_result.passed:
+        struct_errors = [
+            f"[plan_structure] {d.message}" for d in struct_result.diagnostics
+        ]
+        return {
+            "passed": False,
+            "errors": struct_errors,
+            "structure_invalid": True,
+        }
+
     policies = load_policies()
 
     errors: list[str] = []
     syntax_warnings: list[str] = []
 
-    if plan.get("version") != 1:
-        errors.append("顶层字段 `version` 应为整数 1")
-
     steps = plan.get("steps")
-    if not isinstance(steps, list) or not steps:
-        errors.append("`steps` 必须是非空数组")
-    else:
+    # validate_plan_structure() already verified steps is a non-empty list
+    # with valid structure; dynamic gates operate on structurally-valid steps.
+    if isinstance(steps, list) and steps:
         chain_ok, chain_violations = _check_broken_dependency_chain(steps, prior_feedback)
         if not chain_ok:
             errors.extend(chain_violations)
@@ -925,16 +941,7 @@ def validate_plan(
             is_ast_mode = isinstance(step_sdk, list) and len(step_sdk) > 0
             print(f"[validator] step[{st.get('id', '?')}] mode={'AST' if is_ast_mode else 'LEGACY'}")
 
-            # ── Mixed protocol rejection: sdk_calls + command 不能共存 ──
-            if is_ast_mode and isinstance(st, dict):
-                cmd = _vtext(st.get("command")).strip()
-                if cmd:
-                    errors.append(
-                        f"{step_label}: 混合协议违规 — sdk_calls 与 command 字段同时存在。"
-                        f"AST 纯模式下禁止输出 command 字段（包括占位符）。"
-                        f"请删除 command 字段，只保留 imports + sdk_calls。"
-                    )
-                    continue
+            # ── Mixed protocol already rejected by validate_plan_structure() ──
 
             # ── Task 5: 声明式 imports/sdk_calls 结构数组强校验 ──
             if isinstance(st, dict) and st.get("type") == "python":

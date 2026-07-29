@@ -1,0 +1,110 @@
+metadata:
+  id: cwe-917-cwe-917
+  name: CWE-917
+  cwe_ids:
+  - CWE-917
+  target_type: generic
+  tags:
+  - cwe-917
+  - cwe-917
+  - consolidator_reviewed:false
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: 'Velocity SSTI 文件读取 payload：利用 #include 指令读取目标文件内容，绕过禁用反射的沙箱限制。'
+payload_templates:
+- name: velocity-ssti-file-read-via-include
+  description: Velocity SSTI 文件读取 payload：利用
+  lang: python
+  template: null
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-runtime-exec-with-output
+  description: 基于 Runtime.exec(String) 并回显命令输出的 Velocity SSTI 载荷，避免 ProcessBuilder
+    导致的参数计数错误。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-scanner-rce
+  description: 使用java.util.Scanner读取命令输出的Velocity SSTI RCE payload模板，通用性强，不依赖Java版本
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-class-reflection-rce-with-cmd-output
+  description: A Velocity template injection payload that uses $class.forName for
+    reflective RCE, then reads the command's full output via BufferedReader and injects
+    it into the response. This payload is designed for environments where the default
+    Velocity global context is present and no tool variables like $runtime have been
+    added.
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: incremental-probe-and-basic-rce
+  description: 增量式 Velocity SSTI 利用模板：从算术验证开始，逐步过渡到 Runtime.exec，并处理 HTML 实体编码问题。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-rce-via-static-forname-reflection
+  description: 利用空字符串获得 String 类并用反射调用 Class.forName 静态方法加载 Runtime，完整执行命令并写文件，规避常见的
+    $x.getClass().forName() 错误
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-rce-via-dollar-class
+  description: 为 CWE-917（Velocity 模板注入）创建武器库条目，包含基于 $class 和 .class.forName() 的两种
+    RCE payload，用于自动化打靶时直接加载。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-classloader-rce
+  description: 基于 Velocity SSTI 通过 ClassLoader 加载 Runtime 实现 RCE 的武器化模板，避免常见 forName
+    误区，提供可直接复用的自动化 payload。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-rce-via-string-reflection
+  description: 新增 Velocity SSTI 远程命令执行模板，使用空字符串反射链执行命令并回显输出。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-ssti-rce-class-forName-scanner
+  description: 针对 Velocity SSTI 的 RCE 载荷模板，使用 Class.forName + Runtime.exec + Scanner
+    读取输出，完全避免非法数组语法，稳定可靠。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-rce-via-dollar-class
+  description: 追加基于 Velocity 内置对象 $class 的反射链 RCE Payload，替代原有基于数值实例的错误载荷，并提供完整的命令回显与静态文件检索变体。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical

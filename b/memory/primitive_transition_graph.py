@@ -22,7 +22,14 @@ from memory.exploit_primitives import (
 
 DEFAULT_TRANSITIONS: dict[str, list[str]] = {
     # ── SSTI chain ──
-    "ssti_reflection": ["ssti_execution", "blind_ssti"],
+    "ssti_reflection": [
+        "ssti_execution",
+        "blind_ssti",
+        "template_access",
+        "configuration_disclosure",
+        "file_read",
+        "command_execution",
+    ],
     "ssti_execution": ["command_execution", "arbitrary_file_read", "blind_ssti"],
     "blind_ssti": ["http_callback", "dns_exfiltration"],
 
@@ -59,6 +66,10 @@ DEFAULT_TRANSITIONS: dict[str, list[str]] = {
 # 定义每个 transition 的 precondition（从源 primitive 到目标 primitive 的条件）
 TRANSITION_CONDITIONS: dict[str, dict[str, str]] = {
     "ssti_reflection->ssti_execution": "需确认 template engine 类型（jinja2/twig/freemarker），然后使用对应的 class traversal payload",
+    "ssti_reflection->template_access": "Optional objective: access template context or resources; does not require command execution",
+    "ssti_reflection->configuration_disclosure": "Optional objective: disclose template-reachable configuration; does not require command execution",
+    "ssti_reflection->file_read": "Optional objective: disclose file contents through template or resource access; does not require command execution",
+    "ssti_reflection->command_execution": "Optional objective: attempt command execution only when its preconditions hold",
     "ssti_execution->command_execution": "需成功访问 os.popen 或 subprocess 模块（通过 __globals__ 或 __subclasses__ 链）",
     "ssti_execution->arbitrary_file_read": "需成功调用 open() 或 os.popen('cat ...') 并通过响应回显或 OOB 获取内容",
     "sql_boolean->sql_union": "需确定列数（ORDER BY 1,2,3...）和回显位置",

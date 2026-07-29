@@ -1,0 +1,40 @@
+schema_version: 1.1.0
+canonical_id: cwe-94:init:ssti-reflection:arithmetic-probe
+cwe_id: CWE-94
+current_state: init
+technique: arithmetic_probe
+metadata:
+  template_engine: velocity
+  payload_dialect: velocity
+  generated_by: route_factory
+  source_cwe: CWE-917
+  canonical_cwe: CWE-94
+activation:
+  state: draft
+  source: route_factory
+requires:
+  current_state: init
+  runtime_facts:
+  - endpoint
+  - parameter
+  - method
+  signals: []
+target_primitive: ssti_reflection
+payload_template_ref: primitive:ssti_reflection:sha256:008b15dab525fb94
+expected_signals:
+- arithmetic_result_in_response
+materialization:
+  type: http_request
+  method_from: runtime_truths
+  endpoint_from: runtime_truths
+  parameter_from: runtime_truths
+  payload_template_ref: primitive:ssti_reflection:sha256:008b15dab525fb94
+success:
+  match: any
+  expected_signals:
+  - arithmetic_result_in_response
+failure:
+  state_change: none
+replay:
+  enabled: false
+generation_status: candidate_only

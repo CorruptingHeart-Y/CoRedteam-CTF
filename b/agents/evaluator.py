@@ -396,6 +396,20 @@ def _detect_primitives(all_stdouts: str, payload_text: str, step_results: list[d
     combined_text = f"{all_stdouts} {payload_text}".lower()
 
     # SSTI family
+    velocity_math = re.search(
+        r"#set\(\$x\s*=\s*(\d+)\s*\*\s*(\d+)\s*\)\s*\$x",
+        payload_text,
+        re.IGNORECASE,
+    )
+    if velocity_math:
+        expected = str(int(velocity_math.group(1)) * int(velocity_math.group(2)))
+        if re.search(rf"(?<!\d){re.escape(expected)}(?!\d)", all_stdouts):
+            detected.append("ssti_reflection")
+            confidence["ssti_reflection"] = 0.92
+            evidence["ssti_reflection"] = (
+                f"Velocity arithmetic probe evaluated to {expected} — primitive confirmed"
+            )
+
     if re.search(r'\{\{7\*7\}\}.*49|\$\{7\*7\}.*49', all_stdouts, re.DOTALL):
         detected.append("ssti_reflection")
         confidence["ssti_reflection"] = 0.92
@@ -580,6 +594,33 @@ def _joined_text_from_steps(step_results: list[dict[str, Any]], field_path: str)
     return " ".join(parts)
 
 
+
+
+def _extract_plan_payload_text(plan: dict[str, Any]) -> str:
+    """Extract payload-bearing text from command and structured sdk_calls."""
+    parts: list[str] = []
+    for st in (plan.get("steps") or []):
+        if not isinstance(st, dict):
+            continue
+        step_id = st.get("id", "?")
+        parts.append(_normalize_text_value(st.get("command", ""), step_id, "plan.command"))
+        for call in (st.get("sdk_calls") or []):
+            if not isinstance(call, dict):
+                parts.append(_normalize_text_value(call, step_id, "plan.sdk_calls"))
+                continue
+            for field in ("target", "query", "body", "headers"):
+                if field not in call:
+                    continue
+                value = call.get(field)
+                if isinstance(value, dict):
+                    parts.extend(
+                        _normalize_text_value(v, step_id, f"plan.sdk_calls.{field}.{k}")
+                        for k, v in value.items()
+                    )
+                else:
+                    parts.append(_normalize_text_value(value, step_id, f"plan.sdk_calls.{field}"))
+    return " ".join(p for p in parts if p)
+
 def _local_evidence_state(
     all_stdouts: str,
     pre_primitives: dict[str, Any],
@@ -663,6 +704,71 @@ def _adjudicate_feedback_state(
     if local_state == "init":
         fb.setdefault("milestones_achieved", ["init: no trusted local evidence"])
 
+
+
+
+def _apply_structured_feedback_fields(
+    fb: dict[str, Any],
+    *,
+    pre_primitives: dict[str, Any],
+    pre_flag: str,
+    pre_signal: str,
+    all_stdouts: str,
+    all_payloads: str,
+) -> None:
+    """Expose primitive progress separately from completed exploit success."""
+    detected = set(pre_primitives.get("detected_primitives") or fb.get("detected_primitives") or [])
+    primitive_state = dict(fb.get("primitive_state") or {})
+    primitive_state.setdefault("ssti", any(pid.startswith("ssti_") for pid in detected))
+    arithmetic_probe = bool(re.search(
+        r"#set\(\$x\s*=\s*\d+\s*\*\s*\d+\s*\)\s*\$x",
+        all_payloads,
+        re.IGNORECASE,
+    ))
+    primitive_state.setdefault("arithmetic", arithmetic_probe and "ssti_reflection" in detected)
+    primitive_state.setdefault(
+        "object_access",
+        "ssti_execution" in detected or bool(re.search(r"__globals__|__subclasses__|__mro__|__builtins__", all_stdouts, re.IGNORECASE)),
+    )
+    primitive_state.setdefault(
+        "rce",
+        any(pid in detected for pid in ("command_execution", "blind_rce_oob", "arbitrary_file_read", "credential_dump")),
+    )
+    fb["primitive_state"] = primitive_state
+
+    primitive_confirmed = any(bool(v) for v in primitive_state.values())
+    flag_found = bool(pre_flag or fb.get("flag_found"))
+    complete_chain = bool(flag_found or (primitive_state.get("rce") and pre_signal))
+    fb["primitive_confirmed"] = primitive_confirmed
+    fb["flag_found"] = flag_found
+    fb["exploit_completed"] = bool(fb.get("exploit_completed") or complete_chain)
+
+    if arithmetic_probe and primitive_state.get("arithmetic") and not fb["exploit_completed"]:
+        fb["repro_success"] = False
+        fb["should_continue"] = True
+        fb["evidence_level"] = "F"
+        fb.setdefault("failure_analysis", {})
+        fb["failure_analysis"].setdefault("type", "primitive_only")
+        fb["failure_analysis"].setdefault(
+            "detail",
+            "arithmetic_result_in_response confirms SSTI primitive only; no flag or completed exploit chain evidence",
+        )
+
+    if not fb.get("repro_success"):
+        failure_analysis = dict(fb.get("failure_analysis") or {})
+        if primitive_state.get("ssti") and not primitive_state.get("rce"):
+            failure_analysis.setdefault("type", "reflection_blocked")
+        elif not all_stdouts.strip():
+            failure_analysis.setdefault("type", "no_observable_output")
+        else:
+            failure_analysis.setdefault("type", fb.get("error_fingerprint", "execution_failed"))
+        fb["failure_analysis"] = failure_analysis
+        if not fb.get("possible_next_direction"):
+            fb["possible_next_direction"] = (
+                ["processbuilder", "scriptengine"]
+                if failure_analysis.get("type") in {"reflection_blocked", "primitive_only"}
+                else []
+            )
 
 # ────────────────────────────────────────────────────────────────
 #  Exploit Progress Engine (EPE) — semantic side-effect scoring
@@ -989,10 +1095,7 @@ def _mock_evaluate(confirmed: dict[str, Any], plan: dict[str, Any], exec_out: di
     )
 
     # ── Partial primitive detection (even in MOCK mode) ──
-    all_payloads = " ".join(
-        _normalize_text_value(st.get("command", ""), st.get("id", "?"), "plan.command")
-        for st in (plan.get("steps") or [])
-    )
+    all_payloads = _extract_plan_payload_text(plan)
     mock_primitives = _detect_primitives(all_stdouts, all_payloads, results)
 
     # ── EPE: semantic progress scoring ──
@@ -1081,10 +1184,7 @@ def run_evaluator(
     # Also scan chain_output._stdout from executor context.
     chain_stdouts = _joined_text_from_steps(step_results_for_text, "chain_output._stdout")
     all_stdouts = f"{all_stdouts} {chain_stdouts}"
-    all_payloads = " ".join(
-        _normalize_text_value(st.get("command", ""), st.get("id", "?"), "plan.command")
-        for st in (plan.get("steps") or [])
-    )
+    all_payloads = _extract_plan_payload_text(plan)
     pre_flag    = _detect_flag(all_stdouts)
     pre_signal  = _detect_success_signal(all_stdouts) if not pre_flag else ""
     pre_blind   = _detect_blind_rce(clean_exec_out.get("step_results") or []) if not pre_flag else False
@@ -1095,6 +1195,14 @@ def run_evaluator(
         fb = _mock_evaluate(confirmed, plan, clean_exec_out)
         _adjudicate_feedback_state(
             fb, all_stdouts, pre_primitives, pre_flag, pre_signal, pre_blind, step_results_for_text
+        )
+        _apply_structured_feedback_fields(
+            fb,
+            pre_primitives=pre_primitives,
+            pre_flag=pre_flag,
+            pre_signal=pre_signal,
+            all_stdouts=all_stdouts,
+            all_payloads=all_payloads,
         )
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1301,6 +1409,15 @@ def run_evaluator(
         fb, all_stdouts, pre_primitives, pre_flag, pre_signal, pre_blind, step_results_for_text
     )
 
+    _apply_structured_feedback_fields(
+        fb,
+        pre_primitives=pre_primitives,
+        pre_flag=pre_flag,
+        pre_signal=pre_signal,
+        all_stdouts=all_stdouts,
+        all_payloads=all_payloads,
+    )
+
     if not fb.get("repro_success"):
         existing_summary = fb.get("summary", "")
         if not existing_summary.startswith("[FAILED]"):
@@ -1316,3 +1433,5 @@ def run_evaluator(
     feedback_path.parent.mkdir(parents=True, exist_ok=True)
     feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
     return fb
+
+

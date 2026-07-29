@@ -5,6 +5,7 @@ import json
 import os
 import platform
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,11 @@ from memory.exploit_primitives import get_primitive_registry
 from memory.primitive_learning import get_learning_engine
 from memory.primitive_transition_graph import get_transition_graph
 from control.anti_regression import PayloadEvolutionEngine, AntiRegressionController
+from routes.knowledge_provider import RouteKnowledgeProvider
+from core.route_candidate_generator import (
+    generate_and_rank_routes,
+    build_candidate_routes_context_verbose,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1759,6 +1765,305 @@ def _build_forbidden_techniques_block(feedback: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Strategy Diversification — Exploit Objective Expansion
+# 当 primitive 已确认但 exploit 停滞时，强制扩展策略空间。
+# 只扩展策略类别，不硬编码 payload。
+# ═══════════════════════════════════════════════════════════════════
+
+_REFLECTION_BLOCKED_KEYWORDS = (
+    "reflected literally", "no execution evidence", "reflection blocked",
+    "reflection_blocked", "security policy", "sandbox", "class.forName",
+    "getRuntime", "ProcessBuilder", "ScriptEngine",
+)
+
+_STAGNATION_STATES = frozenset({"probe_success", "payload_injected"})
+
+
+def _detect_strategy_stagnation(feedback: dict[str, Any] | None) -> str | None:
+    """Detect when the exploit strategy is stuck and needs diversification.
+
+    Multi-signal detection — no single field is authoritative.
+    Returns stagnation type string if detected, None otherwise.
+
+    Currently detects: 'reflection_blocked'
+    """
+    if not feedback or not isinstance(feedback, dict):
+        return None
+
+    # ── Precondition: primitive confirmed, exploit NOT completed ──
+    if not feedback.get("primitive_confirmed"):
+        return None
+    if feedback.get("exploit_completed") or feedback.get("flag_found"):
+        return None
+
+    # ── Explicit failure_reason (strongest signal) ──
+    failure_reason = str(feedback.get("failure_reason", "")).lower()
+    if "reflection" in failure_reason and "blocked" in failure_reason:
+        return "reflection_blocked"
+
+    signals: list[str] = []
+
+    # ── Signal 1: primitive_state — SSTI yes, RCE no ──
+    ps = feedback.get("primitive_state", {})
+    if isinstance(ps, dict):
+        if ps.get("ssti") and not ps.get("rce") and not ps.get("arithmetic"):
+            signals.append("ssti_without_rce")
+
+    # ── Signal 2: failure_analysis text contains reflection/blocking keywords ──
+    fa = feedback.get("failure_analysis", {})
+    if isinstance(fa, dict):
+        fa_text = " ".join(str(v) for v in fa.values()).lower()
+    else:
+        fa_text = str(fa).lower()
+    if any(kw in fa_text for kw in _REFLECTION_BLOCKED_KEYWORDS):
+        signals.append("fa_reflection_keywords")
+
+    # ── Signal 3: raw_evidence shows literal reflection ──
+    evidence = str(feedback.get("raw_evidence", "")).lower()
+    if any(kw in evidence for kw in ("reflected literally", "no execution evidence",
+                                       "reflected in <", "reflected as")):
+        signals.append("literal_reflection_evidence")
+
+    # ── Signal 4: state stuck at early stage ──
+    state = str(feedback.get("current_exploit_state", "")).lower()
+    if state in _STAGNATION_STATES:
+        signals.append(f"state_stuck")
+
+    # ── Signal 5: ssti_reflection primitive detected but no execution ──
+    detected = feedback.get("detected_primitives") or []
+    if isinstance(detected, list):
+        has_reflection = any("ssti" in str(p).lower() or "reflection" in str(p).lower()
+                            for p in detected)
+        has_execution = any("execution" in str(p).lower() or "rce" in str(p).lower()
+                           for p in detected)
+        if has_reflection and not has_execution:
+            signals.append("reflection_without_execution")
+
+    # ── Signal 6: what_failed / state_transition_blocker mentions reflection ──
+    blocker = str(feedback.get("state_transition_blocker", "")).lower()
+    what_failed = str(feedback.get("what_failed", "")).lower()
+    if any(kw in blocker or kw in what_failed
+           for kw in ("reflected literally", "reflected as", "no execution")):
+        signals.append("blocker_reflection")
+
+    # ── Decision: need ≥2 independent non-explicit signals ──
+    non_explicit = [s for s in signals if s != "explicit_reflection_blocked"]
+    if len(non_explicit) >= 2:
+        return "reflection_blocked"
+
+    return None
+
+
+def _compact_route_knowledge(route_knowledge: list[Any]) -> str:
+    """Build compact route intelligence block ≤220 chars.
+
+    Keeps: primitive, possible_transitions, expected_signals.
+    Drops: historical_outcome, strategy_class, route_status (advisory noise).
+    """
+    if not route_knowledge:
+        return ""
+    parts: list[str] = []
+    for item in route_knowledge:
+        try:
+            plain = item.to_plain()
+        except AttributeError:
+            continue
+        prim = plain.get("primitive", "")
+        trans = ",".join(plain.get("possible_transitions", []))
+        sigs = ",".join(plain.get("expected_signals", []))
+        if not prim:
+            continue
+        parts.append(
+            f"primitive={prim} → {{{trans}}} signals:{{{sigs}}}"
+        )
+    if not parts:
+        return ""
+    block = "[ROUTE] " + " | ".join(parts)
+    if len(block) > 220:
+        block = block[:217] + "..."
+    return block
+
+
+def _build_objective_diversification_block(stagnation_type: str) -> str:
+    """Build strategy-space diversification guidance.
+
+    Compact decision constraint ~180-250 chars. No hardcoded payloads.
+    """
+    if stagnation_type != "reflection_blocked":
+        return ""
+
+    return (
+        "[DIVERSIFY] strategy stagnation detected — "
+        "reflection chain blocked, do not repeat previous objective. "
+        "Must consider alternatives: "
+        "file_read | template_access | configuration_disclosure | command_execution"
+    )
+
+
+def _build_plan_generation_contract(confirmed: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Validator request metadata into an explicit LLM contract.
+
+    Parameter discovery stays authoritative in the Validator extractor.  This
+    function only presents that existing contract in plan-schema terminology;
+    it does not validate or repair generated plans.
+    """
+    from agents.validator import _extract_parameter_contract
+
+    parameter_contract = _extract_parameter_contract(confirmed) or {}
+    required_inputs = [
+        {
+            "name": parameter.get("name", ""),
+            "accepted_locations": list(
+                parameter.get("accepted_locations") or ["query"]
+            ),
+        }
+        for parameter in parameter_contract.get("parameters", [])
+        if parameter.get("name")
+    ]
+
+    example_name = required_inputs[0]["name"] if required_inputs else "required_field"
+    example_locations = (
+        required_inputs[0]["accepted_locations"] if required_inputs else ["form"]
+    )
+    if "form" in example_locations:
+        correct_example = {
+            "primitive": "HttpClient.post",
+            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "body": {example_name: "<value>"},
+            "body_format": "form",
+        }
+    elif "query" in example_locations:
+        correct_example = {
+            "primitive": "HttpClient.get",
+            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "query": {example_name: "<value>"},
+        }
+    else:
+        correct_example = {
+            "primitive": "HttpClient.post",
+            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "body": {example_name: "<value>"},
+            "body_format": "json",
+        }
+
+    return {
+        "contract_name": "PLAN GENERATION CONTRACT",
+        "priority_order": [
+            "Output schema contract",
+            "Interface contract",
+            "Required input placement",
+            "Route candidate selection",
+            "Optimization objective",
+        ],
+        "output_schema_contract": {
+            "version": 1,
+            "steps_location": "steps[]",
+            "sdk_call_shape": "dictionary",
+            "execution_mode": "Use sdk_calls or command, never both in one step",
+        },
+        "required_inputs": required_inputs,
+        "http_method": parameter_contract.get("method", ""),
+        "endpoint": parameter_contract.get("endpoint", ""),
+        "interface_contract": {
+            "sdk_calls_location": "steps[].sdk_calls[]",
+            "query_location": "sdk_calls[].query",
+            "form_location": "sdk_calls[].body",
+            "form_requires": "body_format=form",
+        },
+        "candidate_route_policy": [
+            "Candidate routes describe WHAT strategy to consider.",
+            "They do NOT override HOW the generated plan must satisfy interface contracts.",
+            "Schema compliance has higher priority than route selection.",
+        ],
+        "examples": {
+            "correct": correct_example,
+            "incorrect": {
+                "primitive": correct_example["primitive"],
+                example_name: "<value>",
+            },
+        },
+    }
+
+
+def _build_exploit_transition_context(
+    trajectory: ExploitTrajectoryMemory | None = None,
+) -> dict[str, Any]:
+    """Expose the current graph edge as an LLM planning constraint."""
+    traj = trajectory or get_trajectory()
+    get_current_primitive = getattr(traj, "get_current_primitive", None)
+    if not callable(get_current_primitive):
+        return {}
+
+    current_primitive = str(get_current_primitive() or "").strip()
+    if not current_primitive:
+        return {}
+
+    allowed_next_primitives = list(
+        get_transition_graph().get_next_primitives(current_primitive)
+    )
+    return {
+        "constraint_name": "EXPLOIT CHAIN CONSTRAINT",
+        "current_primitive": current_primitive,
+        "allowed_next_primitives": allowed_next_primitives,
+        "rules": [
+            "Do not generate steps that require primitives not established in the current chain.",
+            "Primitive transition validity has higher priority than route optimization.",
+            "Candidate routes describe possible strategies, but every step must follow valid primitive transitions.",
+        ],
+    }
+
+
+def _build_candidate_routes_layer(
+    confirmed: dict[str, Any],
+    feedback: dict[str, Any] | None = None,
+) -> str:
+    """Build compact ranked candidate routes for the ROUTE prompt layer.
+
+    Uses route_candidate_generator to find, score, and rank exploit routes
+    from the current primitive. Returns a budget-friendly compact string
+    (~300-400 chars) suitable for injection into the system prompt.
+
+    Falls back to empty string if no current primitive can be determined.
+    """
+    try:
+        graph = get_transition_graph()
+        traj = get_trajectory()
+
+        cwe_ids = [v.get("cwe_id", "") for v in confirmed.get("vulnerabilities", []) if v.get("cwe_id")]
+        entry_primitives = graph.get_entry_primitives(cwe_ids)
+        current_primitive = traj.get_current_primitive()
+
+        effective_primitive = current_primitive
+        if not effective_primitive and entry_primitives:
+            effective_primitive = entry_primitives[0]
+
+        if not effective_primitive:
+            return ""
+
+        ranked, _ = generate_and_rank_routes(
+            current_primitive=effective_primitive,
+            graph=graph,
+            feedback=feedback,
+            traj=traj,
+            max_depth=2,
+            max_routes=6,
+        )
+
+        if not ranked:
+            return ""
+
+        verbose = build_candidate_routes_context_verbose(ranked, max_routes=6)
+        print(f"[planner] 🧭 候选路线已生成: {len(ranked)} routes, "
+              f"top={ranked[0].objective}({ranked[0].score:.0f}), "
+              f"chars={len(verbose)}")
+        return verbose
+    except Exception as e:
+        print(f"[planner] ⚠️ 候选路线生成失败: {e}")
+        return ""
+
+
+
 def _build_trajectory_context(traj: ExploitTrajectoryMemory) -> str:
     """Dehydrated trajectory state — compact ~400 char high-density dict (Task 3)."""
     if not traj.nodes:
@@ -1783,7 +2088,7 @@ def _build_trajectory_context(traj: ExploitTrajectoryMemory) -> str:
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
-def _build_primitive_context(confirmed: dict[str, Any]) -> str:
+def _build_primitive_context(confirmed: dict[str, Any], feedback: dict[str, Any] | None = None) -> str:
     """构建 primitive-driven reasoning 上下文注入块。
     这是系统的核心升级：Planner 不再思考 payload，而是思考 primitive。"""
     registry = get_primitive_registry()
@@ -1826,22 +2131,37 @@ def _build_primitive_context(confirmed: dict[str, Any]) -> str:
         lines.append("")
 
     # Current state vs primitive context
-    if current_primitive:
-        lines.append(f"── 🎯 当前 Primitive: {current_primitive} ──")
-        # Next upgrade targets
-        next_prims = graph.get_next_primitives(current_primitive)
-        if next_prims:
-            lines.append("  🔼 推荐升级目标（优先选择）：")
-            for np_id in next_prims:
-                p = registry.get(np_id)
-                cond = graph.get_transition_condition(current_primitive, np_id)
-                if p:
-                    lines.append(f"    → {np_id}: {p.description[:100]}")
-                    lines.append(f"      条件: {cond}")
-                    if p.payload_templates:
-                        lines.append(f"      实例化: {p.payload_templates[0]}")
+    # Determine the effective current primitive: trajectory first, then CWE entry
+    effective_primitive = current_primitive
+    if not effective_primitive and entry_primitives:
+        effective_primitive = entry_primitives[0]
+
+    if effective_primitive:
+        lines.append(f"── 🎯 当前 Primitive: {effective_primitive} ──")
+        # ── Route Candidate Reasoning: compare multiple exploit routes ──
+        ranked_routes, routes_context = generate_and_rank_routes(
+            current_primitive=effective_primitive,
+            graph=graph,
+            feedback=feedback,
+            traj=traj,
+        )
+        if routes_context:
+            lines.append(routes_context)
         else:
-            lines.append("  （已到达该链顶端，考虑 OOB exfiltration 或 credential extraction）")
+            # Fallback: flat next primitives (no routes generated)
+            next_prims = graph.get_next_primitives(current_primitive)
+            if next_prims:
+                lines.append("  🔼 推荐升级目标（优先选择）：")
+                for np_id in next_prims:
+                    p = registry.get(np_id)
+                    cond = graph.get_transition_condition(current_primitive, np_id)
+                    if p:
+                        lines.append(f"    → {np_id}: {p.description[:100]}")
+                        lines.append(f"      条件: {cond}")
+                        if p.payload_templates:
+                            lines.append(f"      实例化: {p.payload_templates[0]}")
+            else:
+                lines.append("  （已到达该链顶端，考虑 OOB exfiltration 或 credential extraction）")
         lines.append("")
 
     # Primitive transition graph
@@ -1884,6 +2204,8 @@ def _build_feedback_block(feedback: dict[str, Any]) -> str:
     fb_milestones = feedback.get("milestones_achieved", [])
     fb_blocker = feedback.get("state_transition_blocker", "")
     fb_next_action = feedback.get("next_required_action", "")
+    fb_failure_analysis = feedback.get("failure_analysis") or {}
+    fb_next_directions = feedback.get("possible_next_direction") or []
     if fb_state:
         fb_parts.append(f"当前攻击状态: {fb_state}")
     if fb_milestones:
@@ -1892,6 +2214,10 @@ def _build_feedback_block(feedback: dict[str, Any]) -> str:
         fb_parts.append(f"状态阻塞点: {fb_blocker}")
     if fb_next_action:
         fb_parts.append(f"下一步: {fb_next_action}")
+    if isinstance(fb_failure_analysis, dict) and fb_failure_analysis:
+        fb_parts.append(f"失败分析: {fb_failure_analysis}")
+    if isinstance(fb_next_directions, list) and fb_next_directions:
+        fb_parts.append(f"可选下一方向: {', '.join(str(x) for x in fb_next_directions[:5])}")
     fb_summary = feedback.get("summary", "")
     if fb_summary:
         fb_parts.append(f"summary: {fb_summary[:200]}")
@@ -1970,14 +2296,44 @@ def run_planner(
 
     # 🔑 RAG 检索：按 CWE + 漏洞描述 + 上轮报错精准匹配三层记忆
     memory_context = _build_memory_context(memory, confirmed, feedback)
+    route_knowledge_provider = RouteKnowledgeProvider()
+    route_knowledge = route_knowledge_provider.for_confirmed(confirmed)
+    route_knowledge_context = route_knowledge_provider.build_planner_context(confirmed)
+    for item in route_knowledge:
+        print(
+            "[planner] Route knowledge injected: "
+            f"primitive={item.primitive} "
+            f"transitions=[{','.join(item.possible_transitions)}] "
+            f"signals=[{','.join(item.expected_signals)}]"
+        )
 
+    # ── Candidate Routes: injected into user message (NOT system prompt) ──
+    # System prompt budget is too tight for route comparison; user message
+    # goes directly to LLM without budget compaction.
+    _candidate_routes_for_user = _build_candidate_routes_layer(confirmed, feedback)
+    _exploit_transition_context = _build_exploit_transition_context()
+
+    # Decision context order: facts -> evaluator feedback -> FSM constraint ->
+    # candidate routes -> generation contract -> memory.
     user = {
         "confirmed_vuln": confirmed,
-        "layered_memory": json.loads(memory.planning_context()),
-        "retrieved_experience": memory_context,
         "prior_feedback": feedback,
         "last_execution_raw": (feedback or {}).get("last_execution_raw", {}),
     }
+    if _exploit_transition_context:
+        user["exploit_chain_constraint"] = _exploit_transition_context
+        print(
+            "[planner] Exploit chain constraint injected:",
+            json.dumps(_exploit_transition_context, ensure_ascii=False),
+        )
+    user["route_knowledge"] = [item.to_plain() for item in route_knowledge]
+    if _candidate_routes_for_user:
+        user["candidate_routes"] = _candidate_routes_for_user
+    # Keep the generation contract after advisory route knowledge so its
+    # schema/placement rules have the highest recency in the user context.
+    user["plan_generation_contract"] = _build_plan_generation_contract(confirmed)
+    user["layered_memory"] = json.loads(memory.planning_context())
+    user["retrieved_experience"] = memory_context
 
     core_logic = _extract_user_goal_dense(confirmed, adapter=adapter)
 
@@ -1999,13 +2355,9 @@ def run_planner(
     # ═══════════════════════════════════════════════════════════════════
     # Tasks 3+4: Strict Physical Memory Budgeting + Attention Routing
     #
-    # 六层注意力拓扑图（位置 1-6，严格不可重排）：
-    #   [L1 头部] Runtime Manifest — 最高指导原则
-    #   [L2]     Hard Constraints & Banned Imports
-    #   [L3]     SDK API Contract
-    #   [L4]     Verified Facts & Memory Context
-    #   [L5]     Dehydrated Trajectory State (compact JSON)
-    #   [L6 尾部] User Goal — 裁剪后的攻击目标摘要
+    # Relative decision priority for dynamic knowledge is fixed:
+    # runtime constraints -> confirmed facts -> evaluator feedback
+    # -> route knowledge/diversification -> long-term memory.
     #
     # 每一层由 MEMORY_BUDGET 物理硬截断；
     # 最终 total payload 由 _FINAL_PAYLOAD_HARD_CAP 再次双保险切片。
@@ -2026,13 +2378,26 @@ def run_planner(
             _retry_block = _enforce_section_budget(forbidden_block, 700, "memory")[0]
             print(f"[planner] 失败指纹黑名单独立为 retry_constraints ({len(_retry_block)} chars)")
 
+    # ── L2c: Strategy Diversification (dynamic — objective expansion when stuck) ──
+    # Higher priority than retry_constraints: strategic guidance, only injected when
+    # multi-signal detection confirms stagnation (e.g. reflection_blocked).
+    _diversify_block = ""
+    if feedback:
+        _stagnation_type = _detect_strategy_stagnation(feedback)
+        if _stagnation_type:
+            _diversify_raw = _build_objective_diversification_block(_stagnation_type)
+            if _diversify_raw:
+                _diversify_block = _enforce_section_budget(_diversify_raw, 800, "memory")[0]
+                print(f"[planner] 🧭 策略多样化已注入: stagnation={_stagnation_type} "
+                      f"({len(_diversify_block)} chars)")
+
     # ── L3: SDK API Contract ──
     l3 = _apply_memory_budget("sdk_contract", _build_sdk_contract_block())
 
-    # ── L4: Verified Facts (primitive context + verification + memory) ──
+    # ── Confirmed vulnerability facts ──
     l4_parts: list[str] = []
 
-    primitive_context = _build_primitive_context(confirmed)
+    primitive_context = _build_primitive_context(confirmed, feedback)
     if primitive_context:
         l4_parts.append(_enforce_section_budget(primitive_context, 500, "memory")[0])
 
@@ -2041,10 +2406,25 @@ def run_planner(
     if verif_context and verif.get_stats()["facts_count"] > 0:
         l4_parts.append(_enforce_section_budget(verif_context, 300, "memory")[0])
 
-    if memory_context:
-        l4_parts.append(_enforce_section_budget(memory_context, 400, "memory")[0])
-
     l4 = _apply_memory_budget("verified_facts", "\n\n".join(l4_parts)) if l4_parts else ""
+
+    # Evaluator feedback outranks advisory route knowledge. Route knowledge in
+    # turn outranks ordinary long-term memory and remains payload-free.
+    _feedback_layer = (
+        _enforce_section_budget(_build_feedback_block(feedback), 700, "memory")[0]
+        if feedback
+        else ""
+    )
+    _route_layer = (
+        _compact_route_knowledge(route_knowledge)
+        if route_knowledge
+        else ""
+    )
+    _memory_layer = (
+        _enforce_section_budget(memory_context, 400, "memory")[0]
+        if memory_context
+        else ""
+    )
 
     # ── L5: Trajectory State (dehydrated compact JSON, ~300 char budget) ──
     traj = get_trajectory()
@@ -2054,19 +2434,35 @@ def run_planner(
     # ── L6: User Goal (never mid-text sliced — compacted by section if needed) ──
     l6 = core_logic
 
-    # ── Explicit layer ordering: L1 → L2(static) → RETRY(dynamic) → L3 → L4 → L5 → L6 ──
+    # ── Explicit knowledge order: runtime -> facts -> feedback -> route -> memory ──
     _retry_key = "RETRY"
+    _diversify_key = "DIVERSIFY"
     _layers: dict[str, str] = {}
     _layers["L1"] = l1
     _layers["L2"] = l2
-    if _retry_block:
-        _layers[_retry_key] = _retry_block
     _layers["L3"] = l3
     _layers["L4"] = l4
+    if _feedback_layer:
+        _layers["FEEDBACK"] = _feedback_layer
+    if _retry_block:
+        _layers[_retry_key] = _retry_block
+    if _route_layer:
+        _layers["ROUTE"] = _route_layer
+    if _diversify_block:
+        _layers[_diversify_key] = _diversify_block
+    if _memory_layer:
+        _layers["MEMORY"] = _memory_layer
     _layers["L5"] = l5
     _layers["L6"] = l6
-    # Drop priority: RETRY first (compact older entries, keep latest summary), then L4, L5, compact L6
-    _drop_order = [_retry_key, "L4", "L5", "L6"]
+    # Drop priority (first dropped = lowest value):
+    #   MEMORY (long-term, large) → RETRY (old failure debris) →
+    #   L5 (trajectory) → L4 (verified facts) → ROUTE (second) →
+    #   DIVERSIFY (decision constraint) → FEEDBACK (evaluator signal) →
+    #   L6 (mission — absolute last resort)
+    _drop_order = [
+        "MEMORY", _retry_key, "L5", "L4",
+        "ROUTE", _diversify_key, "FEEDBACK", "L6",
+    ]
     _drop_idx = 0
 
     def _assemble() -> str:
@@ -2120,6 +2516,9 @@ def run_planner(
             if after_layer < before_layer:
                 _layers[layer_key] = trimmed
                 made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True  # already fits, guard must not drop
+                _drop_idx += 1
             else:
                 # No reduction — keep latest summary only or drop entirely
                 parts = layer_content.split("\n── Older")
@@ -2135,14 +2534,47 @@ def run_planner(
             _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
             _budget_diag[layer_key]["passes"] += 1
             _budget_diag[layer_key]["rendered"] = after_layer
-        elif layer_key in ("L4", "L5"):
-            section_type = "memory" if layer_key == "L4" else "trajectory"
+        elif layer_key == _diversify_key:
+            # Strategy diversification: compact to core, keep constraint
+            target_limit = max(len(layer_content) // 2, 200)
+            trimmed, dropped = _enforce_section_budget(layer_content, target_limit, "memory")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                _layers[layer_key] = trimmed
+                made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                # Already fits — mark progress so guard doesn't drop us
+                made_progress = True
+                _drop_idx += 1
+            else:
+                # Keep only the constraint directive
+                for anchor in ("禁止：", "禁止", "DIVERSIFICATION"):
+                    idx = layer_content.find(anchor)
+                    if idx >= 0:
+                        _layers[layer_key] = layer_content[idx:]
+                        after_layer = len(_layers[layer_key])
+                        made_progress = after_layer < before_layer
+                        break
+                else:
+                    _layers[layer_key] = ""
+                    after_layer = 0
+                    _drop_idx += 1
+                    made_progress = True
+            _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
+            _budget_diag[layer_key]["passes"] += 1
+            _budget_diag[layer_key]["rendered"] = after_layer
+        elif layer_key in ("L4", "L5", "MEMORY", "ROUTE", "FEEDBACK"):
+            section_type = "trajectory" if layer_key == "L5" else "memory"
             target_limit = max(len(layer_content) // 2, 100)
             trimmed, dropped = _enforce_section_budget(layer_content, target_limit, section_type)
             after_layer = len(trimmed)
             if after_layer < before_layer:
                 _layers[layer_key] = trimmed
                 made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                # Already fits — keep, don't drop
+                made_progress = True
+                _drop_idx += 1
             else:
                 # No reduction — drop entirely
                 _layers[layer_key] = ""
@@ -2159,6 +2591,9 @@ def run_planner(
             if after_layer < before_layer:
                 _layers[layer_key] = trimmed
                 made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True
+                _drop_idx += 1
             else:
                 _drop_idx += 1
             _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
@@ -2179,7 +2614,7 @@ def run_planner(
     # ── Aggregated budget diagnostic (at most one line per compacted section) ──
     if _budget_diag:
         diag_parts = []
-        for lk in ("RETRY", "L4", "L5", "L6"):
+        for lk in ("MEMORY", "RETRY", "L5", "DIVERSIFY", "ROUTE", "FEEDBACK", "L4", "L6"):
             d = _budget_diag.get(lk)
             if d and d["passes"] > 0:
                 diag_parts.append(
@@ -2188,51 +2623,6 @@ def run_planner(
         if diag_parts:
             print(f"[planner][budget] compacted: " + " | ".join(diag_parts)
                   + f" | total={len(system_prompt_with_memory)}/{_FINAL_PAYLOAD_HARD_CAP}")
-
-    # ── Append feedback, then re-enforce ──
-    if feedback:
-        fb_block = _build_feedback_block(feedback)
-        system_prompt_with_memory += "\n" + fb_block
-        # Re-enforce: drop from feedback first if needed (max 16 iterations)
-        _fb_iter = 0
-        _FB_MAX_ITERS = 16
-        while len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
-            _fb_iter += 1
-            if _fb_iter > _FB_MAX_ITERS:
-                # Hard fallback: drop feedback block
-                system_prompt_with_memory = _assemble()
-                break
-            fb_before = len(system_prompt_with_memory)
-            # Split off feedback, try dropping from it
-            parts = system_prompt_with_memory.rsplit("\n【上一轮执行反馈", 1)
-            if len(parts) == 2 and len(parts[0]) < _FINAL_PAYLOAD_HARD_CAP:
-                fb_remaining = _FINAL_PAYLOAD_HARD_CAP - len(parts[0]) - 5
-                fb_trimmed, _ = _enforce_section_budget(parts[1], fb_remaining, "memory")
-                system_prompt_with_memory = parts[0] + "\n" + fb_trimmed
-                if len(system_prompt_with_memory) >= fb_before:
-                    # No progress — drop feedback entirely
-                    system_prompt_with_memory = _assemble()
-                break
-            else:
-                # Drop L4, then L5, then compact L6
-                dropped_one = False
-                for lk in ("L4", "L5"):
-                    if _layers.get(lk):
-                        _layers[lk] = ""
-                        dropped_one = True
-                        break
-                if not dropped_one:
-                    prev_l6 = len(_layers.get("L6", ""))
-                    _layers["L6"], _ = _enforce_section_budget(
-                        _layers["L6"], max(len(_layers.get("L6", "")) // 2, 400), "user_goal"
-                    )
-                    if len(_layers.get("L6", "")) >= prev_l6:
-                        # Can't compact L6 further — drop feedback
-                        system_prompt_with_memory = _assemble()
-                        break
-                system_prompt_with_memory = _assemble()
-                if feedback:
-                    system_prompt_with_memory += "\n" + fb_block
 
     # ── Final invariant assertion ──
     assert len(system_prompt_with_memory) <= _FINAL_PAYLOAD_HARD_CAP, (
@@ -2282,3 +2672,541 @@ def run_planner(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return plan
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Regression Tests — Strategy Diversification
+# ═══════════════════════════════════════════════════════════════════
+
+def test_regression_reflection_blocked_strategy_diversification() -> dict[str, Any]:
+    """Regression test: when feedback indicates reflection_blocked,
+    the Planner candidate strategy must NOT consist solely of RCE.
+
+    Returns a dict with keys: passed, details, failures.
+    """
+    failures: list[str] = []
+    details: list[str] = []
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 1: reflection_blocked detection — positive case
+    # ────────────────────────────────────────────────────────────────
+    fb_reflection_blocked: dict[str, Any] = {
+        "primitive_confirmed": True,
+        "exploit_completed": False,
+        "flag_found": False,
+        "repro_success": False,
+        "primitive_state": {"ssti": True, "rce": False, "arithmetic": False},
+        "current_exploit_state": "probe_success",
+        "detected_primitives": ["ssti_reflection"],
+        "what_failed": "RCE payload reflected literally, no execution evidence",
+        "state_transition_blocker": (
+            "reflected literally in response body; "
+            "Java reflection (class.forName/Runtime/ProcessBuilder/ScriptEngine) "
+            "blocked by Velocity security policy"
+        ),
+        "raw_evidence": (
+            "Step 2: payload reflected as <h2 class=\"fire\">..."
+            "$x.class.forName('java.lang.Runtime')</h2>"
+        ),
+        "failure_analysis": {
+            "type": "primitive_only",
+            "detail": (
+                "arithmetic_result_in_response confirms SSTI primitive, "
+                "but reflection chain blocked; payload reflected literally"
+            ),
+        },
+    }
+
+    stagnation = _detect_strategy_stagnation(fb_reflection_blocked)
+    if stagnation != "reflection_blocked":
+        failures.append(
+            f"Test 1 FAIL: expected 'reflection_blocked', got {stagnation!r}"
+        )
+    else:
+        details.append("Test 1 PASS: reflection_blocked detected correctly")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 2: reflection_blocked with explicit failure_reason
+    # ────────────────────────────────────────────────────────────────
+    fb_explicit: dict[str, Any] = {
+        "primitive_confirmed": True,
+        "exploit_completed": False,
+        "failure_reason": "reflection_blocked",
+    }
+    stagnation2 = _detect_strategy_stagnation(fb_explicit)
+    if stagnation2 != "reflection_blocked":
+        failures.append(
+            f"Test 2 FAIL: explicit failure_reason should trigger detection, "
+            f"got {stagnation2!r}"
+        )
+    else:
+        details.append("Test 2 PASS: explicit failure_reason='reflection_blocked' detected")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 3: negative case — no stagnation (successful exploit)
+    # ────────────────────────────────────────────────────────────────
+    fb_success: dict[str, Any] = {
+        "primitive_confirmed": True,
+        "exploit_completed": True,
+        "flag_found": True,
+    }
+    stagnation3 = _detect_strategy_stagnation(fb_success)
+    if stagnation3 is not None:
+        failures.append(
+            f"Test 3 FAIL: successful exploit should NOT trigger stagnation, "
+            f"got {stagnation3!r}"
+        )
+    else:
+        details.append("Test 3 PASS: completed exploit does not trigger stagnation")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 4: negative case — no primitive confirmed
+    # ────────────────────────────────────────────────────────────────
+    fb_no_primitive: dict[str, Any] = {
+        "primitive_confirmed": False,
+        "exploit_completed": False,
+        "current_exploit_state": "init",
+    }
+    stagnation4 = _detect_strategy_stagnation(fb_no_primitive)
+    if stagnation4 is not None:
+        failures.append(
+            f"Test 4 FAIL: no primitive confirmed should NOT trigger stagnation, "
+            f"got {stagnation4!r}"
+        )
+    else:
+        details.append("Test 4 PASS: no primitive confirmed — no stagnation")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 5: diversification block contains all 4 strategy dimensions
+    # ────────────────────────────────────────────────────────────────
+    block = _build_objective_diversification_block("reflection_blocked")
+    if not block:
+        failures.append("Test 5 FAIL: diversification block is empty")
+    else:
+        required_dimensions = [
+            "command_execution",
+            "file_read",
+            "template_access",
+            "configuration_disclosure",
+        ]
+        missing = [d for d in required_dimensions if d not in block]
+        if missing:
+            failures.append(
+                f"Test 5 FAIL: diversification block missing dimensions: {missing}"
+            )
+        else:
+            details.append("Test 5 PASS: all 4 strategy dimensions present")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 6: diversification block does NOT contain hardcoded payloads
+    # ────────────────────────────────────────────────────────────────
+    forbidden_payload_markers = [
+        "#set($x=7*7)$x",                   # arithmetic probe
+        "class.forName",                     # reflection chain
+        "getRuntime().exec",                 # RCE payload
+        "ProcessBuilder",                    # alternative RCE
+        "ScriptEngine",                      # alternative RCE
+        "{{7*7}}",                           # Jinja2 SSTI probe
+        '{{config.__class__.__init__',       # Flask SSTI chain
+        "' OR '1'='1",                       # SQL injection probe
+    ]
+    for marker in forbidden_payload_markers:
+        if marker in block:
+            failures.append(
+                f"Test 6 FAIL: diversification block contains hardcoded payload: "
+                f"{marker!r}"
+            )
+            break
+    else:
+        details.append("Test 6 PASS: no hardcoded payloads in diversification block")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 7: block for unknown stagnation type is empty
+    # ────────────────────────────────────────────────────────────────
+    block_unknown = _build_objective_diversification_block("unknown_type")
+    if block_unknown != "":
+        failures.append(
+            f"Test 7 FAIL: unknown stagnation type should return empty string, "
+            f"got {len(block_unknown)} chars"
+        )
+    else:
+        details.append("Test 7 PASS: unknown stagnation type returns empty")
+
+    # ────────────────────────────────────────────────────────────────
+    # Test 8: block contains strategy selection rules (not just categories)
+    # ────────────────────────────────────────────────────────────────
+    if "strategy stagnation" not in block or "do not repeat" not in block:
+        failures.append(
+            "Test 8 FAIL: diversification block missing constraint directive"
+        )
+    else:
+        details.append("Test 8 PASS: constraint directive present")
+
+    return {
+        "passed": len(failures) == 0,
+        "total_tests": len(details) + len(failures),
+        "passed_count": len(details),
+        "failed_count": len(failures),
+        "details": details,
+        "failures": failures,
+    }
+
+
+def test_diversification_survives_budget_compaction() -> dict[str, Any]:
+    """Regression test: when memory/trajectory/route layers are all large,
+    the DIVERSIFY layer must survive budget compaction and make it into
+    the final prompt. DIVERSIFY orig=N→0 is a hard failure.
+
+    Also verifies the compressed block is < 350 chars so it fits naturally.
+    """
+    failures: list[str] = []
+    details: list[str] = []
+
+    # ── 1. Build synthetic large layers to simulate budget pressure ──
+    # L1+L2+L3 are ~1600 chars combined (critical, never dropped)
+    l1 = "L1 " + "X" * 493    # Runtime Manifest
+    l2 = "L2 " + "X" * 681    # Hard Constraints
+    l3 = "L3 " + "X" * 441    # SDK Contract
+    critical_len = len(l1) + len(l2) + len(l3) + 4 * 3  # + separators
+
+    # Dynamic layers — simulate a full prompt
+    memory_layer = "MEMORY " + "X" * 800     # Large long-term memory
+    retry_layer = """╔════ RETRY ════╗
+Latest validator rejection:
+  unknown: some error
+  Use HttpClient query/body; do not import urllib.
+── Older failures ──
+  🚫 禁止项 #1 (step 1 — validator_rejected)
+  🚫 禁止项 #2 (step 2 — validator_rejected)
+╚══════════════════╝"""
+
+    l4_layer = "L4 " + "X" * 700     # Verified facts
+    l5_layer = "L5 " + "X" * 300     # Trajectory
+    route_layer = (
+        "[ROUTE] primitive=ssti_reflection → {ssti_execution,blind_ssti} "
+        "signals:{arithmetic_result_in_response}"
+    )  # ~110 chars, compact format
+    feedback_layer = "FEEDBACK " + "X" * 700  # Evaluator feedback
+
+    # The DIVERSIFY block — actual production content
+    diversify_layer = _build_objective_diversification_block("reflection_blocked")
+    if not diversify_layer:
+        failures.append("DIVERSIFY-SURVIVE-0: diversification block is empty")
+        return {
+            "passed": False, "total_tests": 1, "passed_count": 0,
+            "failed_count": 1, "details": [], "failures": failures,
+        }
+
+    # L6 user goal — the mission
+    l6_layer = "TARGET " + "X" * 2600
+
+    # ── 2. Verify compressed block fits < 350 chars ──
+    block_len = len(diversify_layer)
+    if block_len > 350:
+        failures.append(
+            f"DIVERSIFY-SURVIVE-1: block too large ({block_len} > 350 chars)"
+        )
+    else:
+        details.append(
+            f"DIVERSIFY-SURVIVE-1 PASS: block is {block_len} chars (under 350)"
+        )
+
+    # ── 3. Assemble layers in production order ──
+    _retry_key = "RETRY"
+    _diversify_key = "DIVERSIFY"
+    layers: dict[str, str] = {
+        "L1": l1, "L2": l2, "L3": l3, "L4": l4_layer,
+        "FEEDBACK": feedback_layer,
+        _retry_key: retry_layer, "ROUTE": route_layer,
+        _diversify_key: diversify_layer, "MEMORY": memory_layer,
+        "L5": l5_layer, "L6": l6_layer,
+    }
+
+    # Same drop order as production (after fix)
+    drop_order = [
+        "MEMORY", _retry_key, "L5", "L4",
+        "ROUTE", _diversify_key, "FEEDBACK", "L6",
+    ]
+
+    def _assemble() -> str:
+        return "\n\n".join(v for v in layers.values() if v)
+
+    prompt = _assemble()
+    initial_len = len(prompt)
+    details.append(
+        f"DIVERSIFY-SURVIVE-2 INFO: initial prompt {initial_len} chars "
+        f"(critical={critical_len})"
+    )
+
+    # ── 4. Run budget compaction loop ──
+    HARD_CAP = 5000
+    drop_idx = 0
+    budget_diag: dict[str, dict[str, int]] = {}
+    MAX_ITERS = 32
+    budget_iter = 0
+
+    while len(prompt) > HARD_CAP:
+        budget_iter += 1
+        if budget_iter > MAX_ITERS:
+            break
+
+        before_total = len(prompt)
+        if drop_idx >= len(drop_order):
+            # All layers visited — force-compact L6
+            l6_content = layers.get("L6", "")
+            if l6_content:
+                layers["L6"], _ = _enforce_section_budget(
+                    l6_content, HARD_CAP - critical_len - 10, "user_goal",
+                )
+            layers["L4"] = ""
+            layers["L5"] = ""
+            prompt = _assemble()
+            break
+
+        layer_key = drop_order[drop_idx]
+        layer_content = layers.get(layer_key, "")
+        if not layer_content:
+            drop_idx += 1
+            continue
+
+        before_layer = len(layer_content)
+        made_progress = False
+
+        # Same compaction logic as production (with already-fits guard)
+        if layer_key == _retry_key:
+            target_limit = max(len(layer_content) // 2, 200)
+            trimmed, _ = _enforce_section_budget(layer_content, target_limit, "memory")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                layers[layer_key] = trimmed
+                made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True; drop_idx += 1
+            else:
+                parts = layer_content.split("\n── Older")
+                if len(parts) >= 2 and len(parts[0]) < before_layer:
+                    layers[layer_key] = parts[0]
+                    made_progress = True
+                else:
+                    layers[layer_key] = ""; drop_idx += 1; made_progress = True
+        elif layer_key == _diversify_key:
+            target_limit = max(len(layer_content) // 2, 200)
+            trimmed, _ = _enforce_section_budget(layer_content, target_limit, "memory")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                layers[layer_key] = trimmed
+                made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True; drop_idx += 1
+            else:
+                for anchor in ("[DIVERSIFY]", "DIVERSIFY", "strategy stagnation"):
+                    idx = layer_content.find(anchor)
+                    if idx >= 0:
+                        layers[layer_key] = layer_content[idx:]
+                        made_progress = True
+                        break
+                else:
+                    layers[layer_key] = ""; drop_idx += 1; made_progress = True
+        elif layer_key in ("L4", "L5", "MEMORY", "ROUTE", "FEEDBACK"):
+            section_type = "trajectory" if layer_key == "L5" else "memory"
+            target_limit = max(len(layer_content) // 2, 100)
+            trimmed, _ = _enforce_section_budget(layer_content, target_limit, section_type)
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                layers[layer_key] = trimmed
+                made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True; drop_idx += 1
+            else:
+                layers[layer_key] = ""; drop_idx += 1; made_progress = True
+        elif layer_key == "L6":
+            target_limit = max(len(layer_content) * 3 // 4, 500)
+            trimmed, _ = _enforce_section_budget(layer_content, target_limit, "user_goal")
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                layers[layer_key] = trimmed
+                made_progress = True
+            elif after_layer == before_layer and after_layer <= target_limit:
+                made_progress = True; drop_idx += 1
+            else:
+                drop_idx += 1
+
+        budget_diag.setdefault(layer_key, {"original": before_layer, "passes": 0})
+        budget_diag[layer_key]["passes"] += 1
+        budget_diag[layer_key]["rendered"] = len(layers.get(layer_key, ""))
+
+        prompt = _assemble()
+        after_total = len(prompt)
+        if after_total >= before_total and not made_progress:
+            if layers.get(layer_key):
+                layers[layer_key] = ""
+            drop_idx += 1
+            prompt = _assemble()
+
+    final_len = len(prompt)
+
+    # ── 5. Assertions ──
+    # 5a: MEMORY should be dropped (it's lowest priority)
+    memory_rendered = len(layers.get("MEMORY", ""))
+    if memory_rendered > 0:
+        details.append(
+            f"DIVERSIFY-SURVIVE-3 INFO: MEMORY survived ({memory_rendered} chars) "
+            f"— prompt may have had spare capacity"
+        )
+
+    # 5b: DIVERSIFY must survive (not compressed to 0)
+    diversify_rendered = len(layers.get(_diversify_key, ""))
+    if diversify_rendered == 0:
+        failures.append(
+            "DIVERSIFY-SURVIVE-3 FAIL: DIVERSIFY was compressed to 0 — "
+            "strategic guidance lost before reaching LLM"
+        )
+    else:
+        details.append(
+            f"DIVERSIFY-SURVIVE-3 PASS: DIVERSIFY survived "
+            f"({diversify_rendered} chars)"
+        )
+
+    # 5c: Final prompt must contain diversification content.
+    diversify_markers = [
+        "[DIVERSIFY]", "strategy stagnation", "do not repeat",
+        "command_execution", "file_read",
+    ]
+    if not any(m in prompt for m in diversify_markers):
+        failures.append(
+            "DIVERSIFY-SURVIVE-4 FAIL: final prompt has no diversification marker. "
+            f"Expected at least one of: {diversify_markers}"
+        )
+    else:
+        found_markers = [m for m in diversify_markers if m in prompt]
+        details.append(
+            f"DIVERSIFY-SURVIVE-4 PASS: diversification markers in prompt: "
+            f"{found_markers}"
+        )
+
+    # 5d: Must contain at least one alternative objective keyword
+    alt_objectives = ["file_read", "configuration_disclosure",
+                      "template_access", "command_execution"]
+    found_obj = [kw for kw in alt_objectives if kw in prompt]
+    has_diversify = "[DIVERSIFY]" in prompt or "strategy stagnation" in prompt
+    if not found_obj and not has_diversify:
+        failures.append(
+            f"DIVERSIFY-SURVIVE-5 FAIL: no alternative objective found. "
+            f"Expected at least one of: {alt_objectives}"
+        )
+    elif found_obj:
+        details.append(
+            f"DIVERSIFY-SURVIVE-5 PASS: alternative objectives in prompt: {found_obj}"
+        )
+    else:
+        details.append(
+            "DIVERSIFY-SURVIVE-5 PASS: DIVERSIFY label survived "
+            "(objectives compacted under pressure)"
+        )
+
+    # 5e: ROUTE must survive (not compressed to 0)
+    route_rendered = len(layers.get("ROUTE", ""))
+    if route_rendered == 0:
+        failures.append(
+            "DIVERSIFY-SURVIVE-8 FAIL: ROUTE was compressed to 0 — "
+            "route intelligence lost before reaching LLM"
+        )
+    else:
+        details.append(
+            f"DIVERSIFY-SURVIVE-8 PASS: ROUTE survived ({route_rendered} chars)"
+        )
+
+    # 5f: No hardcoded payload leakage in DIVERSIFY block
+    payload_markers = [
+        "#set($x=7*7)", "class.forName", "getRuntime().exec",
+        "ProcessBuilder", "ScriptEngine", "{{7*7}}",
+        "{{config.__class__", "' OR '1'='1",
+    ]
+    leaked = [m for m in payload_markers if m in diversify_layer]
+    if leaked:
+        failures.append(
+            f"DIVERSIFY-SURVIVE-6 FAIL: payload leaked in DIVERSIFY block: {leaked}"
+        )
+    else:
+        details.append(
+            "DIVERSIFY-SURVIVE-6 PASS: no payload leakage in DIVERSIFY block"
+        )
+
+    # 5g: Final prompt is under cap
+    if final_len > HARD_CAP:
+        failures.append(
+            f"DIVERSIFY-SURVIVE-7 FAIL: final prompt {final_len} > cap {HARD_CAP}"
+        )
+    else:
+        details.append(
+            f"DIVERSIFY-SURVIVE-7 PASS: final prompt {final_len} <= cap {HARD_CAP}"
+        )
+
+    # ── 6. Diagnostic summary ──
+    diag_parts = []
+    for lk in drop_order:
+        d = budget_diag.get(lk)
+        if d and d["passes"] > 0:
+            diag_parts.append(
+                f"{lk} orig={d['original']}→{d.get('rendered', 0)} passes={d['passes']}"
+            )
+    if diag_parts:
+        details.append(f"DIVERSIFY-SURVIVE-DIAG: " + " | ".join(diag_parts))
+
+    return {
+        "passed": len(failures) == 0,
+        "total_tests": len(details) + len(failures),
+        "passed_count": len(details),
+        "failed_count": len(failures),
+        "details": details,
+        "failures": failures,
+    }
+
+
+if __name__ == "__main__":
+    # ── Test suite 1: strategy diversification detection + block content ──
+    result1 = test_regression_reflection_blocked_strategy_diversification()
+    print(f"\n{'='*60}")
+    print(f"Test Suite 1: Strategy Diversification Detection & Content")
+    print(f"{'='*60}")
+    for d in result1["details"]:
+        print(f"  [PASS] {d}")
+    for f in result1["failures"]:
+        print(f"  [FAIL] {f}")
+    print(f"  Total: {result1['total_tests']} | "
+          f"Passed: {result1['passed_count']} | "
+          f"Failed: {result1['failed_count']}")
+    print(f"  OVERALL: {'PASS' if result1['passed'] else 'FAIL'}")
+
+    # ── Test suite 2: budget survival ──
+    result2 = test_diversification_survives_budget_compaction()
+    print(f"\n{'='*60}")
+    print(f"Test Suite 2: DIVERSIFY Budget Survival")
+    print(f"{'='*60}")
+    for d in result2["details"]:
+        print(f"  [PASS] {d}")
+    for f in result2["failures"]:
+        print(f"  [FAIL] {f}")
+    print(f"  Total: {result2['total_tests']} | "
+          f"Passed: {result2['passed_count']} | "
+          f"Failed: {result2['failed_count']}")
+    print(f"  OVERALL: {'PASS' if result2['passed'] else 'FAIL'}")
+
+    print(f"\n{'='*60}")
+    all_passed = result1["passed"] and result2["passed"]
+    print(f"  ALL TESTS: {'PASS' if all_passed else 'FAIL'}")
+    print(f"{'='*60}")
+    sys.exit(0 if all_passed else 1)
+    print(f"\n{'='*60}")
+    print(f"Strategy Diversification Regression Test")
+    print(f"{'='*60}")
+    for d in result["details"]:
+        print(f"  [PASS] {d}")
+    for f in result["failures"]:
+        print(f"  [FAIL] {f}")
+    print(f"\n  Total: {result['total_tests']} | "
+          f"Passed: {result['passed_count']} | "
+          f"Failed: {result['failed_count']}")
+    print(f"  OVERALL: {'PASS' if result['passed'] else 'FAIL'}")
+    print(f"{'='*60}")
+    sys.exit(0 if result["passed"] else 1)

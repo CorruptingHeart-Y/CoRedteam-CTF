@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import logging
 import re
 import socket
 import textwrap
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import docker
 from docker.errors import DockerException, ImageNotFound
@@ -80,6 +82,25 @@ class RawResponse:
     def json(self) -> dict:
         import json as _json
         return _json.loads(self._body)
+class ExecutionNetworkConnectError(RuntimeError):
+    # Stable transport failure surfaced to the host Executor.
+    pass
+
+
+def _execution_base_url(base_url: str) -> str:
+    # Use the Executor-provided transport URL for the locked policy target.
+    for path in (_CONTEXT_PATH, f"{_WORKSPACE}/context.json"):
+        try:
+            target_context = json.loads(Path(path).read_text()).get("target_context", {})
+        except (OSError, json.JSONDecodeError):
+            continue
+        execution_url = target_context.get("execution_base_url", "")
+        policy_url = target_context.get("policy_base_url") or target_context.get("base_url", "")
+        if execution_url and (not base_url or base_url.rstrip("/") == policy_url.rstrip("/")):
+            return execution_url
+    return base_url
+
+
 
 
 # ── HttpClient ──────────────────────────────────
@@ -88,6 +109,7 @@ class HttpClient(requests.Session):
     \"\"\"Generic red-team HTTP client: SSL-ignore, cookie persistence, CSRF extraction.\"\"\"
 
     def __init__(self, base_url: str = "", verify_ssl: bool = False):
+        base_url = _execution_base_url(base_url)
         super().__init__()
         self.base_url       = base_url.rstrip("/") if base_url else ""
         self._verify_ssl    = verify_ssl
@@ -98,7 +120,12 @@ class HttpClient(requests.Session):
         if self.base_url and not url.startswith(("http://", "https://")):
             url = f"{self.base_url}{url}"
         kwargs.setdefault("verify", self._verify_ssl)
-        resp = super().request(method.upper(), url, *args, **kwargs)
+        try:
+            resp = super().request(method.upper(), url, *args, **kwargs)
+        except requests.exceptions.ConnectionError as exc:
+            raise ExecutionNetworkConnectError(
+                f"[EXECUTION_NETWORK_CONNECT_FAILED] {method.upper()} {url}: {exc}"
+            ) from exc
         self._last_response = resp
         return resp
 
@@ -139,7 +166,12 @@ class HttpClient(requests.Session):
         # create_connection iterates ALL getaddrinfo results (cf. Docker
         # extra_hosts where localhost resolves to both 127.0.0.1 and the
         # target container IP). Plain socket.connect() only tries the first.
-        sock = socket.create_connection((host, port), timeout=15)
+        try:
+            sock = socket.create_connection((host, port), timeout=15)
+        except OSError as exc:
+            raise ExecutionNetworkConnectError(
+                f"[EXECUTION_NETWORK_CONNECT_FAILED] {method.upper()} {host}:{port}: {exc}"
+            ) from exc
         try:
             if use_tls:
                 ctx = ssl.create_default_context()
@@ -496,7 +528,8 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
         "    with open('/workspace/tmp/context.json') as f: _prior_ctx = json.load(f)",
         "except (FileNotFoundError, json.JSONDecodeError):",
         "    with open('/workspace/context.json') as f: _prior_ctx = json.load(f)",
-        "target_base = _prior_ctx.get('target_context', {}).get('base_url', '')",
+        "target_context = _prior_ctx.get('target_context', {})",
+        "target_base = target_context.get('execution_base_url') or target_context.get('base_url', '')",
         "s = HttpClient(target_base)",
         "",
     ])
@@ -631,6 +664,96 @@ SECCOMP_PROFILE = {
 class SecurityViolationError(Exception):
     pass
 
+
+class ExecutionNetworkError(RuntimeError):
+    """Fail-closed error raised before an unsafe/unreachable transport starts."""
+
+    def __init__(self, code: str, detail: str, diagnostics: dict[str, Any] | None = None):
+        self.code = code
+        self.detail = detail
+        self.diagnostics = diagnostics or {}
+        super().__init__(f"[{code}] {detail}")
+
+
+@dataclass(frozen=True)
+class ExecutionTargetContext:
+    """One immutable source for policy authorization and Docker transport routing."""
+
+    policy_base_url: str
+    policy_host: str
+    policy_port: int
+    policy_scheme: str
+    execution_base_url: str
+    execution_host: str
+    execution_port: int
+    network_mode: str
+
+    @property
+    def transport_authority(self) -> str:
+        return f"{self.execution_host}:{self.execution_port}"
+
+    def to_context_dict(self) -> dict[str, Any]:
+        # Compatibility fields remain the original locked policy target.
+        return {
+            "base_url": self.policy_base_url,
+            "host": self.policy_host,
+            "port": self.policy_port,
+            "scheme": self.policy_scheme,
+            "policy_base_url": self.policy_base_url,
+            "execution_base_url": self.execution_base_url,
+            "execution_host": self.execution_host,
+            "execution_port": self.execution_port,
+            "network_mode": self.network_mode,
+        }
+
+
+def _build_execution_target_context(policy_base_url: str) -> ExecutionTargetContext:
+    """Derive Docker transport routing without changing the locked policy URL."""
+    policy_base_url = (policy_base_url or "").strip()
+    try:
+        parsed = urlparse(policy_base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("policy URL must contain an http(s) scheme and host")
+        if parsed.username or parsed.password:
+            raise ValueError("policy URL credentials are not supported")
+        policy_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except (TypeError, ValueError) as exc:
+        raise ExecutionNetworkError(
+            "EXECUTION_TARGET_RESOLUTION_FAILED",
+            f"cannot construct Docker execution URL from policy target: {exc}",
+            {"policy_base_url": policy_base_url},
+        ) from exc
+
+    policy_host = parsed.hostname
+    is_loopback = policy_host.lower() == "localhost"
+    if not is_loopback:
+        try:
+            policy_ip = ipaddress.ip_address(policy_host)
+            is_loopback = str(policy_ip) in ("127.0.0.1", "::1")
+        except ValueError:
+            pass
+
+    if is_loopback:
+        execution_host = "host.docker.internal"
+        execution_base_url = urlunparse(
+            parsed._replace(netloc=f"{execution_host}:{policy_port}")
+        )
+        network_mode = "docker-host-gateway"
+    else:
+        execution_host = policy_host
+        execution_base_url = policy_base_url
+        network_mode = "docker-direct"
+
+    return ExecutionTargetContext(
+        policy_base_url=policy_base_url,
+        policy_host=policy_host,
+        policy_port=policy_port,
+        policy_scheme=parsed.scheme,
+        execution_base_url=execution_base_url,
+        execution_host=execution_host,
+        execution_port=policy_port,
+        network_mode=network_mode,
+    )
 
 # ──────────────────────────────────────────────
 #  网络隔离辅助
@@ -889,11 +1012,12 @@ class DockerSandbox:
 
         # ── 网络策略：优先直连靶机容器网络（不经过宿主机） ──
         target_net: str | None = None
+        needs_host_gateway = target_host == "host.docker.internal"
         target_container_ip: str = ""
         extra_hosts: dict[str, str] = {}
 
         # 尝试通过端口映射找到靶机容器所在的 Docker 网络
-        if target_port and self.client:
+        if target_port and not needs_host_gateway:
             target_net = _find_target_container_network(self.client, target_host or "", target_port)
 
         if target_net:
@@ -925,7 +1049,6 @@ class DockerSandbox:
             )
             if needs_host_gateway:
                 extra_hosts["host.docker.internal"] = "host-gateway"
-                extra_hosts["localhost"] = "host-gateway"
                 _audit_log.warning(
                     f"[NETWORK] step={step_id} host={target_host} mode=bridge+host-gateway "
                     f"(FALLBACK — traffic may route through Docker host)"
@@ -967,17 +1090,29 @@ class DockerSandbox:
             stdout = _hard_truncate(stdout)
             stderr = _hard_truncate(stderr, threshold=2000, head=600, tail=800)
 
+            execution_error_code = next(
+                (
+                    code for code in (
+                        "EXECUTION_TARGET_RESOLUTION_FAILED",
+                        "EXECUTION_NETWORK_CONNECT_FAILED",
+                    )
+                    if code in stdout or code in stderr
+                ),
+                None,
+            )
             return {
-                "ok": exit_code == 0,
+                "ok": exit_code == 0 and execution_error_code is None,
                 "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr,
                 "duration_sec": round(time.time() - start, 3),
                 "container_id": container.id[:12],
                 "execution_mode": "docker",
-                "network_mode": "bridge",
+                "network_mode": "docker-host-gateway" if needs_host_gateway else network_mode,
                 "target_ip": target_ip,
                 "target_host": target_host,
+                "target_port": target_port,
+                **({"error_code": execution_error_code} if execution_error_code else {}),
             }
 
         except docker.errors.APIError as e:
@@ -1101,6 +1236,17 @@ def _run_docker(
         "from redteam_sdk import *\n"
         "# ── Cross-step context restore (auto-injected by Executor) ──\n"
         "_prior = load_all_context()\n"
+        "_execution_tc = _prior.get('target_context', {})\n"
+        "if _execution_tc.get('network_mode') == 'docker-host-gateway':\n"
+        "    import socket as _execution_socket\n"
+        "    try:\n"
+        "        _execution_addresses = _execution_socket.getaddrinfo(\n"
+        "            _execution_tc.get('execution_host'), _execution_tc.get('execution_port'), type=_execution_socket.SOCK_STREAM)\n"
+        "        if not _execution_addresses:\n"
+        "            raise OSError('no address records')\n"
+        "    except OSError as _resolution_error:\n"
+        "        print('EXECUTION_TARGET_RESOLUTION_FAILED: ' + str(_resolution_error))\n"
+        "        raise SystemExit(86)\n"
         "# ── HTTP auto-logging instrumentation (injected by Executor) ──\n"
         "_hc_req_orig = HttpClient.request\n"
         "def _hc_req(self, method, url, *a, **kw):\n"
@@ -1257,6 +1403,7 @@ def run_executor(
                             raise SecurityViolationError(f"重建后仍缺少工具: {missing2}！")
                     else:
                         raise SecurityViolationError("镜像构建失败！")
+
                 else:
                     raise SecurityViolationError("无 Dockerfile 目录，无法重建镜像。")
     except SecurityViolationError:
@@ -1264,13 +1411,25 @@ def run_executor(
     except DockerException as e:
         raise SecurityViolationError(f"Docker 引擎异常: {e}！") from e
 
+    try:
+        execution_target = _build_execution_target_context(target_url)
+    except ExecutionNetworkError as e:
+        out = {
+            "version": 1,
+            "executed": False,
+            "reason": e.code,
+            "error_code": e.code,
+            "diagnostics": e.diagnostics,
+            "step_results": [],
+            "execution_mode": "docker",
+        }
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return out
+
     # 准备执行工作区
-    tc_dict: dict[str, Any] = {}
-    if target is not None:
-        tc_dict = {"base_url": target.url, "host": target.hostname, "port": target.port, "scheme": target.scheme}
-    elif target_url:
-        tc_dict = {"base_url": target_url}
-    exec_workspace = _prepare_exec_workspace(workdir, target_context=tc_dict if tc_dict else None)
+    tc_dict = execution_target.to_context_dict()
+    exec_workspace = _prepare_exec_workspace(workdir, target_context=tc_dict)
     print(f"[executor] 执行工作区: {exec_workspace}")
 
     step_results: list[dict[str, Any]] = []
@@ -1293,7 +1452,8 @@ def run_executor(
         try:
             result, step_chain_output = _run_step(
                 st, timeout_sec, exec_workspace, sandbox,
-                env_vars=sandbox_env or None, target_url=target_url, target=target,
+                env_vars=sandbox_env or None,
+                target_url=execution_target.execution_base_url, target=None,
             )
         except SecurityViolationError as e:
             result = {
@@ -1365,10 +1525,19 @@ def run_executor(
             print(f"[executor] 所有 {len(step_results)} 个步骤均失败/被拦截:")
             print(f"[executor]   stderr: {stderrs[0]}")
 
+    network_failure_code = next(
+        (
+            (entry.get("result") or {}).get("error_code")
+            for entry in step_results
+            if (entry.get("result") or {}).get("error_code") in (
+                "EXECUTION_TARGET_RESOLUTION_FAILED", "EXECUTION_NETWORK_CONNECT_FAILED")
+        ),
+        None,
+    )
     execution_mode = "docker" if sandbox and sandbox.is_available() else "security_blocked"
     out = {
         "version": 1,
-        "executed": True,
+        "executed": network_failure_code is None,
         "plan_id":  plan.get("plan_id"),
         "workdir":  str(workdir.resolve()),
         "step_results":    step_results,
@@ -1378,6 +1547,9 @@ def run_executor(
         "total_steps":     len(steps),
         "blocked_steps":   blocked_count,
     }
+    if network_failure_code:
+        out["reason"] = network_failure_code
+        out["error_code"] = network_failure_code
     result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     _audit_log.info(

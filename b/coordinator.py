@@ -1250,6 +1250,20 @@ def run_pipeline(
         # 注入上一轮原始执行结果到 feedback，供 Planner 参考
         fb["last_execution_raw"] = _build_last_exec_raw(exec_out)
         print(f"[coordinator] 📋 已注入原始执行数据到 feedback ({len(fb['last_execution_raw'].get('steps', []))} 步)")
+        structured_feedback_parts: list[str] = []
+        if isinstance(fb.get("failure_analysis"), dict) and fb.get("failure_analysis"):
+            structured_feedback_parts.append(f"failure_analysis={fb['failure_analysis']}")
+        if isinstance(fb.get("possible_next_direction"), list) and fb.get("possible_next_direction"):
+            structured_feedback_parts.append(
+                "possible_next_direction=" + ", ".join(str(x) for x in fb["possible_next_direction"][:5])
+            )
+        if structured_feedback_parts:
+            existing_feedback = fb.get("feedback_for_planner") or ""
+            structured_block = "【结构化失败反馈】\n" + "\n".join(structured_feedback_parts)
+            fb["feedback_for_planner"] = (existing_feedback + "\n\n" + structured_block).strip()
+            feedback = fb
+            print("[coordinator] structured evaluator feedback attached for next Planner")
+
 
         # ── Exploit Trajectory Recording ──
         _record_trajectory_entry(iteration, fb, last_plan, exec_out, step_results)

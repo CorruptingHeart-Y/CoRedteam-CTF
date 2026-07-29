@@ -642,6 +642,41 @@ def test_request_contract_gate_rejects_missing_parameter():
         f"expected parameter_missing error, got: {contract_errs}"
 
 
+def test_extract_parameter_contract_accepts_source_dict_and_legacy_string():
+    """Structured source uses its code field without breaking legacy strings."""
+    from agents.validator import _extract_parameter_contract
+
+    structured_source = {
+        "vulnerabilities": [{
+            "source": {
+                "file": "Main.java",
+                "line": 21,
+                "code": "@RequestParam String index",
+            },
+        }],
+    }
+    assert _extract_parameter_contract(structured_source) is None
+
+    parseable_code = '@RequestParam(name = "text")'
+    structured_contract = _extract_parameter_contract({
+        "vulnerabilities": [{
+            "source": {
+                "file": "Main.java",
+                "line": 21,
+                "code": parseable_code,
+            },
+        }],
+    })
+    legacy_contract = _extract_parameter_contract({
+        "vulnerabilities": [{"source": parseable_code}],
+    })
+    assert structured_contract == legacy_contract
+    assert structured_contract["parameters"] == [{
+        "name": "text",
+        "accepted_locations": ["query", "form"],
+    }]
+
+
 def test_request_contract_gate_accepts_query_location_for_requestparam():
     """@RequestParam accepts both query and form — GET query must pass."""
     from agents.validator import _check_request_contract

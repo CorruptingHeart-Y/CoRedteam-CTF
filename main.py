@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -14,6 +16,56 @@ from code_browser import CODE_TOOLS
 
 # 加载环境变量
 load_dotenv()
+
+# ==========================================
+# 0. CWE 字段归一化（Stage 1 输出边界）
+# ==========================================
+
+def _normalize_cwe_field(vuln: dict) -> str:
+    """Normalize cwe / cwe_id field. Fail-closed on ambiguity or missing data."""
+    has_cwe_id = "cwe_id" in vuln
+    has_cwe = "cwe" in vuln
+    raw_id = vuln.get("cwe_id")
+    raw_cwe = vuln.get("cwe")
+
+    if not has_cwe_id and not has_cwe:
+        raise ValueError(f"CWE_NORMALIZE_MISSING: neither cwe_id nor cwe in vuln")
+
+    # Only cwe_id
+    if has_cwe_id and not has_cwe:
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise ValueError(f"CWE_NORMALIZE_EMPTY: cwe_id empty: {raw_id!r}")
+        return raw_id.strip()
+
+    # Only cwe
+    if has_cwe and not has_cwe_id:
+        if not isinstance(raw_cwe, str) or not raw_cwe.strip():
+            raise ValueError(f"CWE_NORMALIZE_EMPTY: cwe empty: {raw_cwe!r}")
+        return raw_cwe.strip()
+
+    # Both present
+    id_val = raw_id.strip() if isinstance(raw_id, str) else str(raw_id)
+    cwe_val = raw_cwe.strip() if isinstance(raw_cwe, str) else str(raw_cwe)
+    if not id_val and not cwe_val:
+        raise ValueError("CWE_NORMALIZE_BOTH_EMPTY")
+    if not id_val:
+        return cwe_val
+    if not cwe_val:
+        return id_val
+    if id_val.upper() == cwe_val.upper():
+        return id_val
+    raise ValueError(f"CWE_NORMALIZE_CONFLICT: cwe_id={id_val!r} != cwe={cwe_val!r}")
+
+
+def _apply_cwe_normalization(vulns: list) -> list:
+    """Normalize CWE fields: ensure every entry has cwe_id, resolve conflicts."""
+    out = []
+    for v in vulns:
+        canonical = _normalize_cwe_field(v)
+        entry = {**v, "cwe_id": canonical}
+        out.append(entry)
+    return out
+
 
 # ==========================================
 # 1. 颜色定义 (ANSI 转义码)
@@ -245,14 +297,16 @@ def analysis_node(state: CoRedteamState):
 ## 【核心禁令】
 1. 严禁想象：禁止虚构任何文件夹、文件名、函数名或代码行。
 2. 证据至上：每一条 'evidence' 必须 100% 复制自真实文本。
-3. 拒绝模板：严禁输出教科书范例，必须针对 target_codebase 里的真实代码。
+3. 拒绝模板：严禁输出教科书范例，必须针对目标目录 '{target_display_name}' 里的真实代码。
 4. 警惕混淆：如果在非预期后缀(如.css, .jpg)发现编程逻辑，务必如实报告。
+5. 锁定根目录：你的所有文件读取工具只能访问目标根目录 '{target_display_name}' 内的文件。任何越界路径都会被工具拒绝。
 
 ## 【输出逻辑】
 - 必须输出一个合法的 JSON 对象，根节点必须是 "vulnerabilities" 数组
 - 提供包含漏洞的完整函数块，明确指出 Source 和 Sink
 - 对于多阶段攻击，标注各环节之间的关系
-    
+- source.file 路径必须相对于目标根目录 '{target_display_name}'
+
 {memory_context}
 """
 
@@ -260,7 +314,7 @@ def analysis_node(state: CoRedteamState):
     if state["critic_feedback"]:
         messages.append(HumanMessage(content=f"请参考评审意见修正：\n{state['critic_feedback']}"))
     else:
-        messages.append(HumanMessage(content="开始分析 target_codebase 目录并检索 CWE 模式。"))
+        messages.append(HumanMessage(content=f"开始分析目标目录 '{target_display_name}' 并检索 CWE 模式。"))
 
     # ===== 初始化/恢复文件缓存 =====
     file_cache = state.get('file_cache', {})
@@ -304,7 +358,7 @@ def analysis_node(state: CoRedteamState):
                     if any(path == dp or path.startswith(dp + '/') or path.startswith(dp + '\\') for dp in dangerous_paths):
                         print(f"  {RED}└─ [安全拦截✗]{RESET} 跳过危险路径: {path}")
                         messages.append(ToolMessage(
-                            content=f"错误：不允许访问系统路径 '{path}'，请使用 target_codebase 内的相对路径。",
+                            content=f"错误：不允许访问系统路径 '{path}'，请使用目标根目录内的相对路径。",
                             tool_call_id=tool_call['id']
                         ))
                         step_count += 1
@@ -460,20 +514,29 @@ You must output ONLY JSON format. No explanations, titles, lists, or Markdown ma
 
 def evolution_node(state: CoRedteamState):
     print(f"\n{BOLD}{GREEN}[🧠 Evolution]{RESET} 任务总结，写入长期记忆...")
-    
-    evolution_prompt = f"复盘审计：\n结果：{state['vulnerabilities']}\n反馈：{state['critic_feedback']}\n提取一条通用的漏洞模式经验。"
+
+    evolution_prompt = (
+        "复盘本次代码审计过程，提取一条通用的漏洞模式经验。"
+        "\n【重要禁令】"
+        "\n- 禁止写入任何绝对文件路径（如 /home/user/... 或 C:\\... 或 target_codebase/...）"
+        "\n- 禁止写入任何 flag 值（如 HTB{...} 或 FLAG{...} 或 CTF{...}）"
+        "\n- 禁止写入任何具体的 exploit payload、solver 脚本路径或官方解答引用"
+        "\n- 禁止写入任何具体的 URL、IP 地址或目标主机信息"
+        "\n- 只能描述通用的漏洞模式、检测方法和防御建议"
+        "\n结果简报：" + state['vulnerabilities'][:500] + "\n反馈摘要：" + state['critic_feedback'][:500]
+    )
     experience = llm.invoke(evolution_prompt).content
-    
+
     collection = chroma_client.get_or_create_collection(name="vulnerability_patterns")
     collection.add(
         documents=[experience],
         ids=[f"pattern_{state['iteration_count']}_{hash(experience[:5])}"]
     )
-    
+
     print(f"\n{GREEN}💡 沉淀的新经验:{RESET}")
     print(f"{GREEN}{experience}{RESET}")
     print(f"💡 记忆库已更新。{RESET}")
-    
+
     return {}
 
 # ==========================================
@@ -573,11 +636,34 @@ app = builder.compile()
 # ==========================================
 
 if __name__ == "__main__":
+    # Fix Unicode emoji output on Windows (GBK codec can't handle emoji)
+    if os.name == "nt":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    # ================================================================
+    # Stage 1 Target Scope Enforcement
+    # ================================================================
+    # CO_REDTEAM_TARGET_ROOT is set by CLI (b/cli.py) before spawning this process.
+    # code_browser.py reads it at import time to lock BASE_DIR.
+    # We re-read and canonicalize here for logging and prompt injection.
+    resolved_target_root = os.environ.get("CO_REDTEAM_TARGET_ROOT", "")
+    if resolved_target_root:
+        resolved_target_root = str(Path(resolved_target_root).resolve())
+        os.environ["CO_REDTEAM_TARGET_ROOT"] = resolved_target_root
+        print(f"{BOLD}{YELLOW}[TARGET SCOPE] resolved_target_root={resolved_target_root}{RESET}")
+    else:
+        # Fallback for backward compatibility: use cwd
+        resolved_target_root = str(Path(".").resolve())
+        print(f"{BOLD}{YELLOW}[TARGET SCOPE] CO_REDTEAM_TARGET_ROOT not set, defaulting to cwd: {resolved_target_root}{RESET}")
+
+    target_display_name = resolved_target_root
+
     print(f"{BOLD}{YELLOW}=== CO-REDTEAM Phase 1 (Discovery) 系统启动 ==={RESET}")
     initial_state = {
-        "iteration_count": 0, 
-        "vulnerabilities": "", 
-        "critic_feedback": "", 
+        "iteration_count": 0,
+        "vulnerabilities": "",
+        "critic_feedback": "",
         "messages": [],
         "file_cache": {}  # 初始化文件缓存
     }
@@ -618,6 +704,16 @@ if __name__ == "__main__":
             final_json = {"vulnerabilities": [], "status": "JSON_PARSE_ERROR", "error": str(err)}
 
         if final_json:
+            # ── CWE normalization: ensure every vuln has cwe_id ──
+            vulns = final_json.get("vulnerabilities", [])
+            if vulns:
+                try:
+                    vulns = _apply_cwe_normalization(vulns)
+                    final_json["vulnerabilities"] = vulns
+                except ValueError as e:
+                    print(f"{BOLD}{RED}[CWE NORMALIZE] {e}{RESET}")
+                    # Continue with non-normalized data rather than losing results
+
             paths = [
                 "./reports/vulnerability_proposal_latest.json",
                 "b/data/confirmed_vuln.json",
