@@ -8,7 +8,7 @@
 
 ## 1. Project Synopsis
 
-**November** is a multi-agent autonomous vulnerability exploitation framework built on the principle of **Constrained Agency** — the radical proposition that an LLM's exploit reasoning capability *improves* when its action space is surgically restricted rather than expanded. The system enforces a **Verification-Driven Planning** regime in which every agent action is cross-validated against a static **Runtime Manifest** before execution, eliminating the primary failure mode of LLM-based red-team systems: **Hybrid Representation Collapse** — the phenomenon where a model oscillates between natural language reasoning and code generation, degrading both.
+**November** is an autonomous vulnerability discovery, validation, and controlled exploitation framework built on the principle of **Constrained Agency** — the radical proposition that an LLM's exploit reasoning capability *improves* when its action space is surgically restricted rather than expanded. The system enforces a **Verification-Driven Planning** regime in which every agent action is cross-validated against a static **Runtime Manifest** before execution, eliminating the primary failure mode of LLM-based red-team systems: **Hybrid Representation Collapse** — the phenomenon where a model oscillates between natural language reasoning and code generation, degrading both.
 
 ### The Three Plagues of LLM-Driven Exploitation
 
