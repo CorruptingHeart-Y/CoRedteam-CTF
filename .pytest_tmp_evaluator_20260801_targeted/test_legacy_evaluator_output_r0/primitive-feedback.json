@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "repro_success": false,
+  "confidence": 0.3,
+  "evidence_level": "F",
+  "hard_evidence_found": "NONE",
+  "error_fingerprint": "NoError",
+  "current_exploit_state": "probe_success",
+  "milestones_achieved": [
+    "probe_success: 所有步骤 exit_code=0，确认目标可达且脚本无语法错误"
+  ],
+  "state_transition_blocker": "脚本执行成功但 payload 未正确触发漏洞。需分析 HTTP 响应体确定 payload 是否被目标接受/处理",
+  "next_required_action": "检查 [HTTP] 日志中的响应体内容，调整 payload 参数/格式/端点，尝试触发 S 级证据",
+  "what_worked": "所有步骤 exit_code=0",
+  "what_failed": "虽有 stdout 输出但无 S 级或 A 级物理铁证",
+  "raw_evidence": "[HTTP] 200 OK ",
+  "hypothesis": "脚本执行成功但 payload 未正确触发漏洞",
+  "next_direction": "调整 payload 参数/格式/端点，尝试触发 S 级证据",
+  "analysis": {
+    "what_happened": "所有步骤退出码为 0，有输出但未检测到任何 S 级或 A 级物理铁证。仅凭 exit_code=0 不足以判定成功。",
+    "vs_expectation": "MOCK 模式：基于本地正则检测，未进行语义分析。",
+    "guidance": "启用 LLM 以获得详细的三段论分析和可操作建议。"
+  },
+  "summary": "所有步骤退出码为 0，有输出但未检测到任何 S 级或 A 级物理铁证。仅凭 exit_code=0 不足以判定成功。",
+  "feedback_for_planner": "若失败：拆分命令、增加探测步骤；若成功：固化可复用 payload 到技术记忆。",
+  "should_continue": true,
+  "suggest_abort": false,
+  "is_milestone": false,
+  "memory_patch": {},
+  "detected_primitives": [],
+  "primitive_confidence": {},
+  "primitive_evidence": {},
+  "exploit_chain_primitive": [],
+  "progress_score": 0.0,
+  "exploit_momentum": false,
+  "state_transition_probability": 0.05,
+  "suggested_next_action": "EVOLVE",
+  "_epe_levels": {
+    "L1_surface": 0.0,
+    "L2_primitive": 0.0,
+    "L3_capability": 0.0,
+    "L4_objective": 0.0
+  },
+  "_behavioral_signals": {},
+  "primitive_state": {
+    "ssti": false,
+    "arithmetic": false,
+    "object_access": false,
+    "rce": false
+  },
+  "primitive_confirmed": false,
+  "flag_found": false,
+  "exploit_completed": false,
+  "failure_analysis": {
+    "type": "NoError"
+  },
+  "possible_next_direction": [],
+  "confirmed_primitives": [],
+  "current_primitive": null,
+  "recommended_transition": null,
+  "blocked_transition": null,
+  "failure_type": "verification_failure"
+}

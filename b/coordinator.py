@@ -10,11 +10,12 @@ if str(_ROOT) not in sys.path:
 import json
 from typing import Any
 
-from agents.evaluator import run_evaluator
+from agents.evaluator import _classify_failure_type, run_evaluator
 from agents.executor import run_executor
 from agents.planner import run_planner
 from agents.validator import run_validator
 from core.challenge_adapter import ChallengeAdapter, get_adapter, list_adapters
+from core.capability_registry import get_capability_registry
 from memory.exploit_trajectory import get_trajectory, reset_trajectory
 from memory.verification_memory import get_verification, reset_verification
 from memory.primitive_learning import get_learning_engine, PrimitiveObservation
@@ -26,15 +27,11 @@ from core.llm_client import DeepSeekClient
 # 唯一可信的运行时能力清单。Validator 和 Planner 必须对齐此清单。
 # 禁止扫描 Docker 镜像隐式 pip 依赖；所有能力必须在此显式声明。
 # ═══════════════════════════════════════════════════════════════════
+_CAPABILITY_REGISTRY = get_capability_registry()
 RUNTIME_MANIFEST: dict[str, Any] = {
     "version": 1,
-    "sdk_primitives": [
-        # HTTP 高层编排（禁止直接 import requests / urllib3 / socket）
-        "HttpClient.get",
-        "HttpClient.post",
-        "HttpClient.raw_request",
-        "HttpClient.last_response",
-    ],
+    "capabilities": list(_CAPABILITY_REGISTRY.manifest()),
+    "sdk_primitives": list(_CAPABILITY_REGISTRY.allowed_calls()),
     "safe_modules": [
         # 最小可用能力闭包 — 协议数据处理辅助工具集
         # Validator AST 检查 100% 与此清单对齐
@@ -239,6 +236,10 @@ def _save_failure_lessons(
     confirmed: dict[str, Any],
     adapter: ChallengeAdapter | None = None,
 ) -> None:
+    if _classify_failure_type({"repro_success": False}, exec_out, "") == "runtime_target_missing":
+        print("[coordinator] runtime target 缺失，跳过失败经验写入")
+        return
+
     step_results = exec_out.get("step_results") or []
     cwe_ids = []
     for v in confirmed.get("vulnerabilities", []):
@@ -631,6 +632,23 @@ def _compute_progress_signals(
     return bool(reasons), reasons
 
 
+def _next_no_progress_streak(
+    current_streak: int,
+    progress_reasons: list[str],
+    *,
+    is_milestone: bool = False,
+) -> tuple[int, list[str]]:
+    """Reset only for verified state/primitive progress or a milestone."""
+    hard_prefixes = ("new_primitive", "state_advance")
+    hard_reasons = [
+        reason for reason in progress_reasons
+        if reason.startswith(hard_prefixes)
+    ]
+    if is_milestone or hard_reasons:
+        return 0, hard_reasons
+    return max(int(current_streak), 0) + 1, hard_reasons
+
+
 def _snapshot_round_state(
     fb: dict[str, Any],
     last_plan: dict[str, Any],
@@ -734,7 +752,9 @@ def _record_trajectory_entry(
     detected_primitives = fb.get("detected_primitives", [])
     primitive_confidence = fb.get("primitive_confidence", {})
     primitive_evidence = fb.get("primitive_evidence", {})
-    primary_primitive = detected_primitives[0] if detected_primitives else ""
+    primary_primitive = str(fb.get("current_primitive") or "").strip()
+    if not primary_primitive:
+        primary_primitive = detected_primitives[0] if detected_primitives else ""
     primary_primitive_conf = primitive_confidence.get(primary_primitive, 0.0) if primary_primitive else 0.0
     primary_primitive_ev = primitive_evidence.get(primary_primitive, "") if primary_primitive else ""
 
@@ -1068,6 +1088,8 @@ def run_pipeline(
 
     # ── Multi-dimensional progress tracking ──
     _prev_round_state: dict[str, Any] | None = None
+    _last_stagnation_primitive = ""
+    _same_primitive_attempts = 0
 
     iteration = 0
     while iteration < _iter_budget and iteration < _MAX_HARD_LIMIT:
@@ -1122,6 +1144,9 @@ def run_pipeline(
             }
             warn(f"验证未通过，反馈规划智能体: {val.get('errors', [])}")
             continue
+
+        # Downstream agents must see the same deterministic plan that is executed.
+        last_plan = v.get("plan") or last_plan
 
         # ── Executor ───────────────────────────────────────────────────────
         _print_agent_header("executor")
@@ -1307,6 +1332,21 @@ def run_pipeline(
             print(f"[coordinator] 📦 上下文折叠：{len(old_entries)} 轮旧历史已压缩为摘要")
 
         # ── Multi-dimensional progress detection ────────────────────────
+        _round_primitive = str(
+            fb.get("current_primitive")
+            or ((last_plan.get("primitive_context") or {}).get("target_primitive"))
+            or ((last_plan.get("primitive_context") or {}).get("current_primitive"))
+            or ""
+        ).strip()
+        if _round_primitive:
+            if _round_primitive == _last_stagnation_primitive:
+                _same_primitive_attempts += 1
+            else:
+                _last_stagnation_primitive = _round_primitive
+                _same_primitive_attempts = 1
+        else:
+            _same_primitive_attempts = 0
+
         has_progress, progress_reasons = _compute_progress_signals(
             fb, last_plan, step_results, _prev_round_state,
         )
@@ -1316,19 +1356,13 @@ def run_pipeline(
             progress_label = "; ".join(progress_reasons[:4])
             print(f"[coordinator] 📈 多维进展信号: {progress_label}")
 
-        # ── Classify progress signals: only hard evidence resets no-progress ──
-        # Hard evidence: new_primitive, deterministic response_delta,
-        # parameter_reached, deterministic capability/objective evidence.
-        # verified_facts is NOT included — facts lack source/provenance tracking.
-        _hard_evidence_prefixes = {
-            "new_primitive",
-        }
-        # Soft signals (never reset alone): state_advance, payload_mutation,
-        #   progress_score, exploit_momentum, stp_increase, evaluator_milestone,
-        #   ok_count, new_endpoint, new_status_code, initial_round,
-        #   verified_facts, confidence_increase, partial_progress
-        _hard_reasons = [r for r in progress_reasons
-                         if any(r.startswith(p) for p in _hard_evidence_prefixes)]
+        # Only verified primitive/state progress (or a milestone) resets the
+        # zero-progress counter. Execution-health signals remain soft.
+        _next_streak, _hard_reasons = _next_no_progress_streak(
+            _no_progress_streak,
+            progress_reasons,
+            is_milestone=bool(fb.get("is_milestone")),
+        )
         _has_hard_evidence = bool(_hard_reasons)
 
         # ── 衰减式里程碑奖励（Decaying Extension）────────────────────────
@@ -1337,7 +1371,7 @@ def run_pipeline(
             extension = max(1, 5 - _milestone_count)
             old_budget = _iter_budget
             _iter_budget = min(_iter_budget + extension, _MAX_HARD_LIMIT)
-            _no_progress_streak = 0
+            _no_progress_streak = _next_streak
             stage(
                 "CLI",
                 f"质变里程碑 #{_milestone_count}！奖励 +{extension} 次迭代。"
@@ -1345,15 +1379,23 @@ def run_pipeline(
             )
         elif has_progress:
             if _has_hard_evidence:
-                _no_progress_streak = 0
+                _no_progress_streak = _next_streak
                 print(f"[coordinator] 🔄 硬证据进展 ({'; '.join(_hard_reasons[:3])})，重置无进展计数")
             else:
-                _no_progress_streak += 1
+                _no_progress_streak = _next_streak
                 print(f"[coordinator] ⚙️ 仅软信号/执行健康 ({progress_label})，不算进展 "
                       f"| 无进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
         else:
-            _no_progress_streak += 1
+            _no_progress_streak = _next_streak
             print(f"[coordinator] ⏳ 无任何进展计数: {_no_progress_streak}/{_NO_PROGRESS_ABORT}")
+
+        fb["same_primitive_attempts"] = _same_primitive_attempts
+        fb["no_progress_streak"] = _no_progress_streak
+        fb["new_verified_progress"] = bool(
+            _has_hard_evidence or fb.get("is_milestone")
+        )
+        fb["progress_reasons"] = list(progress_reasons)
+        feedback = fb
 
         # ── 连续无进展主动放弃 ────────────────────────────────────────────
         if _no_progress_streak >= _NO_PROGRESS_ABORT:

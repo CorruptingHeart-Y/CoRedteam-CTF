@@ -1,0 +1,49 @@
+{
+  "confirmed_base_url": "",
+  "confirmable_endpoints": [
+    "/"
+  ],
+  "injectable_params": {},
+  "injectable_endpoints": [],
+  "accepted_fields": [],
+  "rejected_fields": [],
+  "template_engine": "",
+  "reflection_confirmed": false,
+  "payload_blacklist": [],
+  "payload_bypass_techniques": [],
+  "working_primitives": [
+    {
+      "primitive_id": "ssti_reflection",
+      "confidence": 0.95,
+      "evidence": "SSTI payload reflected in response",
+      "engine": ""
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 0.95,
+      "evidence": "#set($x=7*7)$x returned 49",
+      "engine": ""
+    },
+    {
+      "primitive_id": "template_access",
+      "confidence": 0.9,
+      "evidence": "Object access returned class java.lang.String",
+      "engine": ""
+    },
+    {
+      "primitive_id": "object_access",
+      "confidence": 0.9,
+      "evidence": "class.forName returned class java.lang.Runtime",
+      "engine": ""
+    }
+  ],
+  "primitive_knowledge": {},
+  "confirmed_cve": "",
+  "target_app": "",
+  "target_framework": "",
+  "auth_status": "unknown",
+  "csrf_token_required": false,
+  "waf_detected": false,
+  "waf_type": "",
+  "confirmed_flags": []
+}

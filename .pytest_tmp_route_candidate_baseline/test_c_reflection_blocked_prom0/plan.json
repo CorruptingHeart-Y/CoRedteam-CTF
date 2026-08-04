@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "plan_id": "llm-generated",
+  "rationale": "chosen by the LLM Planner",
+  "steps": [],
+  "platform": "Windows"
+}

@@ -1,0 +1,25 @@
+{
+  "challenge": "01_Labyrinth_Linguist",
+  "status": "success",
+  "timestamp": "2026-07-30T10:13:04+08:00",
+  "flag_captured": true,
+  "flag": "HTB{f13ry_t3mpl4t35_fr0m_th3_d3pth5!!}",
+  "exploit_chain": [
+    "ssti_reflection",
+    "command_execution",
+    "arbitrary_file_read"
+  ],
+  "planner_features": [
+    "route_knowledge",
+    "primitive_transition_graph",
+    "plan_generation_contract"
+  ],
+  "validator": {
+    "passed": true,
+    "errors": 0
+  },
+  "notes": [
+    "FSM constraint successfully guided planner transition",
+    "No illegal primitive jump observed"
+  ]
+}

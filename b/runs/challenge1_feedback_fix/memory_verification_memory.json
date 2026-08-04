@@ -1,0 +1,37 @@
+{
+  "confirmed_base_url": "",
+  "confirmable_endpoints": [
+    "/"
+  ],
+  "injectable_params": {},
+  "injectable_endpoints": [],
+  "accepted_fields": [],
+  "rejected_fields": [],
+  "template_engine": "",
+  "reflection_confirmed": false,
+  "payload_blacklist": [],
+  "payload_bypass_techniques": [],
+  "working_primitives": [
+    {
+      "primitive_id": "ssti_reflection",
+      "confidence": 0.95,
+      "evidence": "历史证据：{{7*7}} 返回 49，确认模板表达式执行",
+      "engine": ""
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 0.9,
+      "evidence": "Arithmetic expression #set($x=7*7)$x evaluated to 49, confirming template execution",
+      "engine": ""
+    }
+  ],
+  "primitive_knowledge": {},
+  "confirmed_cve": "",
+  "target_app": "",
+  "target_framework": "",
+  "auth_status": "unknown",
+  "csrf_token_required": false,
+  "waf_detected": false,
+  "waf_type": "",
+  "confirmed_flags": []
+}

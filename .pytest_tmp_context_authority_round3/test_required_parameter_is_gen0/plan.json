@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "plan_id": "legacy-plan",
+  "vuln_summary": "test",
+  "rationale": "test",
+  "chain_design": "test",
+  "steps": [
+    {
+      "id": 1,
+      "status": "PLANNED",
+      "type": "python",
+      "imports": [
+        "redteam_sdk.HttpClient"
+      ],
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/endpoint",
+          "body": {
+            "text": "<value>"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [
+        "redteam_sdk.HttpClient"
+      ],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/endpoint",
+          "body": {
+            "text": "<value>"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    }
+  ],
+  "history_state": {},
+  "primitive_context": {},
+  "platform": "Windows"
+}

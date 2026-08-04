@@ -1,0 +1,57 @@
+{
+    "vulnerabilities": [
+        {
+            "title": "Server-Side Template Injection (SSTI) in Apache Velocity leading to Remote Code Execution",
+            "cwe": "CWE-917",
+            "severity": "CRITICAL",
+            "description": "The application reads the index.html template file and replaces the literal placeholder 'TEXT' with the user-controlled 'text' request parameter via string replacement. The resulting string is then parsed and executed by the Apache Velocity template engine (version 1.7). Because user input is embedded directly into the template source code (rather than passed as a data variable), an attacker can inject Velocity directives such as #set, #if, #foreach and leverage Velocity's reflection capabilities to access java.lang.Runtime and execute arbitrary OS commands, achieving full Remote Code Execution.",
+            "source": {
+                "file": "src/main/java/Main.java",
+                "line": 21,
+                "code": "@RequestParam(required = false, name = \"text\") String textString"
+            },
+            "sink": {
+                "file": "src/main/java/Main.java",
+                "line": 66,
+                "code": "line = line.replace(\"TEXT\", replacement);"
+            },
+            "data_flow": [
+                "Line 21: textString = @RequestParam(name=\"text\") — user-controlled input",
+                "Line 29: template = readFileToString(\"/app/src/main/resources/templates/index.html\", textString) — input passed to template loader",
+                "Line 66: line = line.replace(\"TEXT\", replacement) — user input embedded directly into template source",
+                "Line 41: t.setData(runtimeServices.parse(reader, \"home\")) — modified template parsed by Velocity",
+                "Line 47: t.merge(context, writer) — template executed, injected directives run",
+                "template file line 15: <h2 class=\"fire\">TEXT</h2> — the 'TEXT' placeholder that gets replaced"
+            ],
+            "impact": "Remote Code Execution (RCE) as the application user. Attacker can execute arbitrary system commands, read/write files, and fully compromise the server.",
+            "exploit_example": "POST / with text=#set($x='')#set($rt=$x.class.forName('java.lang.Runtime'))#set($chr=$x.class.forName('java.lang.Character'))#set($str=$x.class.forName('java.lang.String'))#set($ex=$rt.getRuntime().exec('id'))$ex.waitFor()",
+            "fix": "Never embed user input into template source code. Pass user input as a data variable via the VelocityContext (e.g., context.put(\"text\", textString)) and reference it in the template as ${text}. Additionally, upgrade from the outdated Velocity 1.7 and enable sandboxing to restrict access to dangerous classes.",
+            "cwe_id": "CWE-917"
+        },
+        {
+            "title": "Reflected Cross-Site Scripting (XSS) via unencoded user input in HTML response",
+            "cwe": "CWE-79",
+            "severity": "MEDIUM",
+            "description": "When the user-supplied 'text' parameter does not contain Velocity directives, it is reflected verbatim into the HTML response inside the <h2 class=\"fire\"> element without any output encoding. An attacker can submit HTML/JavaScript payloads that execute in the victim's browser context. Although the SSTI vulnerability is the dominant issue, this is a distinct sink behavior where input is rendered as raw HTML.",
+            "source": {
+                "file": "src/main/java/Main.java",
+                "line": 21,
+                "code": "@RequestParam(required = false, name = \"text\") String textString"
+            },
+            "sink": {
+                "file": "src/main/resources/templates/index.html",
+                "line": 15,
+                "code": "<h2 class=\"fire\">TEXT</h2>"
+            },
+            "data_flow": [
+                "Line 21: textString = @RequestParam(name=\"text\") — user-controlled input",
+                "Line 66: line = line.replace(\"TEXT\", replacement) — input placed into template",
+                "Line 54: return template — raw HTML string returned via @ResponseBody without encoding",
+                "template line 15: <h2 class=\"fire\">TEXT</h2> — reflected into HTML"
+            ],
+            "impact": "Execution of arbitrary JavaScript in the victim's browser, enabling session hijacking, credential theft, and defacement.",
+            "fix": "HTML-encode all user-controlled output before rendering, or pass the value as a template data variable and use Velocity's built-in escaping (e.g., ${esc.html(text)}).",
+            "cwe_id": "CWE-79"
+        }
+    ]
+}

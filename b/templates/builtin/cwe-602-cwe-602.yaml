@@ -1,0 +1,23 @@
+metadata:
+  id: cwe-602-cwe-602
+  name: CWE-602
+  cwe_ids:
+  - CWE-602
+  target_type: generic
+  tags:
+  - cwe-602
+  - cwe-602
+  - consolidator_reviewed:false
+  author: co-redteam-consolidator
+  severity: critical
+initial_prechecks: []
+content: |-
+  针对客户端输入过滤绕过（CWE-602），提供基于 HTTP 请求的路径穿越 payload，包含双重编码、Unicode 变形等逃避技巧，确保通过任何简单的黑名单检测。
+
+payload_templates:
+  - name: path-traversal-via-encoding-bypass
+    description: 针对客户端输入过滤绕过（CWE-602），提供基于 HTTP 请求的路径穿越 payload，包含双重编码、Unicode 变形等逃避技巧，确保通过任何简单的黑名单检测。
+    lang: python
+    template: 
+    source: consolidator
+    severity: critical

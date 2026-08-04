@@ -143,11 +143,16 @@ def _capture_planner_prompt(tmp_path, monkeypatch, provider, feedback=None):
         planner, "_build_memory_context", lambda *args: "ordinary-memory-marker"
     )
     monkeypatch.setattr(
-        planner, "_build_primitive_context", lambda confirmed: "confirmed-fact-marker"
+        planner, "_build_primitive_context", lambda *args: "confirmed-fact-marker"
     )
     monkeypatch.setattr(planner, "get_verification", lambda: _FakeVerification())
     monkeypatch.setattr(planner, "_build_trajectory_context", lambda traj: "")
     monkeypatch.setattr(planner, "get_trajectory", lambda: object())
+    monkeypatch.setattr(planner, "_build_candidate_routes_layer", lambda *args: "")
+    monkeypatch.setattr(planner, "_build_exploit_transition_context", lambda: {})
+    monkeypatch.setattr(planner, "_resolve_planning_primitive", lambda *args: "")
+    monkeypatch.setattr(planner, "_build_plan_generation_contract", lambda *args: {})
+    monkeypatch.setattr(planner, "_normalized_cwe_template_sources", lambda *args: [])
     monkeypatch.setattr(
         planner, "_extract_user_goal_dense", lambda *args, **kwargs: "JSON user goal"
     )
@@ -174,13 +179,15 @@ def test_a_no_route_keeps_planner_behavior_and_prompt_route_free(
         "primitive_confirmed": True,
         "exploit_completed": False,
         "failure_reason": "reflection_blocked",
+        "same_primitive_attempts": 3,
+        "no_progress_streak": 3,
+        "failure_analysis": {"type": "reflection_blocked"},
     }
     llm = _capture_planner_prompt(tmp_path, monkeypatch, provider, feedback)
 
     assert "Route Intelligence Block" not in llm.system
     assert "[DIVERSIFY]" in llm.system
-    assert "route_knowledge" in llm.user
-    assert json.loads(llm.user)["route_knowledge"] == []
+    assert "ssti_reflection exploration hint" not in llm.user
     assert "ordinary-memory-marker" in llm.system
 
 
@@ -190,13 +197,36 @@ def test_b_route_metadata_is_in_planner_prompt(tmp_path, monkeypatch):
     provider = RouteKnowledgeProvider(route_root)
     llm = _capture_planner_prompt(tmp_path, monkeypatch, provider)
 
-    assert "ssti_reflection" in llm.system
+    user = json.loads(llm.user)
+    assert "ssti_reflection exploration hint" in user["REFERENCE_BLOCK"]
+    assert "ssti_reflection exploration hint" not in user.get("STRATEGY_BLOCK", "")
+    assert "ssti_reflection exploration hint" not in user.get("CONSTRAINT_BLOCK", "")
+    assert "current_state" not in user["REFERENCE_BLOCK"]
     for transition in _SSTI_REFLECTION_TRANSITIONS:
-        assert transition in llm.system
-    assert json.loads(llm.user)["route_knowledge"][0][
-        "possible_transitions"
-    ] == _SSTI_REFLECTION_TRANSITIONS
+        assert transition not in user["REFERENCE_BLOCK"]
     assert "arithmetic_result_in_response" in llm.system
+
+
+def test_planner_fact_outranks_route_factory_candidate_hint(tmp_path, monkeypatch):
+    route_root = tmp_path / "manual_routes"
+    _write_route(route_root)
+    provider = RouteKnowledgeProvider(route_root)
+    llm = _capture_planner_prompt(
+        tmp_path,
+        monkeypatch,
+        provider,
+        feedback={
+            "current_primitive": "command_execution",
+            "confirmed_primitives": ["command_execution"],
+        },
+    )
+    user = json.loads(llm.user)
+
+    assert "command_execution" in user["FACT_BLOCK"]
+    assert "ssti_reflection exploration hint" in user["REFERENCE_BLOCK"]
+    assert "ssti_reflection exploration hint" not in user.get("STRATEGY_BLOCK", "")
+    assert "ssti_reflection exploration hint" not in user.get("CONSTRAINT_BLOCK", "")
+    assert list(user).index("FACT_BLOCK") < list(user).index("REFERENCE_BLOCK")
 
 
 def test_c_reflection_blocked_prompt_has_route_intelligence_and_diversify(
@@ -210,19 +240,16 @@ def test_c_reflection_blocked_prompt_has_route_intelligence_and_diversify(
         "exploit_completed": False,
         "failure_reason": "reflection_blocked",
         "current_exploit_state": "probe_success",
+        "same_primitive_attempts": 3,
+        "no_progress_streak": 3,
+        "failure_analysis": {"type": "reflection_blocked"},
     }
     llm = _capture_planner_prompt(tmp_path, monkeypatch, provider, feedback)
-    for transition in _SSTI_REFLECTION_TRANSITIONS:
-        assert transition in llm.system
-    assert "[ROUTE]" in llm.system
+    user = json.loads(llm.user)
+    assert "ssti_reflection exploration hint" in user["REFERENCE_BLOCK"]
+    assert "ssti_reflection exploration hint" not in user.get("CONSTRAINT_BLOCK", "")
+    assert "ssti_reflection exploration hint" not in user.get("STRATEGY_BLOCK", "")
     assert "[DIVERSIFY]" in llm.system
-    assert (
-        llm.system.index("confirmed-fact-marker")
-        < llm.system.index("上一轮执行反馈")
-        < llm.system.index("[ROUTE]")
-        < llm.system.index("[DIVERSIFY]")
-        < llm.system.index("ordinary-memory-marker")
-    )
 
 
 def test_no_manual_routes_keeps_route_context_empty(tmp_path):
@@ -254,11 +281,8 @@ def test_d_route_context_has_no_payload_or_request_material(tmp_path, monkeypatc
     _write_route(route_root)
     provider = RouteKnowledgeProvider(route_root)
     llm = _capture_planner_prompt(tmp_path, monkeypatch, provider)
-    route_block = llm.system.split("[ROUTE]", 1)[1]
-    route_block = route_block.split("ordinary-memory-marker", 1)[0].lower()
-    route_user_context = json.dumps(
-        json.loads(llm.user)["route_knowledge"]
-    ).lower()
+    route_block = json.loads(llm.user)["REFERENCE_BLOCK"].lower()
+    route_user_context = route_block
 
     for forbidden in ("payload", "raw_payload", "materialization", "request body"):
         assert forbidden not in route_block

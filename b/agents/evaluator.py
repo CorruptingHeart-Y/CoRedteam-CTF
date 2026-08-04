@@ -10,6 +10,7 @@ from core.llm_client import DeepSeekClient
 from core.memory_store import LayeredMemory
 from core.settings import Settings
 from memory.exploit_primitives import get_primitive_registry, ALL_PRIMITIVE_DEFINITIONS
+from memory.primitive_transition_graph import get_transition_graph
 
 # ────────────────────────────────────────────────────────────────
 # 常量
@@ -361,6 +362,100 @@ def _sanitize_exec_output(exec_out: dict[str, Any], plan: dict[str, Any] | None 
     return out
 
 
+def _classify_failure_type(
+    fb: dict[str, Any],
+    exec_out: dict[str, Any],
+    all_stdouts: str,
+) -> str | None:
+    """Classify failures from execution evidence, never from LLM advice."""
+    if fb.get("repro_success"):
+        return None
+
+    step_results = exec_out.get("step_results") or []
+    evidence_parts = [all_stdouts, str(fb.get("error_fingerprint") or "")]
+    for step in step_results:
+        result = step.get("result") or {}
+        evidence_parts.extend([
+            _normalize_text_value(result.get("stdout", "")),
+            _normalize_text_value(result.get("stderr", "")),
+        ])
+    evidence = "\n".join(evidence_parts).lower()
+
+    runtime_target_error = (
+        ("runtime_target" in evidence or "runtime target" in evidence)
+        and any(marker in evidence for marker in (
+            "stopiteration",
+            "missing",
+            "not found",
+            "no matching",
+            "不存在",
+            "未包含",
+            "未注册",
+        ))
+    )
+    if runtime_target_error:
+        return "runtime_target_missing"
+
+    if any(marker in evidence for marker in (
+        "connectionrefused",
+        "connection refused",
+        "connectiontimeout",
+        "timed out",
+        "name or service not known",
+        "temporary failure in name resolution",
+        "dns",
+        "no route to host",
+        "transport_error",
+        "connection reset",
+    )):
+        return "transport_failure"
+
+    all_steps_ok = bool(step_results) and all(
+        bool((step.get("result") or {}).get("ok")) for step in step_results
+    )
+    if all_steps_ok and not any(marker in evidence for marker in (
+        "step_fail",
+        "traceback",
+        "syntaxerror",
+        "nameerror",
+        "httperror4",
+        "httperror5",
+    )):
+        return "verification_failure"
+
+    return "payload_failure"
+
+
+def _apply_failure_taxonomy(
+    fb: dict[str, Any],
+    exec_out: dict[str, Any],
+    all_stdouts: str,
+) -> None:
+    failure_type = _classify_failure_type(fb, exec_out, all_stdouts)
+    fb["failure_type"] = failure_type
+    if failure_type != "runtime_target_missing":
+        return
+
+    next_action = (
+        "修复 runtime resolver/context：为计划声明的协议和端口补充匹配的 "
+        "target_context.runtime_targets 映射；不要绕过 runtime_targets，也不要硬编码 "
+        "host.docker.internal。"
+    )
+    fb["next_required_action"] = next_action
+    fb["next_direction"] = next_action
+    fb["suggested_next_action"] = "FIX_RUNTIME_CONTEXT"
+    fb["feedback_for_planner"] = next_action
+    fb["state_transition_blocker"] = (
+        "缺少匹配的 runtime target；执行在建立传输连接之前终止，不能归因于 payload。"
+    )
+    fb["memory_patch"] = {}
+    failure_analysis = dict(fb.get("failure_analysis") or {})
+    failure_analysis["type"] = "runtime_target_missing"
+    fb["failure_analysis"] = failure_analysis
+    analysis = fb.setdefault("analysis", {})
+    analysis["guidance"] = next_action
+
+
 # ────────────────────────────────────────────────────────────────
 # Flag / 成功信号检测
 # ────────────────────────────────────────────────────────────────
@@ -666,7 +761,11 @@ def _local_evidence_state(
                     break
             if has_http_success:
                 break
-    if has_http_success:
+    if has_http_success or any(
+        any(item.get("protocol") == "grpc" and item.get("ok") is True
+            for item in result.get("execution_results") or [])
+        for result in step_results
+    ):
         return "probe_success"
 
     return "init"
@@ -777,6 +876,87 @@ def _apply_structured_feedback_fields(
 # Level 1: Surface Signals — payload reached backend and perturbed its state
 #   response_length_mutation, timing_anomaly, redirect_change_received,
 #   new_cookie_set, http_500_post_payload, connection_reset_after_injection
+def _apply_primitive_graph_state(fb: dict[str, Any], exec_out: dict[str, Any]) -> None:
+    graph = get_transition_graph()
+    primitives = graph.get_capability_primitives()
+    transitions = graph.get_capability_transitions()
+    evidence_parts: list[str] = []
+    for step in exec_out.get('step_results') or []:
+        result = step.get('result') or {}
+        chain_output = step.get('chain_output') or {}
+        evidence_parts.append(_normalize_text_value(result.get('stdout', '')))
+        evidence_parts.append(_normalize_text_value(result.get('stderr', '')))
+        evidence_parts.append(_normalize_text_value(chain_output.get('_stdout', '')))
+        evidence_parts.append(_normalize_text_value(chain_output.get('_stderr', '')))
+    evidence_text = '\n'.join(evidence_parts)
+
+    def observed(signal: str) -> bool:
+        return bool(re.search(rf'\b{re.escape(signal)}\b', evidence_text))
+
+    confirmed_primitives: list[str] = []
+    for primitive in primitives:
+        signals = primitive.required_observations + primitive.success_indicators
+        if any(observed(signal) for signal in signals):
+            confirmed_primitives.append(primitive.id)
+    current_primitive = confirmed_primitives[-1] if confirmed_primitives else None
+    blocked = None
+    for transition in transitions:
+        if transition.from_state != current_primitive:
+            continue
+        if any(observed(signal) for signal in transition.invalid_conditions):
+            blocked = transition
+            break
+    if blocked is None:
+        for transition in transitions:
+            if any(observed(signal) for signal in transition.invalid_conditions):
+                blocked = transition
+                break
+    recommended = None
+    if current_primitive:
+        next_state = graph.get_next_state(current_primitive)
+        if next_state:
+            recommended = graph.get_transition(current_primitive, next_state)
+    if blocked and recommended == blocked:
+        recommended = None
+
+    command_execution_confirmed = (
+        "command_execution" in set(fb.get("detected_primitives") or [])
+        or bool(re.search(r"\bProcess\s*[\[(]\s*pid\s*=\s*\d+", evidence_text, re.IGNORECASE))
+        or bool(re.search(
+            r"\bRuntime(?:\.getRuntime\(\))?\.exec\s*(?:\(|invocation\b|invoked\b|called\b)",
+            evidence_text,
+            re.IGNORECASE,
+        ))
+        or observed("command_execution_confirmed")
+    )
+    final_output_observed = bool(
+        _detect_flag(evidence_text)
+        or _detect_success_signal(evidence_text)
+        or observed("execution_result_output_observed")
+        or observed("execution_output_correlated")
+        or re.search(r"uid=\d+|gid=\d+|root:[x*]:", evidence_text, re.IGNORECASE)
+    )
+    if command_execution_confirmed:
+        if "command_execution" not in confirmed_primitives:
+            confirmed_primitives.append("command_execution")
+        current_primitive = "command_execution"
+        if not final_output_observed:
+            recommended = {
+                "from_state": "command_execution",
+                "to_state": "output_extraction",
+            }
+            fb["repro_success"] = False
+            fb["exploit_completed"] = False
+            fb["should_continue"] = True
+
+    fb['confirmed_primitives'] = confirmed_primitives
+    fb['current_primitive'] = current_primitive
+    fb['recommended_transition'] = (
+        recommended.to_dict() if hasattr(recommended, "to_dict") else recommended
+    )
+    fb['blocked_transition'] = blocked.to_dict() if blocked else None
+
+
 _LEVEL_1_WEIGHTS: dict[str, float] = {
     "response_length_change": 0.15,
     "timing_anomaly":         0.15,
@@ -1204,6 +1384,8 @@ def run_evaluator(
             all_stdouts=all_stdouts,
             all_payloads=all_payloads,
         )
+        _apply_primitive_graph_state(fb, clean_exec_out)
+        _apply_failure_taxonomy(fb, clean_exec_out, all_stdouts)
         memory.apply_evaluator_patch(fb.get("memory_patch") or {})
         feedback_path.parent.mkdir(parents=True, exist_ok=True)
         feedback_path.write_text(json.dumps(fb, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1417,6 +1599,9 @@ def run_evaluator(
         all_stdouts=all_stdouts,
         all_payloads=all_payloads,
     )
+    _apply_primitive_graph_state(fb, clean_exec_out)
+
+    _apply_failure_taxonomy(fb, clean_exec_out, all_stdouts)
 
     if not fb.get("repro_success"):
         existing_summary = fb.get("summary", "")

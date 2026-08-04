@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "plan_id": "primitive-feedback",
+  "steps": [
+    {
+      "id": 1,
+      "type": "python",
+      "target_primitive": "template_evaluation_confirmed",
+      "_ast_imports": [],
+      "_ast_sdk_calls": [],
+      "_ast_valid": false
+    }
+  ],
+  "primitive_context": {
+    "current_primitive": "input_processed",
+    "target_primitive": "template_evaluation_confirmed",
+    "transition_edge": "input_processed->template_evaluation_confirmed"
+  },
+  "platform": "Windows"
+}

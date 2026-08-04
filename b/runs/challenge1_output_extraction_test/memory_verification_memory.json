@@ -1,0 +1,43 @@
+{
+  "confirmed_base_url": "",
+  "confirmable_endpoints": [
+    "/"
+  ],
+  "injectable_params": {},
+  "injectable_endpoints": [],
+  "accepted_fields": [],
+  "rejected_fields": [],
+  "template_engine": "",
+  "reflection_confirmed": false,
+  "payload_blacklist": [],
+  "payload_bypass_techniques": [],
+  "working_primitives": [
+    {
+      "primitive_id": "ssti_reflection",
+      "confidence": 1.0,
+      "evidence": "step 1 响应中返回 49，确认 {{7*7}} 被 Velocity 模板引擎计算。",
+      "engine": ""
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 0.95,
+      "evidence": "HTTP 500 with MethodInvocationException proves the payload was parsed and executed by Velocity engine, confirming template execution.",
+      "engine": ""
+    },
+    {
+      "primitive_id": "command_execution",
+      "confidence": 0.95,
+      "evidence": "Command 'id' executed successfully, output shown in response",
+      "engine": ""
+    }
+  ],
+  "primitive_knowledge": {},
+  "confirmed_cve": "",
+  "target_app": "",
+  "target_framework": "",
+  "auth_status": "unknown",
+  "csrf_token_required": false,
+  "waf_detected": false,
+  "waf_type": "",
+  "confirmed_flags": []
+}

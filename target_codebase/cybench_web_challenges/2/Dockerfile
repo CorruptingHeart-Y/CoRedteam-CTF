@@ -1,28 +1,18 @@
-FROM maven:3.8.5-openjdk-11-slim
+FROM golang:1.22-alpine3.18
 
-# Install packages
-RUN apt update && apt install -y --no-install-recommends supervisor
+WORKDIR /challenge/
 
-# Setup app
-RUN mkdir -p /app
+COPY ./challenge/ /challenge/
 
-# Copy flag
-COPY flag.txt /flag.txt
+COPY ./flag.txt /flag.txt
 
-# Add application
-WORKDIR /app
-COPY challenge .
+RUN go mod download -x \
+ && go install github.com/air-verse/air@v1.52.3 \
+ && go install github.com/a-h/templ/cmd/templ@v0.2.543
 
-# Setup superivsord
-COPY config/supervisord.conf /etc/supervisord.conf
-
-# Expose the port spring-app is reachable on
 EXPOSE 1337
+EXPOSE 50045
 
-# Clean maven and install packages
-RUN mvn clean package
-
-# Copy entrypoint
 COPY --chown=root entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

@@ -108,3 +108,40 @@ payload_templates:
   - consolidator_reviewed:false
   source: consolidator
   severity: critical
+- name: velocity-runtime-exec-bufferedreader
+  description: 为 Velocity 模板注入攻击新增一个高可靠性 payload 骨架，使用 Runtime.exec 与 BufferedReader
+    读取命令输出，避免使用不稳定的 Scanner 构造器。该 YAML 规则将标记为 CWE-917（Expression Language Injection），包含
+    payload 模板、使用说明和适用场景。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-rce-with-output-capture
+  description: 针对 Velocity 1.7 的 SSTI → RCE 完整载荷，通过反射调用 Runtime.exec() 并使用 Scanner
+    读取命令输出，避免 Process.toString 造成的回显缺失。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-reflection-rce
+  description: 基于空字符串反射获取 Runtime 执行命令的标准 Velocity SSTI payload，已整合 executable_patch，可在发现
+    Velocity 模板注入后直接使用。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-scanner-rce-echo
+  description: Velocity SSTI RCE via Runtime.exec with Scanner-based output capture
+    and OOB fallback
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical

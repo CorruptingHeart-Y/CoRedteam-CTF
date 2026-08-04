@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "plan_id": "within-run-feedback",
+  "vuln_summary": "test",
+  "rationale": "test",
+  "chain_design": [],
+  "steps": [],
+  "history_state": {},
+  "primitive_context": {},
+  "platform": "Windows"
+}

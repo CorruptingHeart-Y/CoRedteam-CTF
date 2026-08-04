@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
+from core.grpc_sdk import GRPC_SDK_SOURCE
 from urllib.parse import urlparse, urlunparse
 
 import docker
@@ -494,12 +495,70 @@ def _deser(value: Any) -> Any:
 #  Task 6: AST → code inflater
 # ──────────────────────────────────────────────
 
+def _sdk_calls_fully_supported_by_inflater(sdk_calls: Any) -> bool:
+    """Return whether the current inflater can represent every SDK call."""
+    if not isinstance(sdk_calls, list) or not sdk_calls:
+        return False
+
+    unsupported_fields = {
+        "method", "path", "headers", "protocol", "transport", "network_transport",
+    }
+    for call in sdk_calls:
+        if isinstance(call, dict):
+            primitive = call.get("primitive", "")
+            if primitive == "GrpcClient.call":
+                if any(
+                    not isinstance(call.get(field), str) or not call.get(field).strip()
+                    for field in ("target", "service", "method")
+                ):
+                    return False
+                if not isinstance(call.get("payload"), dict):
+                    return False
+                if not isinstance(call.get("metadata", {}), dict):
+                    return False
+                if set(call).difference({"primitive", "target", "service", "method", "payload", "metadata"}):
+                    return False
+                continue
+            if any(call.get(field) not in (None, "", {}, []) for field in unsupported_fields):
+                return False
+            if primitive == "HttpClient.get":
+                if call.get("body") not in (None, {}, []) or call.get("raw") not in (None, "", b""):
+                    return False
+                if call.get("query") is not None and not isinstance(call.get("query"), dict):
+                    return False
+            elif primitive == "HttpClient.post":
+                if call.get("query") not in (None, {}, []) or call.get("raw") not in (None, "", b""):
+                    return False
+                if call.get("body") is not None and not isinstance(call.get("body"), dict):
+                    return False
+                if call.get("body_format", "form") not in ("form", "json"):
+                    return False
+            elif primitive == "HttpClient.raw_request":
+                if call.get("body") not in (None, "", {}, []) or call.get("body_format") not in (None, ""):
+                    return False
+                if not isinstance(call.get("raw", b""), (str, bytes)):
+                    return False
+            elif primitive == "HttpClient.last_response":
+                if any(value not in (None, "", {}, []) for key, value in call.items() if key != "primitive"):
+                    return False
+            else:
+                return False
+        elif str(call) not in {
+            "HttpClient.get",
+            "HttpClient.post",
+            "HttpClient.raw_request",
+            "HttpClient.last_response",
+        }:
+            return False
+    return True
+
+
 def _inflate_ast_to_script(step: dict[str, Any]) -> str:
     """Generate a runnable Python script from structured sdk_calls + imports.
 
     When Planner outputs declarative AST (imports + sdk_calls) without raw
     command code, this inflater generates the executable Python.
-    Execution priority (enforced by _run_docker): sdk_calls > code > command.
+    _run_docker calls this only when every sdk_call is fully supported.
     """
     imports = step.get("imports") or []
     sdk_calls = step.get("sdk_calls") or []
@@ -542,6 +601,10 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
             body_format = call.get("body_format", "form")  # default: form-encoded
             query = call.get("query")
             raw = call.get("raw", b"")
+            service = call.get("service", "")
+            method = call.get("method", "")
+            payload = call.get("payload", {})
+            metadata = call.get("metadata", {})
         else:
             primitive = str(call)
             target = "/"
@@ -549,6 +612,10 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
             body_format = "form"
             query = None
             raw = b""
+            service = ""
+            method = ""
+            payload = {}
+            metadata = {}
 
         if primitive == "HttpClient.get":
             if query and isinstance(query, dict) and query:
@@ -582,6 +649,16 @@ def _inflate_ast_to_script(step: dict[str, Any]) -> str:
             lines.append('save_context("_last_raw_response", resp.text[:2000])')
         elif primitive == "HttpClient.last_response":
             lines.append('print(f"Last response: {s.last_response}")')
+        elif primitive == "GrpcClient.call":
+            lines.append(
+                "resp = GrpcClient.call("
+                f"{target!r}, {service!r}, {method!r}, {payload!r}, {metadata!r})"
+            )
+            lines.append(
+                "print('###EXECUTION_RESULT###' + "
+                "json.dumps(resp.to_dict(), ensure_ascii=False, default=str))"
+            )
+            lines.append('save_context("_last_grpc_response", resp.to_dict())')
 
     lines.append("print('STEP_OK')")
     return "\n".join(lines)
@@ -676,6 +753,24 @@ class ExecutionNetworkError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RuntimeTargetResolution:
+    """Map one logical service description to its sandbox-reachable address."""
+
+    protocol: str
+    logical_host: str
+    logical_port: int
+    host: str
+    port: int
+    primary: bool = False
+
+    def to_context_dict(self) -> dict[str, Any]:
+        return {
+            "logical": {"protocol": self.protocol, "port": self.logical_port},
+            "runtime": {"host": self.host, "port": self.port},
+        }
+
+
+@dataclass(frozen=True)
 class ExecutionTargetContext:
     """One immutable source for policy authorization and Docker transport routing."""
 
@@ -686,6 +781,7 @@ class ExecutionTargetContext:
     execution_base_url: str
     execution_host: str
     execution_port: int
+    runtime_targets: tuple[RuntimeTargetResolution, ...]
     network_mode: str
 
     @property
@@ -703,11 +799,15 @@ class ExecutionTargetContext:
             "execution_base_url": self.execution_base_url,
             "execution_host": self.execution_host,
             "execution_port": self.execution_port,
+            "runtime_targets": [target.to_context_dict() for target in self.runtime_targets],
             "network_mode": self.network_mode,
         }
 
 
-def _build_execution_target_context(policy_base_url: str) -> ExecutionTargetContext:
+def _build_execution_target_context(
+    policy_base_url: str,
+    logical_services: list[dict[str, Any]] | None = None,
+) -> ExecutionTargetContext:
     """Derive Docker transport routing without changing the locked policy URL."""
     policy_base_url = (policy_base_url or "").strip()
     try:
@@ -743,6 +843,32 @@ def _build_execution_target_context(policy_base_url: str) -> ExecutionTargetCont
         execution_host = policy_host
         execution_base_url = policy_base_url
         network_mode = "docker-direct"
+    runtime_targets = [RuntimeTargetResolution(
+        protocol=parsed.scheme,
+        logical_host=policy_host,
+        logical_port=policy_port,
+        host=execution_host,
+        port=policy_port,
+        primary=True,
+    )]
+    seen = {(parsed.scheme, policy_port)}
+    for service in logical_services or []:
+        protocol = str(service.get("protocol") or "").strip().lower()
+        try:
+            port = int(service.get("port"))
+        except (TypeError, ValueError):
+            continue
+        if not protocol or not 1 <= port <= 65535 or (protocol, port) in seen:
+            continue
+        seen.add((protocol, port))
+        runtime_targets.append(RuntimeTargetResolution(
+            protocol=protocol,
+            logical_host=policy_host,
+            logical_port=port,
+            host=execution_host,
+            port=port,
+        ))
+
 
     return ExecutionTargetContext(
         policy_base_url=policy_base_url,
@@ -753,8 +879,23 @@ def _build_execution_target_context(policy_base_url: str) -> ExecutionTargetCont
         execution_host=execution_host,
         execution_port=policy_port,
         network_mode=network_mode,
+        runtime_targets=tuple(runtime_targets),
     )
 
+
+
+def _logical_services_from_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize supported Planner service contracts for runtime resolution."""
+    primitive_context = plan.get("primitive_context") or {}
+    if not isinstance(primitive_context, dict):
+        return []
+    transport_requirements = primitive_context.get("transport_requirements")
+    if isinstance(transport_requirements, dict):
+        return [transport_requirements]
+    return [{
+        "protocol": primitive_context.get("transport"),
+        "port": primitive_context.get("port"),
+    }]
 # ──────────────────────────────────────────────
 #  网络隔离辅助
 # ──────────────────────────────────────────────
@@ -876,7 +1017,7 @@ def _prepare_exec_workspace(base_workdir: Path, target_context: dict | None = No
 
     # 写入 SDK（二进制模式避免 Windows \\n→\\r\\n 转换破坏字符串字面量）
     sdk_path = ws / "redteam_sdk.py"
-    sdk_path.write_bytes(_SDK_SOURCE.encode("utf-8"))
+    sdk_path.write_bytes((_SDK_SOURCE + GRPC_SDK_SOURCE).encode("utf-8"))
 
     # 初始化 context — 预注入 target_context 以便 LLM 脚本读取 base_url
     # 同时写入 ro 区（供脚本初始读取）和 tmp（供 save_context 写入）
@@ -1177,6 +1318,47 @@ def _extract_http_responses_from_stdout(stdout: str) -> list[dict[str, Any]]:
     return responses
 
 
+def _extract_execution_results_from_stdout(stdout: str) -> list[dict[str, Any]]:
+    """Parse structured SDK result markers without interpreting payload data."""
+    marker = "###EXECUTION_RESULT###"
+    results: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        _, separator, payload = line.partition(marker)
+        if not separator:
+            continue
+        try:
+            item = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            results.append(item)
+    return results
+
+
+def _rewrite_code_fallback_runtime_targets(
+    code: str,
+    runtime_targets: tuple[RuntimeTargetResolution, ...] = (),
+) -> str:
+    """Rewrite additional logical service authorities for sandbox execution."""
+    rewritten = code
+    for target in runtime_targets:
+        if target.primary or target.logical_host == target.host:
+            continue
+        logical_hosts = {target.logical_host}
+        try:
+            if ipaddress.ip_address(target.logical_host).is_loopback:
+                logical_hosts.update({"127.0.0.1", "localhost", "[::1]"})
+        except ValueError:
+            if target.logical_host.lower() == "localhost":
+                logical_hosts.update({"127.0.0.1", "localhost", "[::1]"})
+        runtime_authority = f"{target.host}:{target.port}"
+        for logical_host in logical_hosts:
+            rewritten = rewritten.replace(
+                f"{logical_host}:{target.logical_port}", runtime_authority
+            )
+    return rewritten
+
+
 def _run_docker(
     step: dict[str, Any],
     sandbox: DockerSandbox,
@@ -1184,25 +1366,40 @@ def _run_docker(
     env_vars: dict[str, str] | None = None,
     target_url: str = "",
     target: "TargetContext | None" = None,
+    runtime_targets: tuple[RuntimeTargetResolution, ...] = (),
 ) -> tuple[dict[str, Any], dict]:
     stype   = step.get("type")
     step_id = step.get("id", 0)
 
     # ── Protocol Unification: execution priority ──
-    # sdk_calls > code > command (no fallback mixing)
+    # Priority: code > sdk_calls (inflater) > command
+    # - code  field is the canonical executable payload (always preferred)
+    # - sdk_calls is an optimization path when code is missing
+    # - command is the last-resort fallback
     sdk_calls = step.get("sdk_calls") or []
-    if sdk_calls:
+    sdk_calls_supported = _sdk_calls_fully_supported_by_inflater(sdk_calls)
+    if step.get("code") and step["code"].strip():
+        code = _rewrite_code_fallback_runtime_targets(step["code"], runtime_targets)
+        if sdk_calls:
+            print(f"[executor] code field overrides sdk_calls step[{step_id}] ({len(code)} chars)")
+        else:
+            print(f"[executor] using code field step[{step_id}] ({len(code)} chars)")
+    elif sdk_calls and sdk_calls_supported:
         code = _inflate_ast_to_script(step)
-        print(f"[executor] using AST compiler path step[{step_id}] ({len(code)} chars)")
-    elif step.get("code"):
-        code = step["code"]
-        print(f"[executor] using code field step[{step_id}] ({len(code)} chars)")
+        print(f"[executor] using AST inflater path step[{step_id}] (no code; {len(code)} chars)")
+    elif sdk_calls:
+        return {
+            "ok": False, "exit_code": -1, "stdout": "",
+            "stderr": "sdk_calls are not fully supported by the current inflater and no code field was provided",
+            "error_code": "UNSUPPORTED_SDK_CALLS_NO_CODE",
+            "duration_sec": 0.0, "execution_mode": "unsupported_sdk_calls",
+        }, {}
     elif step.get("command"):
         code = (step["command"] or "").strip()
         print(f"[executor] using command field step[{step_id}] (LEGACY) ({len(code)} chars)")
     else:
         code = ""
-        print(f"[executor] step[{step_id}] no executable payload (no sdk_calls/code/command)")
+        print(f"[executor] step[{step_id}] no executable payload (no code/sdk_calls/command)")
 
     if stype != "python":
         return {
@@ -1306,12 +1503,14 @@ def _run_step(
     env_vars: dict[str, str] | None = None,
     target_url: str = "",
     target: "TargetContext | None" = None,
+    runtime_targets: tuple[RuntimeTargetResolution, ...] = (),
 ) -> tuple[dict[str, Any], dict]:
     if sandbox is not None and sandbox.is_available():
         print(f"[executor] Docker 沙箱执行 step {step.get('id')}")
         return _run_docker(
             step, sandbox, exec_workspace,
             env_vars=env_vars, target_url=target_url, target=target,
+            runtime_targets=runtime_targets,
         )
 
     err_msg = (
@@ -1363,13 +1562,6 @@ def run_executor(
     if target is not None:
         sandbox_env.update(target.as_env())
 
-    # 跳过有语法错误的步骤
-    syntax_warnings = val.get("syntax_warnings") or []
-    skip_indices: set[int] = set()
-    for w in syntax_warnings:
-        m = re.search(r"step\[(\d+)\]", w)
-        if m:
-            skip_indices.add(int(m.group(1)))
 
     _audit_log.info(
         f"[AUDIT] 启动 executor: plan_id={plan.get('plan_id')} steps={len(steps)} target={target_url}"
@@ -1412,7 +1604,10 @@ def run_executor(
         raise SecurityViolationError(f"Docker 引擎异常: {e}！") from e
 
     try:
-        execution_target = _build_execution_target_context(target_url)
+        execution_target = _build_execution_target_context(
+            target_url,
+            _logical_services_from_plan(plan),
+        )
     except ExecutionNetworkError as e:
         out = {
             "version": 1,
@@ -1437,23 +1632,13 @@ def run_executor(
     chain_context: dict[str, str] = {}
 
     for i, st in enumerate(steps):
-        if i in skip_indices:
-            step_results.append({
-                "step_id": st.get("id"), "type": st.get("type"), "purpose": st.get("purpose"),
-                "result": {
-                    "ok": False, "exit_code": -1, "stdout": "", "duration_sec": 0.0,
-                    "stderr": f"validator 检测到语法错误，已跳过: {syntax_warnings}",
-                    "execution_mode": "skipped_syntax_error",
-                },
-                "chain_output": {},
-            })
-            continue
 
         try:
             result, step_chain_output = _run_step(
                 st, timeout_sec, exec_workspace, sandbox,
                 env_vars=sandbox_env or None,
                 target_url=execution_target.execution_base_url, target=None,
+                runtime_targets=execution_target.runtime_targets,
             )
         except SecurityViolationError as e:
             result = {
@@ -1494,6 +1679,7 @@ def run_executor(
 
         # 从 stdout 中提取 HTTP 响应记录
         http_responses = _extract_http_responses_from_stdout(stdout)
+        execution_results = _extract_execution_results_from_stdout(stdout)
 
         # 将 stdout / stderr / HTTP 响应合并进 chain_output，使 Evaluator/Planner 能读取真实输出
         if stdout:
@@ -1502,6 +1688,8 @@ def run_executor(
             step_chain_output["_stderr"] = stderr[-1000:]
         if http_responses:
             step_chain_output["_http_responses"] = http_responses
+        if execution_results:
+            step_chain_output["_execution_results"] = execution_results
 
         if step_chain_output:
             print(
@@ -1516,6 +1704,7 @@ def run_executor(
             "result":  result,
             "chain_output": step_chain_output,
             "http_responses": http_responses,
+            "execution_results": execution_results,
         })
 
     fail_results = [r for r in step_results if not (r.get("result") or {}).get("ok")]

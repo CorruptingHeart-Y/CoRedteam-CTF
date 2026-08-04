@@ -74,3 +74,19 @@ payload_templates:
   - consolidator_reviewed:false
   source: consolidator
   severity: critical
+- name: velocity-exec-runtime-exec-cat
+  description: 针对 Java Velocity 模板注入的完整文件读取载荷，通过 Runtime.exec 执行 cat 并返回结果。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical
+- name: velocity-bufferedreader-cmd-exec
+  description: 使用 BufferedReader 逐行读取命令输出的 Velocity SSTI RCE payload，解决 Scanner 构造失败问题。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical

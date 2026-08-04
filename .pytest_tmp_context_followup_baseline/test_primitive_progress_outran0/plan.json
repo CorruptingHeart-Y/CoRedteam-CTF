@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "plan_id": "primitive-feedback",
+  "steps": [
+    {
+      "id": 1,
+      "type": "python",
+      "target_primitive": "arbitrary_file_read",
+      "_ast_imports": [],
+      "_ast_sdk_calls": [],
+      "_ast_valid": false
+    }
+  ],
+  "primitive_context": {
+    "current_primitive": "command_execution",
+    "target_primitive": "arbitrary_file_read",
+    "transition_edge": "input_processed->arbitrary_file_read"
+  },
+  "platform": "Windows"
+}

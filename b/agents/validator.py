@@ -13,6 +13,7 @@ import yaml
 from memory.exploit_trajectory import get_trajectory
 from memory.verification_memory import get_verification
 from control.anti_regression import AntiRegressionController
+from core.capability_contract import validate_capability_contract
 from core.plan_contract import validate_plan_structure
 
 
@@ -396,11 +397,37 @@ def _validate_step(step: dict[str, Any], policies: dict[str, Any]) -> tuple[bool
 def _normalize_plan(plan: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     fixed = copy.deepcopy(plan)
     warnings: list[str] = []
+
+    chain_design = fixed.get("chain_design")
+    if isinstance(chain_design, list):
+        chain_target = next(
+            (item.strip() for item in reversed(chain_design)
+             if isinstance(item, str) and item.strip()),
+            "",
+        )
+        primitive_context = fixed.get("primitive_context")
+        if chain_target and primitive_context is None:
+            primitive_context = {}
+            fixed["primitive_context"] = primitive_context
+        if chain_target and isinstance(primitive_context, dict):
+            llm_target = primitive_context.get("target_primitive")
+            if llm_target != chain_target:
+                primitive_context["target_primitive"] = chain_target
+                warnings.append(
+                    "primitive_context.target_primitive locked to "
+                    f"chain_design terminal primitive {chain_target!r}"
+                )
+
     steps = fixed.get("steps")
     if not isinstance(steps, list):
         return fixed, warnings
-    for st in steps:
-        if not isinstance(st, dict) or st.get("type") != "python":
+    for idx, st in enumerate(steps, start=1):
+        if not isinstance(st, dict):
+            continue
+        if st.get("id") is None:
+            st["id"] = idx
+            warnings.append(f"step[{idx - 1}].id missing; auto-filled as {idx}")
+        if st.get("type") != "python":
             continue
         cmd = _vtext(st.get("command")).strip()
         if not cmd:
@@ -734,10 +761,33 @@ def _check_request_contract(
     Each parameter may have multiple accepted_locations (e.g. @RequestParam
     accepts both query and form); the gate checks all of them.
     """
-    if not parameter_contract or not parameter_contract.get("parameters"):
+    if not parameter_contract:
         return [], []
-    required_params = parameter_contract.get("parameters", [])
-    endpoint = parameter_contract.get("endpoint", "")
+    transport = parameter_contract.get("transport_requirements") or {}
+    protocol = str(transport.get("protocol") or "http").lower()
+    if protocol not in ("http", "https"):
+        return [], []
+
+    typed_inputs = parameter_contract.get("user_input_requirements")
+    if isinstance(typed_inputs, dict):
+        required_params = []
+        for name, requirement in typed_inputs.items():
+            if requirement is False:
+                continue
+            details = requirement if isinstance(requirement, dict) else {}
+            required_params.append({
+                "name": name,
+                "accepted_locations": list(
+                    details.get("accepted_locations") or ["query"]
+                ),
+            })
+    else:
+        # Compatibility for callers that still pass the pre-layered contract.
+        required_params = parameter_contract.get("parameters", [])
+    if not required_params:
+        return [], []
+    interface = parameter_contract.get("interface_requirements") or {}
+    endpoint = interface.get("endpoint", parameter_contract.get("endpoint", ""))
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -813,8 +863,50 @@ def _check_request_contract(
     return errors, warnings
 
 
+def _check_transport_execution_contract(
+    plan: dict[str, Any],
+    parameter_contract: dict[str, Any] | None = None,
+) -> list[str]:
+    """Reject execution interfaces that contradict the declared transport."""
+    primitive_context = plan.get("primitive_context") or {}
+    if not isinstance(primitive_context, dict):
+        primitive_context = {}
+
+    transport = primitive_context.get("transport_requirements") or {}
+    if not isinstance(transport, dict) or not transport.get("protocol"):
+        transport = (parameter_contract or {}).get("transport_requirements") or {}
+    protocol = str(transport.get("protocol") or "").lower()
+    if protocol != "grpc":
+        return []
+
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for call in step.get("sdk_calls") or []:
+            primitive = call.get("primitive", "") if isinstance(call, dict) else str(call)
+            if primitive.rstrip("(").startswith("HttpClient."):
+                return ["transport mismatch: grpc protocol cannot use HttpClient primitive"]
+
+    declarations = [plan, primitive_context]
+    declarations.extend(
+        step for step in (plan.get("steps") or []) if isinstance(step, dict)
+    )
+    for declaration in declarations:
+        execution_interface = declaration.get("execution_interface") or {}
+        if (
+            isinstance(execution_interface, dict)
+            and execution_interface.get("adapter") == "grpc_client"
+        ):
+            return []
+
+    return [
+        "transport mismatch: grpc protocol requires "
+        "execution_interface.adapter=grpc_client"
+    ]
+
+
 def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Extract known parameters from confirmed_vuln.json for Request Contract Gate."""
+    """Extract explicit HTTP user inputs from confirmed_vuln.json."""
     if not confirmed:
         return None
     vulns = confirmed.get("vulnerabilities", [])
@@ -830,11 +922,19 @@ def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, A
             source = source.get("code", "")
         if not isinstance(source, str):
             source = ""
-        # Parse: "HTTP GET/POST parameter `text`" or "@RequestParam(name = \"text\")"
-        for m in _re.finditer(r"[`'\"](\w+)[`'\"]", source):
+        # Only explicit HTTP parameter declarations are user-input evidence.
+        # Quoted transport literals such as net.Listen("tcp", ...) are not.
+        declarations = list(_re.finditer(
+            r"@RequestParam\s*\(\s*(?:(?:name|value)\s*=\s*)?[`'\"](\w+)[`'\"]",
+            source,
+        ))
+        declarations.extend(_re.finditer(
+            r"HTTP\s+(?:GET|POST|PUT|PATCH|DELETE)\s+parameter\s+[`'\"](\w+)[`'\"]",
+            source,
+            _re.IGNORECASE,
+        ))
+        for m in declarations:
             pname = m.group(1)
-            if pname in ("param", "parameter", "name"):
-                continue
             # Determine accepted locations from source hints
             if "@RequestParam" in source:
                 # Spring MVC: accepts query AND form body — both are valid
@@ -850,7 +950,11 @@ def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, A
         evidence = v.get("evidence", "")
         if isinstance(evidence, list):
             for e in evidence:
+                if not isinstance(e, dict):
+                    continue
                 code = e.get("code_snippet", "")
+                if not isinstance(code, str):
+                    continue
                 for m in _re.finditer(r'@(?:RequestMapping|GetMapping|PostMapping)\(["\']([^"\']+)["\']', code):
                     endpoint = m.group(1)
         # Extract method from exploitation hint (only when explicit)
@@ -862,7 +966,22 @@ def _extract_parameter_contract(confirmed: dict[str, Any] | None) -> dict[str, A
         # method="" means "not explicitly constrained" — Gate skips method check
     if not params:
         return None
-    return {"parameters": params, "endpoint": endpoint, "method": method}
+    user_inputs = {
+        parameter["name"]: {
+            "required": True,
+            "accepted_locations": list(parameter["accepted_locations"]),
+        }
+        for parameter in params
+    }
+    return {
+        "transport_requirements": {"protocol": "http", "method": method},
+        "interface_requirements": {"endpoint": endpoint},
+        "user_input_requirements": user_inputs,
+        # Compatibility aliases for existing HTTP challenges and callers.
+        "parameters": params,
+        "endpoint": endpoint,
+        "method": method,
+    }
 
 
 def validate_plan(
@@ -884,6 +1003,7 @@ def validate_plan(
         ]
         return {
             "passed": False,
+            "valid": False,
             "errors": struct_errors,
             "structure_invalid": True,
         }
@@ -976,10 +1096,18 @@ def validate_plan(
                             for p in _MANIFEST_SDK_PRIMITIVES
                         )
                         if not matched:
-                            errors.append(
-                                f"{step_label}: 声明的 SDK call `{call}` 未在 Manifest sdk_primitives "
-                                f"中注册，valid:false"
-                            )
+                            # code-first: 当 code 字段存在时，sdk_calls 为 optional metadata
+                            _code_sdk = isinstance(st.get("code"), str) and st["code"].strip()
+                            if _code_sdk:
+                                syntax_warnings.append(
+                                    f"{step_label}: 声明的 SDK call `{call}` 未在 Manifest sdk_primitives "
+                                    f"中注册（code 存在，降级为 warning）"
+                                )
+                            else:
+                                errors.append(
+                                    f"{step_label}: 声明的 SDK call `{call}` 未在 Manifest sdk_primitives "
+                                    f"中注册，valid:false"
+                                )
                 elif isinstance(step_sdk_calls, list) and not step_sdk_calls and _MANIFEST_SDK_PRIMITIVES:
                     # 空数组 → 可能有绕过意图，警告但不阻断
                     syntax_warnings.append(
@@ -997,10 +1125,17 @@ def validate_plan(
                 # imports / sdk_calls 声明式结构校验已在上面完成（lines ~750-786）
                 # 这里补充 AST vs Manifest 交叉校验
                 ast_ok, ast_errs = _validate_step_ast_against_manifest(st, step_label)
+                # code-first: 当 code 字段存在时，sdk_calls 为 optional metadata，降级为 warning
+                step_has_code = isinstance(st.get("code"), str) and st["code"].strip()
                 if not ast_ok:
-                    errors.extend(ast_errs)
+                    if step_has_code:
+                        syntax_warnings.extend(f"[AST-MANIFEST] {e}" for e in ast_errs)
+                    else:
+                        errors.extend(ast_errs)
                     print(f"[validator] [AST-MANIFEST] {step_label}: {ast_errs}")
-                continue
+                if not step_has_code:
+                    continue  # 纯 AST 模式：跳过旧版路径
+                # code 字段存在 → 继续进入旧版路径做 text_scan / syntax 校验
 
             # ── LEGACY 模式：command/code 文本解析路径 ──
             ok, errs, step_warnings = _validate_step(st, policies)
@@ -1043,19 +1178,37 @@ def validate_plan(
                         print(f"[validator] [POLYGLOT] {msg}")
                         syntax_warnings.append(msg)
 
-    # ── Request Contract Gate — 验证 sdk_calls 是否满足 known parameter contract ──
+    # ── Capability Contract Gate（code-first: 降级为 warning）──
+    capability_errs = validate_capability_contract(plan)
+    if capability_errs:
+        syntax_warnings.extend(f"[capability_contract] {e}" for e in capability_errs)
+        print(
+            f"[validator] [CONTRACT] Capability Registry Gate: "
+            f"{len(capability_errs)} warnings (non-blocking in code-first mode)"
+        )
+
+    # ── Transport Execution Contract Gate（code-first: 降级为 warning）──
+    transport_errs = _check_transport_execution_contract(plan, parameter_contract)
+    if transport_errs:
+        syntax_warnings.extend(f"[transport_contract] {e}" for e in transport_errs)
+        print(
+            f"[validator] [CONTRACT] Transport Execution Contract Gate: "
+            f"{len(transport_errs)} warnings (non-blocking in code-first mode)"
+        )
+
+    # ── Request Contract Gate（code-first: 非安全类错误降级为 warning）──
     contract_errs, contract_warns = _check_request_contract(steps, parameter_contract)
     if contract_errs:
         for cv in contract_errs:
-            errors.append(f"[request_contract] {cv}")
-        print(f"[validator] [CONTRACT] Request Contract Gate: {len(contract_errs)} blocking errors")
+            syntax_warnings.append(f"[request_contract] {cv}")
+        print(f"[validator] [CONTRACT] Request Contract Gate: {len(contract_errs)} warnings (non-blocking in code-first mode)")
     if contract_warns:
         for cw in contract_warns:
             syntax_warnings.append(f"[request_contract] {cw}")
         print(f"[validator] [CONTRACT] Request Contract: {len(contract_warns)} warnings")
 
     passed = len(errors) == 0
-    result: dict[str, Any] = {"passed": passed, "errors": errors}
+    result: dict[str, Any] = {"passed": passed, "valid": passed, "errors": errors}
     if syntax_warnings:
         result["syntax_warnings"] = syntax_warnings
         result["syntax_hint"] = (

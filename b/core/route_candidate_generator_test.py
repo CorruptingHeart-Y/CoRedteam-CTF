@@ -64,6 +64,8 @@ FB_REFLECTION_BLOCKED: dict[str, Any] = {
     "flag_found": False,
     "failure_reason": "reflection_blocked",
     "repro_success": False,
+    "same_primitive_attempts": 3,
+    "no_progress_streak": 3,
     "primitive_state": {"ssti": True, "rce": False, "arithmetic": False},
     "current_exploit_state": "probe_success",
     "detected_primitives": ["ssti_reflection"],
@@ -396,7 +398,12 @@ def test_is_reflection_blocked_detection() -> dict[str, Any]:
 
     # Positive: explicit failure_reason
     _assert(
-        _is_reflection_blocked({"primitive_confirmed": True, "failure_reason": "reflection_blocked"}),
+        _is_reflection_blocked({
+            "primitive_confirmed": True,
+            "failure_reason": "reflection_blocked",
+            "same_primitive_attempts": 3,
+            "no_progress_streak": 3,
+        }),
         "Detects explicit failure_reason='reflection_blocked'",
         failures, details,
     )
@@ -405,7 +412,10 @@ def test_is_reflection_blocked_detection() -> dict[str, Any]:
     _assert(
         _is_reflection_blocked({
             "primitive_confirmed": True,
+            "same_primitive_attempts": 3,
+            "no_progress_streak": 3,
             "primitive_state": {"ssti": True, "rce": False, "arithmetic": False},
+            "failure_analysis": {"type": "no_execution_evidence"},
         }),
         "Detects primitive_state ssti=True, rce=False",
         failures, details,
@@ -425,6 +435,8 @@ def test_is_reflection_blocked_detection() -> dict[str, Any]:
     _assert(
         _is_reflection_blocked({
             "primitive_confirmed": True,
+            "same_primitive_attempts": 3,
+            "no_progress_streak": 3,
             "state_transition_blocker": "reflected literally in response body",
             "raw_evidence": "payload reflected as <h2>...",
             "what_failed": "no execution evidence found",
@@ -879,6 +891,52 @@ def test_user_message_contract_after_routes() -> dict[str, Any]:
     return _make_result(len(failures) == 0, details, failures)
 
 
+# -------------------------------------------------------------------
+# Test 13: CWE classification outranks generic objective desirability
+# -------------------------------------------------------------------
+
+def test_cwe22_path_traversal_outranks_credential_dump() -> dict[str, Any]:
+    """A CWE-22 classification must dominate generic objective desirability."""
+    failures: list[str] = []
+    details: list[str] = []
+    confirmed_vuln = {
+        "vulnerabilities": [{"cwe_id": "CWE-22"}],
+    }
+    routes = [
+        CandidateRoute(
+            "credential_dump",
+            ["entry", "credential_dump"],
+            "credential_dump",
+            "unexplored",
+            "low",
+        ),
+        CandidateRoute(
+            "path_traversal",
+            ["entry", "path_traversal"],
+            "path_traversal",
+            "unexplored",
+            "low",
+        ),
+    ]
+
+    ranked = rank_candidate_routes(routes, confirmed_vuln=confirmed_vuln)
+
+    _assert(
+        ranked[0].objective == "path_traversal",
+        "CWE-22 ranks path_traversal above credential_dump",
+        failures,
+        details,
+    )
+    _assert(
+        ranked[0].score > ranked[1].score,
+        "CWE-22 classification match contributes more than generic objective score",
+        failures,
+        details,
+    )
+
+    return _make_result(len(failures) == 0, details, failures)
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
@@ -896,6 +954,7 @@ ALL_TESTS = [
     ("Test 10: Ranking before/after comparison", test_ranking_before_after_comparison),
     ("Test 11: Contract prioritizes schema over route", test_contract_prioritizes_schema_over_route),
     ("Test 12: User message assembly — contract after routes", test_user_message_contract_after_routes),
+    ("Test 13: CWE-22 prioritizes path traversal", test_cwe22_path_traversal_outranks_credential_dump),
 ]
 
 

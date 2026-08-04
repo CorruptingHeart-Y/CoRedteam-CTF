@@ -102,6 +102,40 @@ _BASE_OBJECTIVE_SCORES: dict[str, float] = {
     "ldap_injection": 35.0,
 }
 
+# Classification must dominate the full spread of generic objective base scores.
+_CLASSIFICATION_MATCH_BONUS = 100.0
+
+_PATH_TRAVERSAL_OBJECTIVES = frozenset({
+    "path_traversal",
+    "filesystem_traversal",
+    "file_read",
+    "arbitrary_file_read",
+    "file_write",
+    "arbitrary_file_write",
+})
+
+_UNAUTHENTICATED_ACCESS_OBJECTIVES = frozenset({
+    "unauthenticated_access",
+    "authentication_bypass",
+    "auth_bypass",
+})
+
+# Standard vulnerability classes only; no challenge, target, or endpoint rules.
+_CWE_OBJECTIVE_PREFERENCES: dict[str, frozenset[str]] = {
+    "CWE-22": _PATH_TRAVERSAL_OBJECTIVES,
+    "CWE-306": _UNAUTHENTICATED_ACCESS_OBJECTIVES,
+}
+
+# The current primitive is already selected from CWE entry primitives upstream.
+# This preserves classification-aware ranking without coupling callers to CWE data.
+_PRIMITIVE_OBJECTIVE_PREFERENCES: dict[str, frozenset[str]] = {
+    "path_traversal": _PATH_TRAVERSAL_OBJECTIVES,
+    "filesystem_traversal": _PATH_TRAVERSAL_OBJECTIVES,
+    "unauthenticated_access": _UNAUTHENTICATED_ACCESS_OBJECTIVES,
+    "authentication_bypass": _UNAUTHENTICATED_ACCESS_OBJECTIVES,
+    "auth_bypass": _UNAUTHENTICATED_ACCESS_OBJECTIVES,
+}
+
 
 def _is_escalation(obj: str) -> bool:
     return obj in _ESCALATION_OBJECTIVES
@@ -295,13 +329,53 @@ def generate_candidate_routes(
 # Route Ranking
 # ═══════════════════════════════════════════════════════════════════
 
+def _normalize_cwe_id(value: Any) -> str:
+    normalized = str(value or "").strip().upper().replace("_", "-").replace(" ", "")
+    if normalized.isdigit():
+        return f"CWE-{normalized}"
+    if normalized.startswith("CWE") and not normalized.startswith("CWE-"):
+        return f"CWE-{normalized[3:].lstrip('-:')}"
+    return normalized
+
+
+def _classification_objectives(
+    confirmed_vuln: dict[str, Any] | None,
+    current_primitive: str | None,
+) -> set[str]:
+    """Return objectives matching the confirmed vulnerability classification."""
+    preferred: set[str] = set()
+
+    if current_primitive:
+        preferred.update(
+            _PRIMITIVE_OBJECTIVE_PREFERENCES.get(current_primitive, ())
+        )
+
+    if not isinstance(confirmed_vuln, dict):
+        return preferred
+
+    records: list[dict[str, Any]] = [confirmed_vuln]
+    vulnerabilities = confirmed_vuln.get("vulnerabilities", [])
+    if isinstance(vulnerabilities, list):
+        records.extend(item for item in vulnerabilities if isinstance(item, dict))
+
+    for record in records:
+        for field_name in ("cwe_id", "cwe"):
+            cwe_id = _normalize_cwe_id(record.get(field_name))
+            preferred.update(_CWE_OBJECTIVE_PREFERENCES.get(cwe_id, ()))
+
+    return preferred
+
+
 def rank_candidate_routes(
     routes: list[CandidateRoute],
     feedback: dict[str, Any] | None = None,
+    confirmed_vuln: dict[str, Any] | None = None,
+    current_primitive: str | None = None,
 ) -> list[CandidateRoute]:
     """Score and rank candidate routes with failure-aware heuristics.
 
     Ranking principles:
+    Primary constraint: vulnerability classification outranks generic desirability.
     1. All legitimate objectives remain — RCE is never banned, only deprioritized.
     2. When reflection_blocked: information_disclosure > escalation.
     3. Unexplored routes are preferred over previously-failed ones.
@@ -314,6 +388,8 @@ def rank_candidate_routes(
     Args:
         routes: Unranked candidate routes from generate_candidate_routes().
         feedback: Evaluator feedback dict for failure-aware adjustments.
+        confirmed_vuln: Stage1 vulnerability classification, when available.
+        current_primitive: Classification anchor already selected upstream.
 
     Returns:
         NEW list of routes sorted by score descending.
@@ -324,10 +400,17 @@ def rank_candidate_routes(
     # ── Determine failure context ──
     is_reflection_blocked = _is_reflection_blocked(feedback)
 
+    classification_objectives = _classification_objectives(
+        confirmed_vuln, current_primitive
+    )
     # Work on copies — do not mutate caller's routes
     scored: list[CandidateRoute] = []
     for route in routes:
-        score = _compute_route_score(route, is_reflection_blocked)
+        score = _compute_route_score(
+            route,
+            is_reflection_blocked,
+            classification_objectives,
+        )
         # Create a copy with the new score
         scored.append(CandidateRoute(
             route_id=route.route_id,
@@ -341,6 +424,71 @@ def rank_candidate_routes(
     # Sort descending by score, then by complexity (prefer simpler at equal score)
     scored.sort(key=lambda r: (r.score, _complexity_order(r.complexity)), reverse=True)
     return scored
+
+
+def _has_stagnation_preconditions(feedback: dict[str, Any] | None) -> bool:
+    """Require repeated same-primitive failure with no verified progress."""
+    if not feedback or not isinstance(feedback, dict):
+        return False
+
+    def counter(*keys: str) -> int:
+        for key in keys:
+            try:
+                return max(int(feedback.get(key, 0) or 0), 0)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    same_primitive_attempts = counter(
+        "same_primitive_attempts",
+        "primitive_attempt_count",
+    )
+    no_progress_streak = counter("no_progress_streak", "zero_progress_count")
+    if same_primitive_attempts < 2 or no_progress_streak < 2:
+        return False
+
+    if any(
+        bool(feedback.get(key))
+        for key in (
+            "new_verified_progress",
+            "state_advanced",
+            "new_evidence",
+            "primitive_just_confirmed",
+            "is_milestone",
+            "exploit_momentum",
+            "repro_success",
+        )
+    ):
+        return False
+
+    progress_reasons = feedback.get("progress_reasons") or []
+    if isinstance(progress_reasons, (list, tuple)):
+        verified_prefixes = (
+            "initial_round",
+            "state_advance",
+            "new_primitive",
+            "verified_facts",
+            "confidence_increase",
+            "partial_progress",
+            "progress_score",
+        )
+        if any(
+            str(reason).startswith(verified_prefixes)
+            for reason in progress_reasons
+        ):
+            return False
+
+    failure_values = (
+        feedback.get("failure_reason"),
+        feedback.get("failure_analysis"),
+        feedback.get("state_transition_blocker"),
+        feedback.get("what_failed"),
+        feedback.get("raw_evidence"),
+    )
+    return any(
+        value not in (None, "", {}, [], "N/A")
+        for value in failure_values
+    )
 
 
 def _is_reflection_blocked(feedback: dict[str, Any] | None) -> bool:
@@ -357,6 +505,8 @@ def _is_reflection_blocked(feedback: dict[str, Any] | None) -> bool:
     if not feedback.get("primitive_confirmed"):
         return False
     if feedback.get("exploit_completed") or feedback.get("flag_found"):
+        return False
+    if not _has_stagnation_preconditions(feedback):
         return False
 
     # ── Signal 1: Explicit failure_reason (strongest) ──
@@ -390,11 +540,16 @@ def _complexity_order(complexity: str) -> int:
     return {"low": 3, "medium": 2, "high": 1}.get(complexity, 0)
 
 
-def _compute_route_score(route: CandidateRoute, is_reflection_blocked: bool) -> float:
+def _compute_route_score(
+    route: CandidateRoute,
+    is_reflection_blocked: bool,
+    classification_objectives: set[str] | None = None,
+) -> float:
     """Compute a single route's score based on objective type, status, and context.
 
     Scoring formula:
       base = _BASE_OBJECTIVE_SCORES[objective] (default 25.0)
+      + CLASSIFICATION_MATCH_BONUS
       - PATH_PENALTY: -10 per extra hop beyond 1
       + STATUS_BONUS/PENALTY
       + CONTEXT_ADJUSTMENT (reflection_blocked)
@@ -404,6 +559,8 @@ def _compute_route_score(route: CandidateRoute, is_reflection_blocked: bool) -> 
     objective = route.objective
     base = _BASE_OBJECTIVE_SCORES.get(objective, 25.0)
     hops = len(route.path) - 1
+    if classification_objectives and objective in classification_objectives:
+        base += _CLASSIFICATION_MATCH_BONUS
 
     # ── Path length penalty ──
     path_penalty = max(0, (hops - 1)) * 10.0
@@ -592,6 +749,7 @@ def generate_and_rank_routes(
     traj: ExploitTrajectoryMemory | None = None,
     max_depth: int = 2,
     max_routes: int = 8,
+    confirmed_vuln: dict[str, Any] | None = None,
 ) -> tuple[list[CandidateRoute], str]:
     """One-shot: generate, rank, and format candidate routes.
 
@@ -602,6 +760,7 @@ def generate_and_rank_routes(
         traj: Trajectory for status detection.
         max_depth: Max hops for path generation.
         max_routes: Max routes in formatted context.
+        confirmed_vuln: Stage1 vulnerability classification, when available.
 
     Returns:
         (ranked_routes, formatted_context_string)
@@ -613,7 +772,12 @@ def generate_and_rank_routes(
         traj=traj,
         max_depth=max_depth,
     )
-    ranked = rank_candidate_routes(routes, feedback=feedback)
+    ranked = rank_candidate_routes(
+        routes,
+        feedback=feedback,
+        confirmed_vuln=confirmed_vuln,
+        current_primitive=current_primitive,
+    )
     context = build_candidate_routes_context(ranked, max_routes=max_routes)
     return ranked, context
 

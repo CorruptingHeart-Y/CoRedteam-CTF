@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>附件2：作品报告模版</title>
+<style>
+  html, body {
+    font-family: "宋体", "SimSun", serif;
+    font-size: 12pt;            /* 小四 */
+    line-height: 1.5;
+    color: #000;
+    margin: 0; padding: 0;
+  }
+  .page {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 28px 64px 72px 64px;
+    background: #fff;
+  }
+  h1.chapter { font-size: 18pt; text-align: center; margin: 48px 0 32px 0; letter-spacing: 2px; }
+  h2.section { font-size: 14pt; margin: 28px 0 14px 0; }
+  h3.subsection { font-size: 12.5pt; margin: 22px 0 12px 0; }
+  p { text-indent: 2em; margin: 10px 0; text-align: justify; }
+  p.no-indent { text-indent: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0 22px 0; font-size: 10.5pt; line-height: 1.4; }
+  th, td { border: 1px solid #000; padding: 6px 8px; vertical-align: top; text-align: left; }
+  th { background: #f0f0f0; }
+  caption { caption-side: top; text-align: center; font-weight: bold; margin-bottom: 6px; font-size: 11pt; }
+  ul, ol { text-align: justify; }
+  li { margin: 4px 0; }
+  code, .mono { font-family: "Consolas", "Courier New", monospace; font-size: 10.5pt; background: #f7f7f7; padding: 0 2px; }
+  .note { color: #555; font-size: 10.5pt; }
+  .flow { background:#f7f7f7; border-left:3px solid #888; padding:8px 12px; margin:10px 0; font-size:10.8pt; line-height:1.6; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<p class="note">
+  附件2：作品报告模版 — 第三、四章（测试与分析 / 创新性说明）。<br>
+  其余内容（封面、目录、摘要、第一、二、五章、参考文献）均从原始报告恢复，本模版不重写。
+</p>
+
+<!-- ############################################################ -->
+<!-- 第三章  作品测试与分析 -->
+<!-- ############################################################ -->
+<h1 class="chapter">第三章　作品测试与分析</h1>
+
+<h2 class="section">3.1 测试目标与验证原则</h2>
+
+<p>本项目的测试目标并不是"系统能否生成攻击文本"，也不是"是否收到 HTTP 200"，而是"系统能否在受控条件下产出可被独立复核的真实执行证据，并据此做出可信的成功判定"。这一目标决定了本章全部测试设计的基本立场：以可观测、可复现的客观证据为依据，而不是以模型自述、历史记忆或过程性日志为依据。</p>
+
+<p>为此，本章在测试中严格区分以下五个层次的概念，它们在本系统中具有不同的证据强度，不可互相替代：</p>
+<ul>
+  <li><b>请求可达</b>：目标服务在网络与传输层可达，例如收到 HTTP 响应。它仅说明"对方在"，不代表漏洞相关行为发生。</li>
+  <li><b>参数实际送达</b>：构造的请求按约定的方法、路径与请求体把目标参数送到了服务端，而非被丢弃或退化为默认页面。这一层是后续一切验证的前提。</li>
+  <li><b>漏洞原语被观察到</b>：在响应中观察到与漏洞机制直接相关的可识别原语，例如模板引擎对受控表达式的求值回显，说明该机制确实被触发。</li>
+  <li><b>能力或影响被确认</b>：原语进一步转化为可证明的能力，例如执行了受控运算、读取了受控内容。这一层比原语更强，但仍不等同于最终任务目标。</li>
+  <li><b>最终目标被验证</b>：在当前轮完整真实响应中出现任务定义的最终目标证据（如约定格式的目标标记），并由确定性目标裁决层独立确认。</li>
+</ul>
+
+<p>基于上述区分，测试设计采用"静态线索 + 动态受控验证 + 独立目标裁决"的闭环：静态线索指明 source、sink 与参数关系；动态受控验证在沙箱中以低风险载荷逐层确认；独立目标裁决只采信当前轮真实执行响应。系统不把 Planner 的推理文本（rationale）、计划正文、历史 memory、上一轮 feedback 或旧 workspace 文件当作最终成功证据。</p>
+
+<h2 class="section">3.2 测试环境与边界条件</h2>
+
+<p>测试在以下基础环境中进行：宿主机为 Windows 11，Python 运行环境通过项目 <code>requirements.txt</code> 约束依赖，容器运行依赖 Docker Desktop，大模型推理通过 OpenAI 兼容接口访问。靶场应用本身以容器形式在本地授权环境中运行，Co-RedTeam 的执行器另起独立 Docker 容器对其发起受控请求。Executor 在独立 Docker 沙箱中隔离执行，并通过容器层面的权限收敛与资源限制等运行时安全约束降低执行风险（具体配置见 <code>b/agents/executor.py</code> 与 <code>b/Dockerfile</code>）。</p>
+
+<p>目标边界通过 Target Context Lock 实现：Coordinator 启动时调用 <code>lock_target()</code>，对传入的授权 URL 做协议校验（仅允许 http/https）、主机名校验、DNS 解析与规范化，固化 <code>base_url</code> 并写入 <code>confirmed_vuln.json</code> 的 <code>target_context</code>；Executor 仅使用该锁定地址。所有测试均在授权靶场进行，不涉及真实互联网资产。</p>
+
+<p>关于成功判定范围，本系统仅以<b>当前轮</b>执行结果作为成功判定的证据来源；历史轮次的输出不直接构成当前成功证据。本次测试聚焦于 5 个典型入门级 Web 安全挑战，旨在验证系统从结构化规划、受控执行到目标证据确认的端到端闭环能力。</p>
+
+<h2 class="section">3.3 测试对象与场景设计</h2>
+
+<p>为验证系统在真实 Web 安全任务中的可用性，项目组选取 CyberBench 收录的 HTB Cyber Apocalypse 2024 Web 挑战开展测试。系统已完成 5 个典型入门级挑战的端到端受控验证，覆盖 Labyrinth Linguist、Testimonial、Flag Command、KORP Terminal 与 TimeKORP。测试覆盖情况如表 3-1 所示。</p>
+
+<table>
+  <caption>表 3-1　典型 Web 挑战测试覆盖情况</caption>
+  <thead>
+    <tr><th>测试来源</th><th>测试类别</th><th>挑战名称</th><th>验证结果</th><th>验证说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>CyberBench（HTB Cyber Apocalypse 2024）</td><td>Web</td><td>Labyrinth Linguist</td><td>通过</td><td>完成结构化规划、受控执行、当前轮真实响应取证与目标确认</td></tr>
+    <tr><td>CyberBench（HTB Cyber Apocalypse 2024）</td><td>Web</td><td>Testimonial</td><td>通过</td><td>完成结构化规划、受控执行、当前轮真实响应取证与目标确认</td></tr>
+    <tr><td>CyberBench（HTB Cyber Apocalypse 2024）</td><td>Web</td><td>Flag Command</td><td>通过</td><td>完成结构化规划、受控执行、当前轮真实响应取证与目标确认</td></tr>
+    <tr><td>CyberBench（HTB Cyber Apocalypse 2024）</td><td>Web</td><td>KORP Terminal</td><td>通过</td><td>完成结构化规划、受控执行、当前轮真实响应取证与目标确认</td></tr>
+    <tr><td>CyberBench（HTB Cyber Apocalypse 2024）</td><td>Web</td><td>TimeKORP</td><td>通过</td><td>完成结构化规划、受控执行、当前轮真实响应取证与目标确认</td></tr>
+  </tbody>
+</table>
+
+<p>在这 5 个挑战中，本章以 Labyrinth Linguist 的 Apache Velocity 服务端模板注入场景（CWE-94）作为详细案例，完整展示从静态线索到目标确认的端到端受控验证流程。该案例在静态与动态两侧都具备清晰的证据层次，能够充分体现系统的闭环能力。</p>
+
+<p><b>案例背景与静态线索。</b>在 <code>b/data/confirmed_vuln.json</code> 中，漏洞条目给出 source（HTTP GET/POST <code>text</code> 参数通过 <code>@RequestParam</code> 接收）、sink（<code>RuntimeServices.parse(reader, "home")</code> 与 <code>t.merge(context, writer)</code>），并通过数据流逐步描述：用户输入的 <code>text</code> 被传入文件读取函数，经 <code>line.replace("TEXT", replacement)</code> 替换占位符后嵌入模板字符串，随后被 <code>StringReader</code> 包装并由 Apache Velocity 解析、渲染。这条数据流明确了"用户输入在模板解析前被拼接"这一关键事实。仅凭静态线索不能直接宣布漏洞成功，因为从 source 到 sink 的可达性、参数是否真的送达、模板是否真的被解析，都必须由动态执行证据来确认。</p>
+
+<p><b>端到端验证流程。</b>系统在该案例上沿以下链路完成受控验证：</p>
+<div class="flow">
+静态漏洞线索 → 参数契约确认 → 结构化 POST 请求 → 参数实际送达 → 低风险表达式解析证据 → 当前轮真实 HTTP response body 出现最终目标证据 → GoalVerifier 确认 → 生成 success_summary.json 与 Victory Screen → 立即停止
+</div>
+
+<p>对该流程的各环节说明如下。第一，<b>静态漏洞线索</b>指明 source、sink、参数与模板解析关系，作为后续验证的依据。第二，<b>参数契约确认</b>：系统把请求意图固化为物化的请求契约（方法、端点、参数列表、规范化请求体及其指纹），与漏洞线索逐字段比对，确认"POST + text 参数"的意图被正确表达。第三，<b>结构化 POST 请求</b>：Executor 把声明式请求描述编译为一次 <code>POST /</code>，请求体为表单格式且包含 <code>text</code> 字段，对应目标接口的真实线缆行为。第四，<b>参数实际送达</b>：当响应不再是空参数的默认页面、且能反映受控输入时，判定参数已送达服务端解析路径；若仅返回默认页面、输入框 <code>value</code> 为空，则判定请求未按契约送达并回落修复。第五，<b>低风险表达式解析证据</b>：请求体中携带一个低风险模板表达式（如对两个整数做乘法并输出结果），若其求值结果出现在响应体中，则说明 Velocity 模板引擎对用户输入进行了解析与求值，模板注入原语被客观观察到。第六，<b>最终目标证据</b>：任务定义的最终目标证据必须出现在当前轮完整的真实 HTTP response body 中。第七，<b>GoalVerifier 确认</b>：由独立于模型推理的确定性目标裁决器（<code>b/core/goal_verifier.py</code>，<code>verify_goal()</code>）只从当前轮真实响应中取证（允许证据源仅限 <code>chain_output._last_response_text</code>、<code>_http_responses[*].response_body</code> 与 <code>http_responses[*].response_body</code>），显式排除 Planner rationale、计划正文、历史 memory 与旧产物；同时通过回显排除（anti-echo）防止请求内字符串被误判为服务端产出。第八，<b>生成 success_summary.json 与 Victory Screen 并立即停止</b>：GoalVerifier 命中后，系统写入 <code>success_summary.json</code>（含验证版本、flag、证据哈希、来源类型等字段）并渲染 Victory Screen（<code>b/ui/victory_screen.py</code>，<code>render_victory_screen()</code>），Coordinator 执行 <code>return 0</code> 立即结束迭代——<b>Evaluator 在成功路径上被完全跳过</b>，不产生 LLM 调用、不产生多余的 [FAILED] 覆写或预算消耗。</p>
+
+<p>为系统化表达上述证据层次，表 3-2 给出测试场景与预期证据层级的对应关系。</p>
+
+<table>
+  <caption>表 3-2　测试场景与预期证据层级</caption>
+  <thead>
+    <tr><th>场景</th><th>预期证据层级</th><th>判定要点</th><th>正常回落</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>静态线索读取</td><td>—（输入，非结论）</td><td>source/sink/参数/数据流齐全</td><td>线索缺失则不进入动态验证</td></tr>
+    <tr><td>请求契约验证</td><td>请求可达 / 参数送达</td><td>方法、路径、请求体与契约一致</td><td>契约不匹配则阻断执行</td></tr>
+    <tr><td>参数送达验证</td><td>参数实际送达</td><td>响应不再是空参数默认页</td><td>返回默认页则停留于请求可达</td></tr>
+    <tr><td>模板解析原语确认</td><td>漏洞原语被观察到</td><td>低风险表达式求值结果回显</td><td>无回显则原语未确认</td></tr>
+    <tr><td>最终目标验证</td><td>最终目标被验证</td><td>当前轮完整响应出现目标证据</td><td>无目标证据则不宣布成功</td></tr>
+    <tr><td>成功后的即时停止</td><td>终结</td><td>GoalVerifier 确认后 return 0，Evaluator 跳过</td><td>不再进入下一轮 Planner</td></tr>
+  </tbody>
+</table>
+
+<h2 class="section">3.4 测试流程与关键运行链路</h2>
+
+<p>系统在测试中沿以下真实链路运行，每一步都落盘可审计的产物文件：</p>
+<p class="no-indent"><code>Planner → plan.json → Validator → validated_plan.json → Docker Executor → execution_result.json → GoalVerifier（确定性裁决）→ [命中] success_summary.json + Victory Screen + return 0<br>　　↘ [未命中] Evaluator → feedback.json → 下一轮 Planner</code></p>
+
+<p>各文件的责任与审计价值如下。<code>plan.json</code> 是 Planner 输出的结构化计划，记录所选策略、各步骤类型、用途、预期结果与依赖关系，以及历史状态透传字段；其审计价值在于"系统打算做什么"是被显式记录的。<code>validated_plan.json</code> 记录校验结论（通过/错误、告警、是否做过归一化）与通过校验的计划；其审计价值在于"什么计划被允许进入执行"有据可查。<code>execution_result.json</code> 记录每一步的执行模式（docker / security_blocked）、退出码、stdout/stderr、容器 ID、物化请求契约与完整 HTTP 响应；其审计价值在于"执行线缆上实际发生了什么"被完整捕获。<code>feedback.json</code> 记录本轮的判定、证据层级、状态机位置与对下一轮的指导。<code>success_summary.json</code> 由 Victory Screen 在目标确认后写入，汇总验证版本、目标证据、证据哈希、来源类型与步骤编号等字段，供复盘与展示；Victory Screen 则以 Rich 终端 UI 渲染胜利结算 HUD。即便失败，<code>plan</code>、<code>validated_plan</code>、<code>execution_result</code>、<code>feedback</code> 也均落盘，保留可复盘的过程信息。</p>
+
+<p>对链路中各模块的职责边界需作如下澄清，这些边界是本系统可答辩性的关键：</p>
+<ul>
+  <li><b>Planner 输出的是结构化计划，不等于执行</b>。计划只是意图，必须经校验与编译后才可能被执行，且 Planner 不拥有宣布成功的权力。</li>
+  <li><b>Validator 对语法树、允许能力与参数契约进行约束</b>。它用 <code>ast.parse</code> 检查语法，用导入白名单与危险模式黑名单约束能力，对结构化请求进行契约层面核验；不满足要求的计划在执行前即被阻断。</li>
+  <li><b>Executor 只在沙箱中执行核验通过的计划</b>。它不直接执行模型生成的任意脚本，而是把声明式计划编译为受控的请求行为，并在 Docker 内隔离运行；若沙箱镜像不可用，则抛出安全违规而非降级到宿主机执行。</li>
+  <li><b>Evaluator 用于解释过程与生成反馈，但不拥有最终成功裁决权</b>。它的 detected_primitives、confidence、summary 等字段是解释性文本，不构成证据；最终是否成功由 GoalVerifier 决定。</li>
+  <li><b>GoalVerifier 是确定性裁决器，不在 LLM 推理路径内</b>。它只从当前轮执行结果的允许证据源中取证，限 <code>chain_output._last_response_text</code>、<code>_http_responses[*].response_body</code> 与 <code>http_responses[*].response_body</code>；显式排除 Planner rationale、计划正文、历史 memory 与旧 workspace 文件；同时以回显排除防止将请求内字符串误判为服务端产出。</li>
+  <li><b>GoalVerifier 命中后 Coordinator 立即结束迭代</b>。GoalVerifier 在 Evaluator 之前运行（<code>coordinator.py:1164</code>）；命中后直接 <code>return 0</code>，不调用 Evaluator、不进入下一轮 Planner、不增加迭代预算。若未命中，则正常回落到 Evaluator 进行过程解释与反馈生成。</li>
+</ul>
+
+<table>
+  <caption>表 3-3　各模块的输入、输出与责任边界</caption>
+  <thead>
+    <tr><th>模块</th><th>输入</th><th>输出</th><th>不能做什么</th><th>审计作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Planner</td><td>confirmed_vuln、目标上下文、约束、历史反馈</td><td>plan.json</td><td>不能直接执行，不能宣布成功</td><td>记录系统意图</td></tr>
+    <tr><td>Validator</td><td>plan.json</td><td>validated_plan.json</td><td>不能放宽白名单、不能改写执行语义</td><td>记录准入决策</td></tr>
+    <tr><td>Executor</td><td>validated_plan.json</td><td>execution_result.json</td><td>不能在沙箱外执行、不能扩大目标范围</td><td>记录真实线缆行为</td></tr>
+    <tr><td>Evaluator</td><td>execution_result.json</td><td>feedback.json</td><td>不能创造证据、不能终裁成功</td><td>记录过程解释</td></tr>
+    <tr><td>GoalVerifier</td><td>当前轮 execution_result</td><td>success_summary.json、Victory Screen</td><td>不能采信历史/计划/rationale</td><td>记录客观结论与终裁</td></tr>
+    <tr><td>Coordinator</td><td>全部产物</td><td>迭代控制</td><td>不能越过 GoalVerifier 自行宣布成功</td><td>记录整体流程</td></tr>
+  </tbody>
+</table>
+
+<h2 class="section">3.5 关键问题复现与迭代修复分析</h2>
+
+<p>本节如实记录在原型开发过程中遇到的关键工程问题及其修复思路。这些问题的共同主题是：当"模型说了算"时系统不可信，必须用结构与契约把成功判定从模型主观判断中剥离出来。本节不宣称这些问题已被"彻底解决"，而是说明当前实现采取了哪些可复核的工程措施来降低其影响。</p>
+
+<h3 class="subsection">3.5.1 请求契约失配问题</h3>
+
+<p>在早期实现中，计划虽然表达了"POST 并携带 <code>text</code> 参数"的意图，但执行层没有把参数可靠地编码为实际请求体，导致服务端只返回默认文本、输入框 <code>value</code> 为空。表象上是"收到了 200"，实质上是请求没有按契约送达。这类问题很难从模型自述中发现，因为模型往往仍会给出乐观的总结。</p>
+
+<p>修复方向是引入物化的请求契约。系统在执行前把请求意图固化为 <code>materialized_execution_record</code>，包含 <code>request_method</code>、<code>request_endpoint</code>、<code>request_parameters</code>、<code>normalized_request_body</code> 及其指纹（<code>request_body_fingerprint</code>、<code>execution_fingerprint</code>）。在本案例的实测产物中可以看到：方法为 POST、端点为 <code>/</code>、参数列表为 <code>["text"]</code>、规范化请求体为包含 <code>text</code> 字段的表单。这样，请求的方法、路径、请求体与漏洞线索是否一致，变成可逐字段比对的事实，而不是靠模型口述。当响应体仍是空参数默认页时，系统据此判定"参数未送达"而非"漏洞不存在"。</p>
+
+<h3 class="subsection">3.5.2 AST 模式兼容与可执行性问题</h3>
+
+<p>结构化计划中的步骤 <code>command</code> 字段可能为空（声明式步骤依赖结构化请求描述而非内联代码）。旧代码若默认把 <code>command</code> 当作字符串处理，会出现归一化与执行异常。这一问题若不处理，声明式计划将无法安全落到沙箱执行。</p>
+
+<p>修复方向包括 None-safe 归一化与结构化编译：对空 <code>command</code> 做安全占位而非崩溃；当步骤携带结构化请求描述时，由 Executor 将其编译为受控的请求脚本，而非直接信任内联代码。Validator 同时对计划做语法树与能力层面审核，确保即便计划以声明式表达，落到执行线上的行为仍受限。该修复使"声明式计划"与"内联代码计划"两条路径都能在沙箱中安全执行，且前者在审计上更清晰。</p>
+
+<h3 class="subsection">3.5.3 长上下文与提示词预算问题</h3>
+
+<p>Planner 的输入包含静态漏洞线索、能力约束、历史反馈、已验证事实与用户目标等多源信息。当这些内容过长时，关键的请求契约信息会被稀释，甚至出现 schema 截断，导致模型忽略 <code>text</code> 参数或端点等关键事实。这是大模型 Agent 的共性难题。</p>
+
+<p>本系统采取的改进原则包括：对历史信息按优先级保留，关键请求契约优先于过程性叙述；对冗长条目做整条目压缩而非截断中段，以保留语义完整性；设置终止条件与无进展熔断，避免在已无新信息时无限消耗预算。需要说明的是，这些措施是工程上的缓解，本报告不宣称"数学上绝对聚焦"，也不宣称"物理截断完全解决幻觉"；模型输出的不稳定性仍然存在，系统通过 Validator、契约、沙箱与 GoalVerifier 来降低其影响，而非声称消除。</p>
+
+<h3 class="subsection">3.5.4 成功判定与停止机制问题</h3>
+
+<p>这是本章最重要的问题。在早期实现中，成功判定高度依赖 Evaluator 的主观总结：即使当前 HTTP 响应中已经出现目标证据，若 Evaluator 只查看了被截短的 stdout 或基于历史记忆给出乐观/悲观结论，仍可能写出失败判断，导致系统在已经成功的状态下继续循环；反之，模型也可能在缺乏目标证据时虚报成功。两个方向都会造成"已成功仍继续跑"或"未成功却宣布完成"的失控。</p>
+
+<p>当前的修复围绕"把成功判定从模型主观判断中剥离"展开，具体包括：</p>
+<ul>
+  <li><b>引入独立于 LLM 的确定性目标裁决器 GoalVerifier</b>：作为 <code>b/core/goal_verifier.py</code> 中的独立模块（<code>verify_goal()</code>），它只扫描当前轮执行结果中的允许证据源（<code>chain_output._last_response_text</code>、<code>_http_responses[*].response_body</code>、<code>http_responses[*].response_body</code>），不与 LLM 共享推理路径，也不依赖 Evaluator 的任何输出。</li>
+  <li><b>限定允许证据源、显式排除污染源</b>：裁决只从当前轮的执行结果中取证；显式排除 Planner rationale、计划正文、历史 memory、上一轮 feedback 与旧 workspace 文件。</li>
+  <li><b>零信任覆写</b>：当模型声称成功但当前轮证据中未出现约定目标标记时，系统强制降级为失败；反之，当本地检测到目标标记时，强制确认为成功。这一覆写以代码事实为准，覆盖模型的乐观或悲观倾向。</li>
+  <li><b>回显排除（Anti-Echo）</b>：为避免把请求中自带的字符串误判为服务端产出，GoalVerifier 从计划中提取已发送的载荷字段（body、query、data、params、payload、command），在进行 flag 匹配时排除仅在请求中出现而未在响应中出现的字符串。</li>
+  <li><b>命中即停，Evaluator 在成功路径上完全跳过</b>：GoalVerifier 在 Evaluator 之前运行（<code>coordinator.py:1164</code>）；命中后 Coordinator 执行 <code>return 0</code> 立即结束迭代——不产生 Evaluator LLM 调用、不写入可能覆盖客观结论的 feedback、不进入下一轮 Planner、不增加迭代预算。Victory Screen 写入 <code>success_summary.json</code> 并渲染胜利结算 HUD。</li>
+</ul>
+
+<p>表 3-4 汇总了 GoalVerifier 的允许证据源与排除证据源，体现其"只认当前轮客观证据、不受历史与模型叙事污染"的设计。GoalVerifier 的验证版本为 <code>goal-verifier-v1</code>，其裁决结论写入 <code>success_summary.json</code> 的 <code>verified_by</code> 字段。</p>
+
+<table>
+  <caption>表 3-4　GoalVerifier 的允许证据源与排除证据源</caption>
+  <thead>
+    <tr><th>类别</th><th>具体来源</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td rowspan="3">允许证据源（当前轮）</td><td>chain_output._last_response_text</td><td>Executor 捕获的最后一轮 HTTP 响应文本</td></tr>
+    <tr><td>chain_output._http_responses[*].response_body</td><td>结构化 HTTP 响应体</td></tr>
+    <tr><td>step_results[*].http_responses[*].response_body</td><td>步骤级 HTTP 响应体</td></tr>
+    <tr><td rowspan="5">排除证据源</td><td>Planner rationale / chain_design / 计划正文</td><td>模型推理与意图文本，非客观证据</td></tr>
+    <tr><td>历史 memory / 上一轮 feedback</td><td>跨轮污染，禁止作为当前成功依据</td></tr>
+    <tr><td>旧 workspace 文件</td><td>历史产物，不反映当前轮</td></tr>
+    <tr><td>LLM 分析 / Evaluator claims</td><td>解释性文本，不构成证据</td></tr>
+    <tr><td>请求载荷字段（anti-echo）</td><td>body/query/data/params/payload/command 中已发送的字符串</td></tr>
+  </tbody>
+</table>
+
+<h2 class="section">3.6 测试结果与分析</h2>
+
+<p>在本次测试中，系统对表 3-1 所列 5 个典型入门级 Web 挑战均完成了端到端受控验证，验证结果均为通过。本节以案例验证结果与工程性质验证的方式给出结论。</p>
+
+<p>以 Labyrinth Linguist 为例，实测产物呈现出一条连贯的证据链：Planner 输出结构化计划；Validator 核验通过并产出 <code>validated_plan.json</code>；Executor 在 Docker 沙箱中执行，产出 <code>execution_result.json</code>（包含物化请求契约、结构化 HTTP 响应体与执行指纹）；在某一轮执行中，当前轮真实 HTTP response body 出现最终目标证据；GoalVerifier 以 <code>verify_goal()</code> 扫描允许证据源，匹配约定目标标记并完成回显排除；裁决命中后 Coordinator 写入 <code>success_summary.json</code>（验证版本 <code>goal-verifier-v1</code>，来源类型 <code>chain_response_body</code>，含证据哈希），渲染 Victory Screen 并执行 <code>return 0</code> 立即停止，Evaluator 被跳过。其余 4 个挑战亦沿同一受控闭环完成验证。</p>
+
+<p>据此，本章给出以下定性结论：</p>
+<ul>
+  <li><b>结构化请求能够按约定将参数送到目标</b>：物化请求契约与实际 HTTP 响应一致，参数送达可在响应中验证。</li>
+  <li><b>系统能区分"HTTP 成功"与"漏洞目标成功"</b>：200 仅被归入"请求可达"，目标成功需由 GoalVerifier 从允许证据源独立确认。</li>
+  <li><b>Validator 可在执行前阻断不满足结构化/契约要求的计划</b>：语法、能力与契约不合规的计划不进入沙箱。</li>
+  <li><b>GoalVerifier 在 Evaluator 之前运行，可在当前轮完整响应中独立确认目标</b>：裁决基于实际响应体与回显排除，不受模型主观判断影响；命中后 Evaluator 被跳过。</li>
+  <li><b>成功后执行立即结束</b>：GoalVerifier 命中后 Coordinator <code>return 0</code>，不进入下一轮 Planner、不增加预算。</li>
+  <li><b>失败时仍保留完整产物链</b>：plan、validated_plan、execution_result、feedback 均落盘，便于复盘。</li>
+</ul>
+
+<p>上述结论均为定性结论，聚焦于闭环能力本身的工程有效性。系统在部分运行中也会因模型输出不稳定、目标不可达或契约失配而未能推进到目标层；这些情形同样被产物链完整记录，作为迭代改进的依据。</p>
+
+<table>
+  <caption>表 3-5　测试结论与可观测证据对应表</caption>
+  <thead>
+    <tr><th>定性结论</th><th>可观测证据</th><th>证据来源文件</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>参数按契约送达</td><td>物化请求契约与响应一致</td><td>execution_result.json</td></tr>
+    <tr><td>区分 HTTP 成功与目标成功</td><td>200 归入请求可达，目标需 GoalVerifier 独立确认</td><td>feedback.json / GoalVerifier</td></tr>
+    <tr><td>执行前阻断不合规计划</td><td>校验错误与告警记录</td><td>validated_plan.json</td></tr>
+    <tr><td>原语被客观观察</td><td>低风险表达式求值结果回显</td><td>execution_result.json (http_responses)</td></tr>
+    <tr><td>目标确认即停、Evaluator 跳过</td><td>success_summary + Victory Screen + return 0</td><td>success_summary.json / 运行日志</td></tr>
+    <tr><td>失败可复盘</td><td>完整产物链落盘</td><td>workspace/*.json</td></tr>
+  </tbody>
+</table>
+
+<h2 class="section">3.7 测试边界与未来增强方向</h2>
+
+<p>本节以专业口径说明当前测试的边界与后续增强方向，作为系统持续演进的指引。</p>
+
+<p>第一，本次测试聚焦于 5 个典型入门级 Web 安全挑战，已完成端到端受控验证，覆盖多个典型 Web 验证场景。</p>
+
+<p>第二，GoalVerifier 当前适配 Flag / 明确目标标记模式，其目标确认依赖约定格式的目标字符串与确定性扫描；面向企业环境时，可将裁决器扩展为业务影响验证器，以"业务影响"作为最终目标证据，这是后续面向企业落地的重要增强方向。</p>
+
+<p>第三，LLM 输出存在固有不稳定性，模型可能忽略关键参数、误判响应或给出与事实相悖的总结。本系统通过 Validator、请求契约、Docker 沙箱与 GoalVerifier 形成多层约束来降低其影响；GoalVerifier 在 Evaluator 之前运行并以 <code>return 0</code> 直接结束，确保成功路径上不产生 LLM 调用、不存在被模型主观判断覆写客观结论的可能。</p>
+
+<p>第四，动态重规划、Skills、MCP 集成、Flow 持久化等属于后续扩展方向，将在继承现有 AST 校验、请求契约、Docker 隔离、FSM/EPE 与 GoalVerifier 等约束的前提下逐步引入，不以开放宿主机 Shell 为代价。</p>
+
+<p>第五，沙箱安全将持续硬化，后续将在现有容器隔离基础上引入额外系统调用过滤与资源控制措施，进一步提升执行边界的强度。</p>
+
+<!-- ############################################################ -->
+<!-- 第四章  创新性说明 -->
+<!-- ############################################################ -->
+<h1 class="chapter" style="page-break-before: always;">第四章　创新性说明</h1>
+
+<p>本章相对"常规 LLM Agent / 自动化扫描工具"说明本作品的具体创新点，并以上述 5 个挑战的端到端受控验证作为工程验证支撑。</p>
+
+<h2 class="section">4.1 从自由文本执行到声明式受控执行</h2>
+
+<p>传统 Agent 往往直接让模型生成 Shell、Python 或请求脚本并送入执行，执行边界难以审计：模型写什么，系统就跑什么，成功与否依赖模型自述。这种"自由文本执行"模式在面对安全验证这类对正确性敏感的任务时存在根本缺陷——它把"是否成功"这一最关键的判定权交给了最不可靠的一环。</p>
+
+<p>本作品的创新不在于"使用了语法树"这一具体技术，而在于把执行模型从"模型提议即可执行"转变为"模型提议动作 ≠ 动作天然可信"。系统要求：模型提议的动作只有依次通过<b>结构校验、能力校验、目标校验与参数契约校验</b>之后，才可被编译为受控执行。Planner 输出结构化计划，Validator 校验其语法树与能力白名单，Executor 把声明式请求描述编译为结构化的 HTTP 行为并在沙箱中执行。这样，执行线上发生的事情始终是可预测、可审计的。</p>
+
+<p>结合本案例可以看清这一创新的价值：form body 与 <code>text</code> 参数不再以自然语言"我希望 POST 一个 text 参数"来表达，而是被固化为物化请求契约——方法、端点、参数列表、规范化请求体及其指纹。"请求意图"与"真实线缆行为"之间的一致性因此变成可逐字段比对的事实。当二者不一致时，系统在执行前或执行后都能发现，而不是任由模型给出一个看似合理的总结。</p>
+
+<h2 class="section">4.2 将漏洞验证建模为有限状态机推进</h2>
+
+<p>本作品把漏洞验证过程建模为有限状态机（FSM）的逐级推进。在当前实现中，能力推进序列的语义进程为：<code>init</code>（初始）→ <code>probe_success</code>（目标可达、探测成功）→ <code>payload_injected</code>（载荷注入、参数送达）→ <code>gadget_triggered</code>（利用原语被触发、漏洞机制被观察到）→ <code>oob_received</code>（OOB/带外证据或能力影响被确认）。当 GoalVerifier 从当前轮真实响应中确认目标证据后，状态跳转至终态 <code>objective_verified</code>（<code>coordinator.py:1176</code>），系统立即结束迭代。</p>
+
+<p>FSM 解决的核心问题不是"多画几个状态"，而是<b>防止验证过程在不满足前提时跳级</b>。具体而言：它避免在尚未确认参数送达时就声称利用成功；避免仅凭 HTTP 200 就把状态推高到原语层；让下一轮计划受到当前已确认状态的约束。状态推进需多次确认方可稳定，但 <code>objective_verified</code> 作为终态由 GoalVerifier 一次命中即确认，直接触发 <code>return 0</code>。</p>
+
+<h2 class="section">4.3 EPE：以证据层级替代二元成功/失败</h2>
+
+<p>EPE（Evidence-Progressive Evaluation，证据渐进评估）是本作品对"成功/失败"这一二元判定的替代方案。它把漏洞利用过程建模为证据强度的逐级递进。在代码中（<code>b/agents/evaluator.py</code>），EPE 对应四层信号权重：L1 表层信号（如响应长度变化、错误触发、载荷回显）、L2 原语信号（如 SSTI 回显、OOB 尝试）、L3 能力信号（如命令执行、任意文件读取）、L4 目标信号（如目标标记确认），并通过 <code>progress_score</code> 等量化字段反映当前证据层级。</p>
+
+<p>这一层级思想在本案例中体现得尤为清晰：</p>
+<ul>
+  <li><b>HTTP 200 仅表示服务可达</b>：归入表层，不代表参数送达或原语触发。</li>
+  <li><b>返回默认页面、输入框为空</b>：说明参数可能未送达，状态不应上升。</li>
+  <li><b>低风险表达式求值结果回显</b>：说明模板引擎发生了解析与求值，进入原语层（对应 FSM 的 <code>gadget_triggered</code>）。</li>
+  <li><b>当前轮完整响应中的目标标记</b>：由 GoalVerifier 独立确认，跳转至终态 <code>objective_verified</code> 并触发即时停止。</li>
+</ul>
+
+<p>EPE 的工程价值在于为系统提供分级决策依据：它帮助系统区分"应当修复请求""应当停留在验证""应当继续受控推进"与"应当立即结束"。当证据仅停留在表层时，系统不会贸然推进到能力层；当原语已确认时，系统才考虑下一步受控推进；当目标层证据出现并被 GoalVerifier 确认时，系统立即终止。这种分级替代了"模型说成功就成功"的脆弱判定，使整个过程具备可解释的渐进性。</p>
+
+<h2 class="section">4.4 确定性目标裁决器与反历史污染成功判定</h2>
+
+<p>本作品与一般 Agent 最大的差别，在于成功判定权被从模型手中剥离并交给独立于 LLM 的确定性目标裁决器 GoalVerifier。其设计要点如下。</p>
+
+<p>第一，Planner 不可宣布成功。Planner 只产出结构化计划，其 rationale、chain_design 等字段属于意图与推理文本，不构成证据。第二，Evaluator 不拥有最终裁决权。它的 detected_primitives、confidence、summary 仅为解释性文本，<b>绝不创造证据</b>；GoalVerifier 在 Evaluator 之前运行，命中后 Evaluator 被完全跳过。第三，历史 memory 不可作为当前成功证据。GoalVerifier 只采信当前轮真实执行响应，防止跨轮污染导致的"记忆式成功"。第四，只有当前轮真实执行响应可触发目标确认；同时采用回显排除（anti-echo），从已发送载荷中提取 body/query/data/params/payload/command 字段进行交叉比对，防止把请求内字符串误认为服务端产出。第五，一旦 GoalVerifier 命中，Coordinator 执行 <code>return 0</code> 立即结束——不调用 Evaluator、不进入下一轮 Planner、不增加迭代预算。Victory Screen 写入 <code>success_summary.json</code>（含验证版本 <code>goal-verifier-v1</code>、目标证据、证据哈希与来源类型）并渲染胜利结算 HUD。</p>
+
+<p>GoalVerifier 是一个确定性裁决器，而不是"再调一个大模型来判"。它以纯代码逻辑扫描允许证据源，不与 LLM 共享推理路径，也不受模型主观判断的任何影响。这种"独立裁决器"而非"又一个 Agent"的架构选择，是本作品与一般多 Agent 框架最根本的区别。</p>
+
+<h2 class="section">4.5 工程创新：请求契约、目标锁定与可审计产物链</h2>
+
+<p>本作品在工程层面有三项相互配合的创新，它们共同支撑了上述机制的可落地与可审计。</p>
+
+<p>第一，请求契约。系统把 endpoint、method、parameter、body format 从自然语言意图变为可校验的结构化约束，并以物化请求契约（含请求体指纹与执行指纹）固化。这使得"请求是否按漏洞线索送达"成为可逐字段比对的事实，而非模型口述。请求契约同时为 GoalVerifier 的回显排除提供了依据——系统知道请求里发了什么，才能判断响应里的内容是不是服务端产出。</p>
+
+<p>第二，Target Context Lock。授权目标在系统启动时即被锁定：协议校验、主机名校验、DNS 解析与 URL 规范化后固化 <code>base_url</code>，Executor 仅使用该锁定地址。这一机制避免模型在规划过程中自行扩大网络范围，把执行边界约束在授权靶场之内。</p>
+
+<p>第三，可审计产物链。<code>plan.json</code> → <code>validated_plan.json</code> → <code>execution_result.json</code> → <code>feedback.json</code> / <code>success_summary.json</code> + Victory Screen 共同构成一条可复盘的证据链：意图→准入→执行→判定→结论→胜利结算，每一步都落盘、可追溯。即便某次运行失败，也能从产物链中定位是契约失配、原语未触发还是模型误判，为迭代改进提供依据。<code>success_summary.json</code> 中的 <code>verified_by</code>、<code>evidence_sha256</code>、<code>source_kind</code> 与 <code>artifact</code> 字段为成功结论提供可独立复核的客观记录。</p>
+
+<h2 class="section">4.6 与传统扫描器及一般多 Agent 框架的差异</h2>
+
+<p>本作品与传统漏洞扫描器、一般自由工具调用型 Agent 在定位上有明显差异。表 4-1 给出客观的结构性对比，措辞不宣称"优于所有商业工具"——本项目侧重深度受控验证，商业扫描器侧重大范围资产发现与规则覆盖，两者可互补。该对比为定性结构比较，不涉及性能排名。</p>
+
+<table>
+  <caption>表 4-1　Co-RedTeam 与常规扫描器/自由工具调用 Agent 的比较</caption>
+  <thead>
+    <tr><th>对比维度</th><th>常规扫描器</th><th>自由工具调用 Agent</th><th>Co-RedTeam</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>核心目标</td><td>大范围资产发现与规则匹配</td><td>通用任务自动化</td><td>单点漏洞的深度受控验证</td></tr>
+    <tr><td>执行输入</td><td>预定义规则/插件</td><td>模型生成的自由脚本</td><td>结构化计划 + 请求契约</td></tr>
+    <tr><td>是否直接执行模型生成代码</td><td>否</td><td>是，边界难审计</td><td>否，经校验编译后在沙箱执行</td></tr>
+    <tr><td>是否检查参数契约</td><td>通常否</td><td>否</td><td>是，物化请求契约逐字段比对</td></tr>
+    <tr><td>是否有状态驱动推进</td><td>通常为规则流</td><td>通常无显式状态机</td><td>FSM + EPE 分层推进</td></tr>
+    <tr><td>最终成功证据</td><td>规则命中</td><td>模型自述</td><td>当前轮客观响应 + GoalVerifier 确定性裁决</td></tr>
+    <tr><td>成功路径是否经过 LLM</td><td>否</td><td>是，全程依赖</td><td>否，GoalVerifier 命中后 Evaluator 跳过</td></tr>
+    <tr><td>审计产物</td><td>扫描报告</td><td>日志（常不完整）</td><td>完整产物链（计划→校验→执行→判定→结算）</td></tr>
+    <tr><td>停止条件</td><td>规则跑完</td><td>模型自定或超时</td><td>GoalVerifier 命中即 return 0</td></tr>
+    <tr><td>适用范围</td><td>广覆盖资产发现</td><td>通用任务</td><td>授权靶场下的深度验证</td></tr>
+  </tbody>
+</table>
+
+<h2 class="section">4.7 可扩展性与未来方向</h2>
+
+<p>以下方向均属未来路线，在现有架构之上扩展，且必须继承 AST 校验、请求契约、Docker 隔离、FSM/EPE 与 GoalVerifier 等已有约束，不以开放宿主机 Shell 为代价。</p>
+<ul>
+  <li><b>Flow 持久化</b>：将验证流程的状态与中间证据持久化，支持跨会话续跑与中断恢复。</li>
+  <li><b>受限 ToolCatalog</b>：在受控前提下引入受限工具目录，扩展可验证的漏洞类型。</li>
+  <li><b>审核型 Skills</b>：以可审核的技能模板承载常见验证模式，技能本身须经校验方可使用。</li>
+  <li><b>安全 MCP Bridge</b>：通过受控的 MCP 桥接外部能力，桥接层保留审计与契约约束。</li>
+  <li><b>企业目标 GoalVerifier</b>：将当前适配 Flag/明确目标的裁决器扩展为业务影响验证器，以适用企业环境。</li>
+  <li><b>可视化验证报告</b>：在现有产物链与 Victory Screen 基础上生成面向人类的可视化报告，提升复盘效率。</li>
+</ul>
+<p>上述扩展不会放松现有的安全边界。无论功能如何扩展，系统都将坚持"模型提议 ≠ 动作可信"的根本立场，所有执行仍须经声明—校验—编译—执行—裁决的受控闭环，沙箱隔离与目标锁定不被牺牲。</p>
+
+</div>
+</body>
+</html>

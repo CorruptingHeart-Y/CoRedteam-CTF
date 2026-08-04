@@ -1,0 +1,20 @@
+schema_version: 1.1.0
+canonical_id: cwe-94:init:ssti-reflection:arithmetic-probe
+cwe_id: CWE-94
+current_state: init
+technique: arithmetic_probe
+metadata:
+  strategy_class: reflection_probe
+activation:
+  state: draft
+target_primitive: ssti_reflection
+payload_template_ref: primitive:ssti_reflection:sha256:008b15dab525fb94
+expected_signals:
+  - arithmetic_result_in_response
+materialization:
+  type: http_request
+  body: challenge-specific-secret
+  raw_payload: do-not-leak
+  payload_template: do-not-leak-template
+generation_status: candidate_only
+historical_outcome: success

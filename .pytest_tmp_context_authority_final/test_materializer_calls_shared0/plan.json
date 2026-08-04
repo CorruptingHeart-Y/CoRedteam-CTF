@@ -1,0 +1,63 @@
+{
+  "chain_design": "single_step_route_materialization",
+  "history_state": {
+    "current_state": "init"
+  },
+  "metadata": {
+    "current_state": "init",
+    "cwe_id": "CWE-94",
+    "expected_signals": [
+      "arithmetic_result_in_response"
+    ],
+    "payload_template_ref": "primitive:ssti_reflection:sha256:d095461aa3182fe4",
+    "request_location": "form",
+    "resolved_url": "http://127.0.0.1:1337/",
+    "route_fingerprint": "0f8c1470f25d593ef81c82278be5604c49cb1541be6b62129c07ec3576d26109",
+    "route_id": "cwe-94:init:ssti-reflection:arithmetic-probe",
+    "source": "route_factory",
+    "target_primitive": "ssti_reflection",
+    "technique": "arithmetic_probe"
+  },
+  "plan_id": "route-79c44e8686a6381f5f5b2f96",
+  "platform": "offline",
+  "primitive_context": {
+    "current_primitive": "ssti_reflection",
+    "fallback_primitive": null,
+    "target_primitive": "ssti_reflection",
+    "transition_edge": "init"
+  },
+  "rationale": "Offline materialization of admitted route cwe-94:init:ssti-reflection:arithmetic-probe",
+  "steps": [
+    {
+      "depends_on": null,
+      "expected_outcome": "arithmetic_result_in_response",
+      "id": 1,
+      "imports": [],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "purpose": "arithmetic_probe",
+      "sdk_calls": [
+        {
+          "body": {
+            "text": "{{7*7}}"
+          },
+          "body_format": "form",
+          "primitive": "HttpClient.post",
+          "query": null,
+          "target": "/"
+        }
+      ],
+      "status": "PLANNED",
+      "target_primitive": "ssti_reflection",
+      "type": "python",
+      "why_this_is_not_regression": "Remain on the admitted route at state init.",
+      "why_this_payload_is_a_mutation": "Use the payload template selected by the admitted route.",
+      "why_this_primitive_advances_chain": "Exercise the admitted primitive ssti_reflection.",
+      "why_this_step_advances_state": "Observe the declared signals for ssti_reflection."
+    }
+  ],
+  "target_context": {
+    "base_url": "http://127.0.0.1:1337"
+  },
+  "version": 1,
+  "vuln_summary": "CWE-94: arithmetic_probe"
+}

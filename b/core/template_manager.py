@@ -126,10 +126,12 @@ class TemplateManager:
         results.sort(key=lambda t: t.severity)
         return results
 
-    def get_templates_for_target(
+    def get_template_records_for_target(
         self,
         confirmed_vuln: dict[str, Any],
-    ) -> str:
+        *,
+        include_candidates: bool = False,
+    ) -> list[AttackTemplate]:
         self.ensure_loaded()
         vulns = confirmed_vuln.get("vulnerabilities", [])
         cwe_set = {v.get("cwe_id", "") for v in vulns}
@@ -157,25 +159,38 @@ class TemplateManager:
                         break
 
         seen = set()
-        unique = []
+        unique: list[AttackTemplate] = []
         _skipped_candidate = 0
         for t in matched:
             if t.id in seen:
                 continue
             seen.add(t.id)
-            if "consolidator_reviewed:false" in t.tags:
+            if "consolidator_reviewed:false" in t.tags and not include_candidates:
                 _skipped_candidate += 1
                 continue
             unique.append(t)
         if _skipped_candidate > 0:
             print(f"[template_manager] ⏭️ 跳过 {_skipped_candidate} 个未审核 consolidator YAML（candidate）")
 
-        if unique:
-            sections = [f"【Attack Templates — {len(unique)} available for CWEs: {', '.join(sorted(cwe_set))}】"]
-            for t in unique:
-                sections.append(t.to_prompt_text())
-            return "\n\n".join(sections)
-        return ""
+        return unique
+
+    def get_templates_for_target(
+        self,
+        confirmed_vuln: dict[str, Any],
+    ) -> str:
+        records = self.get_template_records_for_target(confirmed_vuln)
+        if not records:
+            return ""
+        cwe_set = {
+            v.get("cwe_id", "")
+            for v in confirmed_vuln.get("vulnerabilities", [])
+        }
+        sections = [
+            f"【Attack Templates — {len(records)} available for CWEs: "
+            f"{', '.join(sorted(cwe_set))}】"
+        ]
+        sections.extend(template.to_prompt_text() for template in records)
+        return "\n\n".join(sections)
 
     def add_template(
         self,

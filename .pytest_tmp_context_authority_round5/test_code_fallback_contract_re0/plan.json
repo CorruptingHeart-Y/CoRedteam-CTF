@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "plan_id": "legacy-plan",
+  "vuln_summary": "test",
+  "rationale": "test",
+  "chain_design": "test",
+  "steps": [],
+  "history_state": {},
+  "primitive_context": {},
+  "platform": "Windows"
+}

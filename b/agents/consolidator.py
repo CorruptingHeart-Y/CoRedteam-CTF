@@ -22,6 +22,7 @@ from typing import Any
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+from core.capability_memory import gate_executable_tech_memory
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -102,6 +103,54 @@ CONSOLIDATOR_SYSTEM_PROMPT = """你是一个顶级的红队渗透测试导师与
     ]
   }
 }"""
+
+CONSOLIDATOR_SYSTEM_PROMPT += """
+
+【失败分类硬约束】
+- failure_type=runtime_target_missing 表示 runtime resolver/context 缺少目标映射，执行尚未到达传输或 payload 阶段。
+- 此类失败的 next_action 只能指向 runtime resolver/context 修复；禁止建议绕过 runtime_targets 或硬编码 host.docker.internal。
+- 此类失败禁止生成任何 patterns、techs、payload、strategy 或 yaml_operations memory。
+
+【Capability Memory 硬约束】
+- 每个可执行 tech 必须声明 capability_id 和 required_modules；capability_id 必须来自 runtime Capability Registry。
+- 未注册 capability 或未满足依赖的经验只能写为 pattern/strategy，禁止 executable_patch、payload_template 和 yaml_operations。
+"""
+
+
+def _guard_failure_memory(
+    result: dict[str, Any],
+    reports: dict[str, Any],
+) -> dict[str, Any]:
+    """Fail closed when infrastructure context failed before payload execution."""
+    feedback = reports.get("feedback")
+    if not isinstance(feedback, dict):
+        return result
+    if feedback.get("failure_type") != "runtime_target_missing":
+        return result
+
+    guarded = dict(result)
+    guarded["diagnosis"] = (
+        "runtime target context 缺失；应修复 runtime resolver/context 映射。"
+        "本轮未执行 payload，不生成或持久化 payload/strategy memory。"
+    )
+    guarded["memory_patch"] = {}
+    return guarded
+
+
+def _admit_memory_result(
+    result: dict[str, Any],
+    reports: dict[str, Any],
+    registry: Any = None,
+) -> dict[str, Any]:
+    """Apply failure filtering, then capability admission, before persistence."""
+    admitted = _guard_failure_memory(result, reports)
+    if not admitted.get("memory_patch"):
+        return admitted
+    admitted = dict(admitted)
+    admitted["memory_patch"] = gate_executable_tech_memory(
+        admitted.get("memory_patch") or {}, registry=registry
+    )
+    return admitted
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -247,10 +296,12 @@ def _build_consolidator_context(reports: dict[str, Any]) -> str:
     if isinstance(fb, dict):
         parts.append("\n═══ 评估反馈 (feedback) ═══")
         parts.append(f"repro_success={fb.get('repro_success')} "
+                     f"failure_type={fb.get('failure_type')} "
                      f"confidence={fb.get('confidence')} "
                      f"evidence_level={fb.get('evidence_level', '?')} "
                      f"is_milestone={fb.get('is_milestone')} "
                      f"suggest_abort={fb.get('suggest_abort')}")
+        parts.append(f"  next_action: {fb.get('next_required_action', '')[:500]}")
         summary = fb.get("summary", "")
         if summary:
             parts.append(f"  summary: {summary}")
@@ -925,6 +976,8 @@ def run_global_consolidation(
     except Exception as e:
         print(f"[consolidator] [WARN] LLM 调用失败: {e}")
         return None
+
+    result = _admit_memory_result(result, reports)
 
     diagnosis = result.get("diagnosis", "")
     print(f"[consolidator] [DIAG] 诊断结论:\n  {diagnosis[:300]}...")

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "plan_id": "transition-constraint-test",
+  "steps": [],
+  "platform": "Windows",
+  "primitive_context": {
+    "current_primitive": "ssti_reflection"
+  }
+}

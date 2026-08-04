@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "validation": {
+    "passed": false,
+    "errors": [
+      "[state_regression] 状态退化禁止：当前 exploit 已处于 'gadget_triggered'，禁止重新执行端点 fuzzing/discovery。step_2 的 purpose/command 包含回归信号。"
+    ]
+  },
+  "warnings": [],
+  "normalization_applied": false,
+  "plan": null
+}

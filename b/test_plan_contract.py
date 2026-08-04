@@ -522,3 +522,150 @@ class TestRegression:
         assert "failed" not in out, (
             f"Unexpected failures in materializer suite:\n{out[-2000:]}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Section 7 — Code-first Validator compatibility
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _code_first_plan(**overrides) -> dict:
+    """Minimal valid plan with a code field."""
+    plan = {
+        "version": 1,
+        "plan_id": "code-first-test",
+        "primitive_context": {
+            "current_primitive": "information_disclosure",
+            "target_primitive": "information_disclosure",
+        },
+        "steps": [{
+            "id": 1,
+            "type": "python",
+            "code": "from redteam_sdk import *\ns = HttpClient('http://target')\nresp = s.get('/')\nprint(f'HTTP {resp.status_code}')",
+            "purpose": "probe",
+        }],
+    }
+    plan.update(overrides)
+    return plan
+
+
+class TestCodeFirstCompatibility:
+    """Verify Validator does not block code-first plans on non-security gates."""
+
+    def test_A_code_with_grpc_metadata_passes(self):
+        """Case A: code + grpc sdk_calls metadata → passes (sdk_calls are metadata only)."""
+        from agents.validator import validate_plan
+
+        plan = _code_first_plan()
+        plan["steps"][0]["sdk_calls"] = [{
+            "primitive": "GrpcClient.call",
+            "target": "localhost:50051",
+            "service": "Example",
+            "method": "Call",
+            "payload": {},
+            "metadata": {},
+        }]
+
+        result = validate_plan(plan)
+        assert result["passed"] is True, (
+            f"code-first + grpc metadata must pass; got errors: {result.get('errors')}"
+        )
+
+    def test_B_code_with_unknown_capability_passes_with_warning(self):
+        """Case B: code + unknown capability → passes with warnings, not blocked."""
+        from agents.validator import validate_plan
+
+        plan = _code_first_plan()
+        # execution_interface with adapter not in capability registry
+        plan["primitive_context"]["execution_interface"] = {
+            "adapter": "UnknownAdapter",
+        }
+
+        result = validate_plan(plan)
+        assert result["passed"] is True, (
+            f"code-first + unknown capability must pass (warnings only); "
+            f"got errors: {result.get('errors')}"
+        )
+        # Should have at least one warning from capability contract
+        warnings = result.get("syntax_warnings", [])
+        assert len(warnings) >= 1, f"expected warnings for unknown capability, got none"
+        assert any("capability_contract" in w or "CAPABILITY" in w for w in warnings), (
+            f"expected capability_contract warning, got: {warnings}"
+        )
+
+    def test_C_import_subprocess_still_fails(self):
+        """Case C: code importing subprocess → still BLOCKED (sandbox escape)."""
+        from agents.validator import validate_plan
+
+        plan = _code_first_plan()
+        plan["steps"][0]["code"] = "import subprocess\nsubprocess.run(['ls'])"
+        plan["steps"][0]["imports"] = ["subprocess"]
+
+        result = validate_plan(plan)
+        assert result["passed"] is False, (
+            f"import subprocess must still be blocked; got: {result}"
+        )
+        assert any("subprocess" in e for e in result.get("errors", [])), (
+            f"expected subprocess blocking error; got: {result.get('errors')}"
+        )
+
+    def test_D_os_system_still_fails(self):
+        """Case D: code using os.system() → still BLOCKED (text_scan rule severity=error)."""
+        from agents.validator import validate_plan
+
+        plan = _code_first_plan()
+        plan["steps"][0]["code"] = "import os\nos.system('id')"
+
+        result = validate_plan(plan)
+        assert result["passed"] is False, (
+            f"os.system() must still be blocked by text_scan; got: {result}"
+        )
+        assert any(
+            "os.system" in e.lower() or "os_system" in e.lower()
+            for e in result.get("errors", [])
+        ), (
+            f"expected os.system blocking error; got: {result.get('errors')}"
+        )
+
+    def test_E_pure_code_step_passes_cleanly(self):
+        """Pure code step (no sdk_calls, no imports field) passes all gates."""
+        from agents.validator import validate_plan
+
+        plan = _code_first_plan()
+        # Remove any sdk_calls / imports metadata
+        plan["steps"][0].pop("sdk_calls", None)
+        plan["steps"][0].pop("imports", None)
+
+        result = validate_plan(plan)
+        assert result["passed"] is True, (
+            f"pure code step must pass; got errors: {result.get('errors')}"
+        )
+
+    def test_F_sdk_calls_only_still_blocked_on_manifest(self):
+        """Pure AST step (sdk_calls only, no code) still blocked by manifest gate."""
+        from agents.validator import validate_plan
+
+        plan = {
+            "version": 1,
+            "plan_id": "ast-only",
+            "primitive_context": {
+                "current_primitive": "information_disclosure",
+                "target_primitive": "information_disclosure",
+            },
+            "steps": [{
+                "id": 1,
+                "type": "python",
+                "sdk_calls": [{
+                    "primitive": "UnknownCall.xyz",
+                    "target": "/",
+                }],
+                "imports": ["unknown_lib"],
+                "purpose": "test",
+            }],
+        }
+
+        result = validate_plan(plan)
+        # Without code field, manifest gates remain blocking
+        assert result["passed"] is False, (
+            f"AST-only with unknown primitives must be blocked; got: {result}"
+        )

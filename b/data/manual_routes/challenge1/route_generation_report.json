@@ -1,0 +1,14 @@
+{
+  "proposals_received": 1,
+  "normalized": 1,
+  "written": 1,
+  "candidate_only": 1,
+  "rejected": 0,
+  "duplicate_ids": [],
+  "diagnostics": [],
+  "output_files": [
+    "C:\\Users\\ADMIN\\red\\redteam\\b\\data\\manual_routes\\challenge1\\cwe-94-init-ssti-reflection-arithmetic-probe.yaml"
+  ],
+  "dry_run": false,
+  "yaml_previews": []
+}

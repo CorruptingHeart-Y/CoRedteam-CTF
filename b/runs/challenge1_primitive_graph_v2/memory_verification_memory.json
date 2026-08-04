@@ -1,0 +1,43 @@
+{
+  "confirmed_base_url": "",
+  "confirmable_endpoints": [
+    "/"
+  ],
+  "injectable_params": {},
+  "injectable_endpoints": [],
+  "accepted_fields": [],
+  "rejected_fields": [],
+  "template_engine": "",
+  "reflection_confirmed": false,
+  "payload_blacklist": [],
+  "payload_bypass_techniques": [],
+  "working_primitives": [
+    {
+      "primitive_id": "ssti_reflection",
+      "confidence": 1.0,
+      "evidence": "{{7*7}} reflected as 49 — template expression evaluated and computed",
+      "engine": ""
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 1.0,
+      "evidence": "#set($x=7*7)$x evaluated to 49",
+      "engine": ""
+    },
+    {
+      "primitive_id": "command_execution",
+      "confidence": 0.95,
+      "evidence": "Process[pid=94, exitValue=\"not exited\"] — exec() called",
+      "engine": ""
+    }
+  ],
+  "primitive_knowledge": {},
+  "confirmed_cve": "",
+  "target_app": "",
+  "target_framework": "",
+  "auth_status": "unknown",
+  "csrf_token_required": false,
+  "waf_detected": false,
+  "waf_type": "",
+  "confirmed_flags": []
+}

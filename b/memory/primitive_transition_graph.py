@@ -86,6 +86,157 @@ TRANSITION_CONDITIONS: dict[str, dict[str, str]] = {
 # PrimitiveTransitionGraph
 # ═══════════════════════════════════════════════════════════════════
 
+
+@dataclass(frozen=True)
+class ConfirmedCapabilityPrimitive:
+    """An evidence-backed capability state."""
+
+    id: str
+    description: str
+    required_observations: tuple[str, ...]
+    success_indicators: tuple[str, ...]
+    failure_indicators: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "description": self.description,
+            "required_observations": list(self.required_observations),
+            "success_indicators": list(self.success_indicators),
+            "failure_indicators": list(self.failure_indicators),
+        }
+
+
+@dataclass(frozen=True)
+class ConfirmedCapabilityTransition:
+    """One observable step between adjacent confirmed capability states."""
+
+    from_state: str
+    to_state: str
+    prerequisites: tuple[str, ...]
+    expected_observations: tuple[str, ...]
+    invalid_conditions: tuple[str, ...]
+    planner_hint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "from_state": self.from_state,
+            "to_state": self.to_state,
+            "prerequisites": list(self.prerequisites),
+            "expected_observations": list(self.expected_observations),
+            "invalid_conditions": list(self.invalid_conditions),
+            "planner_hint": self.planner_hint,
+        }
+
+
+TEMPLATE_CAPABILITY_PRIMITIVES: tuple[ConfirmedCapabilityPrimitive, ...] = (
+    ConfirmedCapabilityPrimitive(
+        id="input_processed",
+        description="Controlled input is confirmed to reach template processing.",
+        required_observations=("input_reached_template_processing",),
+        success_indicators=("input_processed_by_template_layer",),
+        failure_indicators=("input_rejected_before_template_processing",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="template_evaluation_confirmed",
+        description="A controlled template expression is confirmed to be evaluated.",
+        required_observations=("controlled_expression_result_observed",),
+        success_indicators=("expression_evaluated",),
+        failure_indicators=("expression_reflected_verbatim",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="object_access_confirmed",
+        description="A template-reachable object or member is confirmed observable.",
+        required_observations=("template_reachable_object_observed",),
+        success_indicators=("object_member_access_confirmed",),
+        failure_indicators=("object_access_denied_or_absent",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="type_resolution_confirmed",
+        description="The type of an accessible object is confirmed resolvable.",
+        required_observations=("resolved_type_identity_observed",),
+        success_indicators=("stable_type_resolution_confirmed",),
+        failure_indicators=("type_resolution_unavailable_or_ambiguous",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="method_available",
+        description="A method on the resolved type is confirmed available.",
+        required_observations=("callable_method_presence_observed",),
+        success_indicators=("method_availability_confirmed",),
+        failure_indicators=("method_missing_or_inaccessible",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="execution_confirmed",
+        description="Invocation is confirmed by an observable effect.",
+        required_observations=("controlled_invocation_effect_observed",),
+        success_indicators=("method_execution_confirmed",),
+        failure_indicators=("invocation_blocked_or_no_effect",),
+    ),
+    ConfirmedCapabilityPrimitive(
+        id="output_confirmed",
+        description="Observed output is confirmed to originate from execution.",
+        required_observations=("execution_result_output_observed",),
+        success_indicators=("execution_output_correlated",),
+        failure_indicators=("output_absent_or_uncorrelated",),
+    ),
+)
+
+TEMPLATE_CAPABILITY_STATE_ORDER: tuple[str, ...] = tuple(
+    primitive.id for primitive in TEMPLATE_CAPABILITY_PRIMITIVES
+)
+
+TEMPLATE_CAPABILITY_TRANSITIONS: tuple[ConfirmedCapabilityTransition, ...] = (
+    ConfirmedCapabilityTransition(
+        "input_processed",
+        "template_evaluation_confirmed",
+        ("input_processed_by_template_layer",),
+        ("controlled_expression_result_observed",),
+        ("input_rejected_before_template_processing",),
+        "Confirm template evaluation before reasoning about accessible objects.",
+    ),
+    ConfirmedCapabilityTransition(
+        "template_evaluation_confirmed",
+        "object_access_confirmed",
+        ("expression_evaluated",),
+        ("template_reachable_object_observed",),
+        ("expression_reflected_verbatim",),
+        "Confirm one reachable object before attempting type resolution.",
+    ),
+    ConfirmedCapabilityTransition(
+        "object_access_confirmed",
+        "type_resolution_confirmed",
+        ("object_member_access_confirmed",),
+        ("resolved_type_identity_observed",),
+        ("object_access_denied_or_absent",),
+        "Resolve the observed object type before reasoning about methods.",
+    ),
+    ConfirmedCapabilityTransition(
+        "type_resolution_confirmed",
+        "method_available",
+        ("stable_type_resolution_confirmed",),
+        ("callable_method_presence_observed",),
+        ("type_resolution_unavailable_or_ambiguous",),
+        "Confirm method availability without assuming invocation succeeded.",
+    ),
+    ConfirmedCapabilityTransition(
+        "method_available",
+        "execution_confirmed",
+        ("method_availability_confirmed",),
+        ("controlled_invocation_effect_observed",),
+        ("method_missing_or_inaccessible",),
+        "Require an observable effect before marking execution confirmed.",
+    ),
+    ConfirmedCapabilityTransition(
+        "execution_confirmed",
+        "output_confirmed",
+        ("method_execution_confirmed",),
+        ("execution_result_output_observed",),
+        ("invocation_blocked_or_no_effect",),
+        "Correlate returned output with the confirmed execution effect.",
+    ),
+)
+
+
 @dataclass
 class TransitionPath:
     """一条从源 primitive 到目标 primitive 的完整路径。"""
@@ -109,6 +260,14 @@ class PrimitiveTransitionGraph:
         self._transitions: dict[str, list[str]] = dict(DEFAULT_TRANSITIONS)
         self._transition_conditions: dict[str, str] = dict(TRANSITION_CONDITIONS)
 
+        self._capability_primitives = {
+            primitive.id: primitive for primitive in TEMPLATE_CAPABILITY_PRIMITIVES
+        }
+        self._capability_transitions = {
+            (transition.from_state, transition.to_state): transition
+            for transition in TEMPLATE_CAPABILITY_TRANSITIONS
+        }
+
     # ── query API ──
 
     def get_next_primitives(self, current_primitive_id: str) -> list[str]:
@@ -119,6 +278,35 @@ class PrimitiveTransitionGraph:
         """返回从 from_id 到 to_id 的 transition 条件。"""
         key = f"{from_id}->{to_id}"
         return self._transition_conditions.get(key, f"需确认 {from_id} 已成功激活，然后尝试升级到 {to_id}")
+
+
+    def get_capability_primitive(self, state_id: str) -> ConfirmedCapabilityPrimitive | None:
+        """Return the evidence contract for a confirmed capability state."""
+        return self._capability_primitives.get(state_id)
+
+    def get_capability_primitives(self) -> tuple[ConfirmedCapabilityPrimitive, ...]:
+        """Return capability states in required progression order."""
+        return TEMPLATE_CAPABILITY_PRIMITIVES
+
+    def get_capability_transitions(self) -> tuple[ConfirmedCapabilityTransition, ...]:
+        """Return all fine-grained single-step transitions."""
+        return TEMPLATE_CAPABILITY_TRANSITIONS
+
+    def get_transition(
+        self,
+        from_state: str,
+        to_state: str,
+    ) -> ConfirmedCapabilityTransition | None:
+        """Return the rich contract for one exact capability transition."""
+        return self._capability_transitions.get((from_state, to_state))
+
+    def get_next_state(self, current_state: str) -> str | None:
+        """Return the next capability state, with legacy first-target fallback."""
+        for transition in TEMPLATE_CAPABILITY_TRANSITIONS:
+            if transition.from_state == current_state:
+                return transition.to_state
+        next_primitives = self.get_next_primitives(current_state)
+        return next_primitives[0] if next_primitives else None
 
     def get_all_upgrade_targets(self, active_primitives: list[str]) -> list[tuple[str, str, str]]:
         """给定已激活的 primitive 列表，返回所有可能的升级目标。

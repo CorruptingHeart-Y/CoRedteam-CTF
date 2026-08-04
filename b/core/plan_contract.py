@@ -48,6 +48,7 @@ class PlanStructureErrorCode(str, Enum):
     PRIMITIVE_CONTEXT_INVALID = "PRIMITIVE_CONTEXT_INVALID"
     TARGET_PRIMITIVE_INVALID = "TARGET_PRIMITIVE_INVALID"
     SDK_PRIMITIVE_INVALID = "SDK_PRIMITIVE_INVALID"
+    SDK_CALL_INVALID = "SDK_CALL_INVALID"
     SDK_TARGET_INVALID = "SDK_TARGET_INVALID"
     REQUEST_CONTAINER_INVALID = "REQUEST_CONTAINER_INVALID"
 
@@ -120,6 +121,17 @@ def _validate_step(st: Any, idx: int, diags: list[PlanStructureDiagnostic]) -> N
     sdk_calls = st.get("sdk_calls")
     is_ast_mode = _is_non_empty_list(sdk_calls)
 
+    if (
+        not isinstance(step_type, str)
+        or not step_type.strip()
+        or step_type not in _VALID_STEP_TYPES
+    ):
+        diags.append(_diag(
+            PlanStructureErrorCode.STEP_TYPE_INVALID,
+            f"{label}.type",
+            f"step[{idx}].type missing or invalid",
+        ))
+
     # ── Mixed protocol: AST mode (sdk_calls present) + non-empty command ──
     # Faithful to validator.validate_plan lines ~929-937.
     if is_ast_mode:
@@ -134,12 +146,6 @@ def _validate_step(st: Any, idx: int, diags: list[PlanStructureDiagnostic]) -> N
     # ── Legacy mode (no sdk_calls): step type + non-empty payload ──
     # Faithful to validator._validate_step (type + at-least-one-of rule).
     if not is_ast_mode:
-        if step_type not in _VALID_STEP_TYPES:
-            diags.append(_diag(
-                PlanStructureErrorCode.STEP_TYPE_INVALID,
-                f"{label}.type",
-                f"step type must be 'python' or 'shell', got {step_type!r}",
-            ))
         cmd = _text(st.get("command")).strip()
         code = st.get("code")
         has_cmd = bool(cmd)
@@ -181,11 +187,14 @@ def _validate_step(st: Any, idx: int, diags: list[PlanStructureDiagnostic]) -> N
         ))
 
     # ── AST sdk_calls: structural type checks on the dict form ──
-    # String-form sdk_calls (e.g. "HttpClient.get") are tolerated by the
-    # runtime Validator and therefore tolerated here.
     if is_ast_mode:
         for cidx, call in enumerate(sdk_calls):
             if not isinstance(call, Mapping):
+                diags.append(_diag(
+                    PlanStructureErrorCode.SDK_CALL_INVALID,
+                    f"{label}.sdk_calls[{cidx}]",
+                    f"step[{idx}].sdk_calls[{cidx}] must be an object",
+                ))
                 continue
             field_prefix = f"{label}.sdk_calls[{cidx}]"
 

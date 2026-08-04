@@ -60,6 +60,20 @@ class _CapturingLLM:
         return dict(self.response)
 
 
+def _authority_source(
+    context: dict[str, str],
+    block_name: str,
+    source_name: str,
+) -> Any:
+    marker = f"SOURCE: {source_name}\n"
+    body = context[block_name].split(marker, 1)[1]
+    if "\nSOURCE: " in body:
+        body = body.split("\nSOURCE: ", 1)[0]
+    return json.loads(body.strip())
+
+
+
+
 def _confirmed_metadata() -> dict[str, Any]:
     return {
         "vulnerabilities": [
@@ -113,11 +127,15 @@ def _isolate_planner(monkeypatch: Any, candidate_routes: str) -> None:
     )
 
 
-def _run_planner(tmp_path: Path, llm: _CapturingLLM) -> dict[str, Any]:
+def _run_planner(
+    tmp_path: Path,
+    llm: _CapturingLLM,
+    confirmed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return planner.run_planner(
         settings=SimpleNamespace(mock_llm=False),
         memory=_MemoryStub(),
-        confirmed=_confirmed_metadata(),
+        confirmed=confirmed or _confirmed_metadata(),
         feedback=None,
         out_path=tmp_path / "plan.json",
         llm=llm,
@@ -133,9 +151,9 @@ def test_complete_metadata_context_contains_candidates_inputs_and_interface(
 
     _run_planner(tmp_path, llm)
     context = json.loads(llm.last_user)
-    contract = context["plan_generation_contract"]
+    contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
 
-    assert "candidate_routes" in context
+    assert "candidate_routes" in context["STRATEGY_BLOCK"]
     assert contract["required_inputs"] == [
         {"name": "text", "accepted_locations": ["query", "form"]}
     ]
@@ -147,6 +165,47 @@ def test_complete_metadata_context_contains_candidates_inputs_and_interface(
         "form_location": "sdk_calls[].body",
         "form_requires": "body_format=form",
     }
+    assert contract["output_schema_contract"]["code_fallback"] == {
+        "location": "steps[].code",
+        "required_when": "Any sdk_call cannot be represented by the standard HTTP inflater",
+        "content": "Complete non-empty Python implementing the same declared operation",
+        "declaration_rule": "Keep sdk_calls structurally valid; put complex bytes and framing in code",
+        "omit_when": "All sdk_calls are representable by the standard HTTP inflater",
+        "runtime_target_contract": {
+            "required_input": "Every complex code fallback must read target_context.runtime_targets",
+            "source": "/workspace/context.json -> target_context.runtime_targets",
+            "match": "Select by logical.protocol and logical.port",
+            "consume": "Use runtime.host and runtime.port for the selected non-primary service",
+            "forbidden": "Never hardcode localhost or 127.0.0.1 for a non-primary service",
+            "primary_http_compat": "Primary HTTP keeps execution_base_url with base_url fallback",
+            "resolver_pattern": "next(item['runtime'] for item in runtime_targets if item['logical']['protocol'] == protocol and item['logical']['port'] == port)",
+        },
+    }
+
+
+def test_code_fallback_contract_requires_runtime_target_lookup(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _isolate_planner(monkeypatch, "Route #1: arbitrary_file_write")
+    llm = _CapturingLLM(_base_plan())
+
+    _run_planner(tmp_path, llm, _grpc_file_write_metadata())
+    context = json.loads(llm.last_user)
+    contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
+    runtime_contract = contract["output_schema_contract"]["code_fallback"][
+        "runtime_target_contract"
+    ]
+
+    assert runtime_contract["source"].endswith("target_context.runtime_targets")
+    assert runtime_contract["match"] == "Select by logical.protocol and logical.port"
+    assert runtime_contract["consume"] == (
+        "Use runtime.host and runtime.port for the selected non-primary service"
+    )
+    assert "localhost or 127.0.0.1" in runtime_contract["forbidden"]
+    assert runtime_contract["primary_http_compat"] == (
+        "Primary HTTP keeps execution_base_url with base_url fallback"
+    )
 
 
 def test_required_parameter_is_generated_in_an_accepted_sdk_location(
@@ -156,7 +215,7 @@ def test_required_parameter_is_generated_in_an_accepted_sdk_location(
     _isolate_planner(monkeypatch, "Route #1: reflection -> command_execution")
 
     def _contract_aware_response(context: dict[str, Any]) -> dict[str, Any]:
-        contract = context["plan_generation_contract"]
+        contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
         required = contract["required_inputs"][0]
         assert required["name"] == "text"
         assert required["accepted_locations"] == ["query", "form"]
@@ -205,9 +264,18 @@ def test_many_candidate_routes_do_not_override_generation_contract(
 
     _run_planner(tmp_path, llm)
     context = json.loads(llm.last_user)
-    contract = context["plan_generation_contract"]
+    contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
+    strategies = _authority_source(
+        context, "STRATEGY_BLOCK", "strategy_options"
+    )
 
-    assert context["candidate_routes"] == many_routes
+    assert strategies["candidate_routes"].startswith(
+        "Route #1: primitive_1 -> objective_1"
+    )
+    assert "[authority content compacted]" in strategies["candidate_routes"]
+    assert strategies["candidate_routes"].endswith(
+        "Route #200: primitive_200 -> objective_200"
+    )
     assert contract["contract_name"] == "PLAN GENERATION CONTRACT"
     assert contract["required_inputs"][0]["name"] == "text"
     assert contract["interface_contract"]["form_location"] == "sdk_calls[].body"
@@ -223,10 +291,14 @@ def test_no_candidate_routes_preserves_existing_planner_flow(
     plan = _run_planner(tmp_path, llm)
     context = json.loads(llm.last_user)
 
-    assert "candidate_routes" not in context
-    assert context["confirmed_vuln"] == _confirmed_metadata()
-    assert "layered_memory" in context
-    assert "prior_feedback" in context
+    assert list(context) == ["FACT_BLOCK", "CONSTRAINT_BLOCK", "STRATEGY_BLOCK", "REFERENCE_BLOCK"]
+    assert _authority_source(
+        context, "FACT_BLOCK", "verified_state"
+    ) == _confirmed_metadata()
+    assert context["REFERENCE_BLOCK"].startswith("[REFERENCE ONLY]")
+    assert "SOURCE:" in context["REFERENCE_BLOCK"]
+    assert "confirmed_vuln" not in context
+    assert "prior_feedback" not in context
     assert llm.calls == 1
     assert plan["plan_id"] == "legacy-plan"
 
@@ -239,7 +311,8 @@ def test_contract_priority_is_explicit_in_prompt(
     llm = _CapturingLLM(_base_plan())
 
     _run_planner(tmp_path, llm)
-    contract = json.loads(llm.last_user)["plan_generation_contract"]
+    context = json.loads(llm.last_user)
+    contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
 
     assert contract["priority_order"] == [
         "Output schema contract",
@@ -260,3 +333,85 @@ def test_contract_priority_is_explicit_in_prompt(
         "They do NOT override HOW the generated plan must satisfy interface contracts."
         in llm.last_user
     )
+
+
+def _grpc_file_write_metadata() -> dict[str, Any]:
+    return {
+        "vulnerabilities": [
+            {
+                "id": "VULN-GRPC-WRITE",
+                "cwe_id": "CWE-22",
+                "name": "Arbitrary file write via gRPC",
+                "source": {"code": "rpc SubmitTestimonial(TestimonialSubmission)"},
+                "sink": {"code": "os.WriteFile(req.Customer, req.Testimonial, 0644)"},
+                "evidence": ["gRPC server listens on tcp :50045"],
+            }
+        ],
+        "target_context": {"base_url": "http://target.test"},
+    }
+
+
+def test_grpc_file_write_prompt_contains_primitive_interface_contract(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _isolate_planner(monkeypatch, "Route #1: arbitrary_file_write")
+    llm = _CapturingLLM(_base_plan())
+
+    _run_planner(tmp_path, llm, _grpc_file_write_metadata())
+    context = json.loads(llm.last_user)
+    contract = _authority_source(context, "CONSTRAINT_BLOCK", "hard_constraints")
+
+    assert contract["primitive_interface_requirements"] == {
+        "primitive": "arbitrary_file_write",
+        "transport_requirements": {
+            "protocol": "grpc",
+            "network_transport": "tcp",
+            "port": 50045,
+        },
+        "interface_requirements": {
+            "rpc_method": "SubmitTestimonial",
+        },
+        "user_input_requirements": {
+            "customer": True,
+        },
+    }
+    assert contract["transport_requirements"] == {
+        "protocol": "grpc",
+        "network_transport": "tcp",
+        "port": 50045,
+    }
+    assert contract["interface_requirements"] == {
+        "rpc_method": "SubmitTestimonial",
+    }
+    assert contract["user_input_requirements"] == {"customer": True}
+
+
+def test_primitive_interface_contract_outranks_route_objective() -> None:
+    contract = planner._build_plan_generation_contract(
+        _grpc_file_write_metadata(),
+        "arbitrary_file_write",
+    )
+
+    assert contract["priority_order"].index("Interface contract") < (
+        contract["priority_order"].index("Route candidate selection")
+    )
+    assert (
+        "Primitive interface requirements override route objective preferences."
+        in contract["candidate_route_policy"]
+    )
+
+
+def test_http_primitive_does_not_receive_grpc_interface_contract() -> None:
+    contract = planner._build_plan_generation_contract(
+        _confirmed_metadata(),
+        "ssti_reflection",
+    )
+
+    assert "primitive_interface_requirements" not in contract
+    assert contract["interface_contract"] == {
+        "sdk_calls_location": "steps[].sdk_calls[]",
+        "query_location": "sdk_calls[].query",
+        "form_location": "sdk_calls[].body",
+        "form_requires": "body_format=form",
+    }

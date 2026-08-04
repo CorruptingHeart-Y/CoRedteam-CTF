@@ -677,6 +677,109 @@ def test_extract_parameter_contract_accepts_source_dict_and_legacy_string():
     }]
 
 
+def test_extract_parameter_contract_with_structured_evidence():
+    """Structured evidence contributes endpoint data to the shared contract."""
+    from agents.validator import _extract_parameter_contract
+
+    contract = _extract_parameter_contract({
+        "vulnerabilities": [{
+            "source": '@RequestParam(name = "text")',
+            "evidence": [{
+                "file": "Main.java",
+                "code_snippet": '@GetMapping("/submit")',
+            }],
+        }],
+    })
+
+    assert contract == {
+        "transport_requirements": {"protocol": "http", "method": ""},
+        "interface_requirements": {"endpoint": "/submit"},
+        "user_input_requirements": {
+            "text": {
+                "required": True,
+                "accepted_locations": ["query", "form"],
+            },
+        },
+        "parameters": [{
+            "name": "text",
+            "accepted_locations": ["query", "form"],
+        }],
+        "endpoint": "/submit",
+        "method": "",
+    }
+
+
+def test_extract_parameter_contract_with_string_or_missing_evidence():
+    """Unstructured or absent evidence leaves a valid partial contract."""
+    from agents.validator import _extract_parameter_contract
+
+    vulnerability = {"source": '@RequestParam(name = "text")'}
+    expected = {
+        "transport_requirements": {"protocol": "http", "method": ""},
+        "interface_requirements": {"endpoint": ""},
+        "user_input_requirements": {
+            "text": {
+                "required": True,
+                "accepted_locations": ["query", "form"],
+            },
+        },
+        "parameters": [{
+            "name": "text",
+            "accepted_locations": ["query", "form"],
+        }],
+        "endpoint": "",
+        "method": "",
+    }
+
+    string_contract = _extract_parameter_contract({
+        "vulnerabilities": [{
+            **vulnerability,
+            "evidence": ["grpc.go:19 handler registration"],
+        }],
+    })
+    missing_contract = _extract_parameter_contract({
+        "vulnerabilities": [vulnerability],
+    })
+
+    assert string_contract == expected
+    assert missing_contract == expected
+
+
+def test_extract_parameter_contract_with_mixed_evidence():
+    """Mixed evidence ignores strings and consumes only structured entries."""
+    from agents.validator import _extract_parameter_contract
+
+    contract = _extract_parameter_contract({
+        "vulnerabilities": [{
+            "source": '@RequestParam(name = "text")',
+            "evidence": [
+                'grpc.go:19 @GetMapping("/ignored")',
+                {
+                    "file": "Main.java",
+                    "code_snippet": '@PostMapping("/structured")',
+                },
+            ],
+        }],
+    })
+
+    assert contract == {
+        "transport_requirements": {"protocol": "http", "method": ""},
+        "interface_requirements": {"endpoint": "/structured"},
+        "user_input_requirements": {
+            "text": {
+                "required": True,
+                "accepted_locations": ["query", "form"],
+            },
+        },
+        "parameters": [{
+            "name": "text",
+            "accepted_locations": ["query", "form"],
+        }],
+        "endpoint": "/structured",
+        "method": "",
+    }
+
+
 def test_request_contract_gate_accepts_query_location_for_requestparam():
     """@RequestParam accepts both query and form — GET query must pass."""
     from agents.validator import _check_request_contract
@@ -692,6 +795,90 @@ def test_request_contract_gate_accepts_query_location_for_requestparam():
     }]
     contract_errs, contract_warns = _check_request_contract(steps, contract)
     assert len(contract_errs) == 0, f"query location must be accepted: {contract_errs}"
+
+
+def test_http_typed_user_input_still_enforces_parameter_contract():
+    """Case 1: HTTP user input remains blocking when absent."""
+    from agents.validator import _check_request_contract
+
+    contract = {
+        "transport_requirements": {"protocol": "http"},
+        "interface_requirements": {"endpoint": "/submit"},
+        "user_input_requirements": {
+            "text": {
+                "required": True,
+                "accepted_locations": ["query", "form"],
+            },
+        },
+    }
+    steps = [{
+        "id": 1,
+        "sdk_calls": [{
+            "primitive": "HttpClient.post",
+            "target": "/submit",
+            "body": {},
+            "body_format": "form",
+        }],
+    }]
+
+    errors, _ = _check_request_contract(steps, contract)
+
+    assert any("parameter_missing: text" in error for error in errors)
+
+
+def test_grpc_transport_and_interface_do_not_enter_http_parameter_gate():
+    """Case 2: gRPC transport/interface metadata is not an HTTP parameter."""
+    from agents.validator import _check_request_contract, _extract_parameter_contract
+
+    confirmed = {
+        "vulnerabilities": [{
+            "cwe_id": "CWE-22",
+            "source": {"code": 'lis, err := net.Listen("tcp", ":50045")'},
+            "data_flow": [{
+                "code": "rpc SubmitTestimonial(TestimonialSubmission)",
+            }],
+        }],
+    }
+
+    assert _extract_parameter_contract(confirmed) is None
+    contract = {
+        "transport_requirements": {
+            "protocol": "grpc",
+            "network_transport": "tcp",
+            "port": 50045,
+        },
+        "interface_requirements": {"rpc_method": "SubmitTestimonial"},
+        "user_input_requirements": {"customer": True},
+    }
+    errors, _ = _check_request_contract([{
+        "id": 1,
+        "sdk_calls": [{
+            "primitive": "HttpClient.post",
+            "target": "/SubmitTestimonial",
+            "body": {},
+            "body_format": "form",
+        }],
+    }], contract)
+
+    assert errors == []
+
+
+def test_plain_cwe22_source_does_not_create_http_parameter_contract():
+    """Case 3: ordinary path traversal remains outside the HTTP parameter gate."""
+    from agents.validator import _check_request_contract, _extract_parameter_contract
+
+    confirmed = {
+        "vulnerabilities": [{
+            "cwe_id": "CWE-22",
+            "source": {"code": 'open(base + "/" + filename)'},
+        }],
+    }
+
+    contract = _extract_parameter_contract(confirmed)
+    errors, _ = _check_request_contract([{"id": 1, "sdk_calls": []}], contract)
+
+    assert contract is None
+    assert errors == []
 
 
 def test_request_contract_gate_accepts_form_location_for_requestparam():
@@ -1241,10 +1428,10 @@ def test_static_l2_with_validator_rejections_does_not_fatal():
 
 
 def test_planner_ast_schema_contains_no_urllib_rule():
-    """Planner prompt must explicitly forbid urllib/urllib.parse imports — in L2 AND L6."""
+    """Transport/schema rules live in L2/L3 and never leak into L6."""
     from agents.planner import _extract_user_goal_dense, _build_hard_constraints_block
 
-    # Check L6 (user goal — dense prompt)
+    # L6 is only the user goal.
     confirmed = {
         "vulnerabilities": [{
             "id": "VULN-001", "title": "Velocity SSTI", "cwe_id": "CWE-94",
@@ -1256,12 +1443,11 @@ def test_planner_ast_schema_contains_no_urllib_rule():
         "target_context": {"base_url": "http://172.29.80.1:9084"},
     }
     l6 = _extract_user_goal_dense(confirmed)
-    assert "HttpClient" in l6, "HttpClient reference missing in L6"
-    assert "urllib.parse" in l6 or "不得导入" in l6, \
-        "must reference urllib.parse ban in L6"
-    assert "sdk_call.query" in l6 or "sdk_call.body" in l6, \
-        "must instruct using sdk_call fields for parameters in L6"
-    assert "body_format" in l6.lower(), "body_format reference missing in L6"
+    assert "http://172.29.80.1:9084" in l6
+    assert "HttpClient" not in l6
+    assert "urllib.parse" not in l6
+    assert "sdk_call.query" not in l6
+    assert "body_format" not in l6.lower()
 
     # Check L2 (static hard constraints — non-droppable critical zone)
     l2 = _build_hard_constraints_block()

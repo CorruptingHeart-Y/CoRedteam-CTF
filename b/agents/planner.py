@@ -10,6 +10,20 @@ from pathlib import Path
 from typing import Any
 
 from core.challenge_adapter import ChallengeAdapter, get_adapter
+from core.context_authority import (
+    compile_context_authority,
+    partition_feedback_authority,
+)
+from core.knowledge_source_normalizer import (
+    FACT_AUTHORITY,
+    CONSTRAINT_AUTHORITY,
+    STRATEGY_AUTHORITY,
+    REFERENCE_AUTHORITY,
+    HARD_CONSTRAINT,
+    STRATEGY_OPTION,
+    group_knowledge_by_authority,
+    normalize_knowledge_source,
+)
 from core.llm_client import DeepSeekClient
 from core.memory_store import LayeredMemory
 from core.settings import Settings
@@ -24,7 +38,9 @@ from routes.knowledge_provider import RouteKnowledgeProvider
 from core.route_candidate_generator import (
     generate_and_rank_routes,
     build_candidate_routes_context_verbose,
+    _has_stagnation_preconditions,
 )
+from core.route_shadow_resolver import build_route_shadow_report, run_route_shadow
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -38,7 +54,7 @@ from core.route_candidate_generator import (
 MEMORY_BUDGET: dict[str, int] = {
     "runtime_constraints": 800,    # L1 Manifest — 必须保持紧凑
     "hard_constraints": 800,       # L2 Hard Constraints & Bans (includes no-urllib rules)
-    "sdk_contract": 500,           # L3 SDK API Contract
+    "sdk_contract": 700,           # L3 SDK API + compact plan AST contract
     "verified_facts": 800,         # L4 Verified Facts + Memory context
     "trajectory_state": 300,       # L5 Dehydrated trajectory (compact JSON)
     "user_goal": 2500,             # L6 User Goal — 裁剪后的攻击目标摘要
@@ -160,10 +176,9 @@ def _compact_user_goal(content: str, limit: int) -> tuple[str, int]:
         return content, 0
 
     critical_keywords = (
-        "target", "endpoint", "/", "text", "query", "form", "body_format",
-        "sdk_calls", "HttpClient", "imports", "data=", "json=", "params=",
-        "parameter", "contract", "JSON", "AST", "primitive", "body",
-        "target_base", "base_url", "CWE-94", "Velocity", "SSTI",
+        "target", "goal", "objective", "endpoint", "path", "/", "parameter",
+        "accepted_locations", "target_base", "base_url", "CWE", "flag",
+        "目标", "端点", "参数", "漏洞",
     )
     kept_lines: list[str] = []
     budget_remaining = limit - 10
@@ -178,11 +193,7 @@ def _compact_user_goal(content: str, limit: int) -> tuple[str, int]:
         if sum(len(l) + 1 for l in kept_lines) >= budget_remaining:
             break
     if not kept_lines:
-        # No contract-critical lines found → fixed minimal schema summary
-        result = (
-            "sdk_calls:[{primitive:HttpClient,target:/,query|body,body_format:form|json}];"
-            "imports:[json,re];HttpClient handles encoding;no urllib/requests"
-        )
+        result = "[User goal compacted: pursue the confirmed target objective]"
     else:
         result = "\n".join(kept_lines)
         # Drop complete lines from end if over budget — never raw-slice
@@ -190,11 +201,7 @@ def _compact_user_goal(content: str, limit: int) -> tuple[str, int]:
             kept_lines.pop()
             result = "\n".join(kept_lines)
     if len(result) > limit:
-        # If even one complete line doesn't fit, use the fixed minimal summary
-        result = (
-            "sdk_calls:[{primitive:HttpClient,target:/,query|body,body_format:form|json}];"
-            "imports:[json,re];HttpClient handles encoding;no urllib/requests"
-        )
+        result = "[User goal compacted: pursue the confirmed target objective]"
     if len(result) > limit:
         result = ""  # absolute last resort
     return result, 1 if len(result) < len(content) else 0
@@ -298,7 +305,11 @@ def _build_sdk_contract_block() -> str:
         "  s.raw_request('GET', '/path#frag')  # WAF绕过保留特殊字符\n"
         "  oob = OOBReceiver(port=8765); oob.start()\n"
         "  hit = oob.wait_for_callback(timeout=30)\n"
-        "  target_base=json.load(open('/workspace/context.json')).get('target_context',{}).get('base_url','')"
+        "  target_base=json.load(open('/workspace/context.json')).get('target_context',{}).get('base_url','')\n"
+        "  PLAN AST: imports:[str]; sdk_calls:[{\"primitive\":\"HttpClient.get|post\","
+        "\"target\":\"/\",\"query|body\":{},\"body_format\":\"form|json\"}]\n"
+        "  Every steps[] item MUST include type: \"python\" or \"shell\".\n"
+        "  sdk_calls and command are mutually exclusive."
     )
 
 
@@ -388,6 +399,157 @@ def _extract_plan_ast(plan: dict[str, Any]) -> dict[str, Any]:
             _extract_step_ast(st)
     return plan
 
+
+def _runtime_targets_snapshot(
+    confirmed: dict[str, Any],
+) -> list[dict[str, Any]] | None:
+    """Return Planner-visible runtime targets without inventing a fallback."""
+    target_context = confirmed.get("target_context")
+    if not isinstance(target_context, dict) or "runtime_targets" not in target_context:
+        return None
+    runtime_targets = target_context.get("runtime_targets")
+    if not isinstance(runtime_targets, list):
+        return []
+    return [target for target in runtime_targets if isinstance(target, dict)]
+
+
+def _normalize_generated_plan(
+    plan: dict[str, Any],
+    runtime_targets: list[dict[str, Any]] | None = None,
+    resolver_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize evidence-backed gRPC plans into the registered SDK contract."""
+    primitive_context = plan.get("primitive_context")
+    if not isinstance(primitive_context, dict):
+        return plan
+
+    evidence = resolver_evidence if isinstance(resolver_evidence, dict) else {}
+    evidence_transport = evidence.get("transport_requirements")
+    if not isinstance(evidence_transport, dict):
+        evidence_transport = {}
+    plan_transport = primitive_context.get("transport_requirements")
+    if not isinstance(plan_transport, dict):
+        plan_transport = {}
+
+    protocol = str(
+        evidence_transport.get("protocol")
+        or evidence.get("protocol")
+        or plan_transport.get("protocol")
+        or primitive_context.get("protocol")
+        or primitive_context.get("transport")
+        or ""
+    ).strip().lower()
+    if protocol != "grpc":
+        return plan
+
+    evidence_interface = evidence.get("interface_requirements")
+    if not isinstance(evidence_interface, dict):
+        evidence_interface = {}
+    plan_interface = primitive_context.get("interface_requirements")
+    if not isinstance(plan_interface, dict):
+        plan_interface = {}
+
+    steps = plan.get("steps")
+    if not isinstance(steps, list):
+        return plan
+    step_dicts = [step for step in steps if isinstance(step, dict)]
+
+    def _first_text(keys: tuple[str, ...]) -> str:
+        sources = (evidence_interface, evidence, plan_interface, primitive_context)
+        for source in sources:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for step in step_dicts:
+            calls = step.get("sdk_calls")
+            call_sources = calls if isinstance(calls, list) else ()
+            for source in (step, *call_sources):
+                if not isinstance(source, dict):
+                    continue
+                for key in keys:
+                    value = source.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        return ""
+
+    service = _first_text(("service", "grpc_service"))
+    rpc_method = _first_text(("rpc_method",))
+    if not service or not rpc_method:
+        return plan
+
+    expected_port = (
+        evidence_transport.get("port")
+        or evidence.get("port")
+        or plan_transport.get("port")
+        or primitive_context.get("port")
+    )
+    matched_target: dict[str, Any] | None = None
+    if runtime_targets is not None:
+        for target in runtime_targets:
+            logical = target.get("logical")
+            if not isinstance(logical, dict):
+                continue
+            if str(logical.get("protocol") or "").strip().lower() != "grpc":
+                continue
+            if expected_port not in (None, ""):
+                try:
+                    if int(logical.get("port")) != int(expected_port):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            matched_target = target
+            break
+        if matched_target is None:
+            plan["error"] = "missing grpc runtime target"
+            plan["steps"] = []
+            return plan
+
+    target_authority = ""
+    if matched_target is not None:
+        logical = matched_target.get("logical")
+        if isinstance(logical, dict):
+            host = str(logical.get("host") or "").strip()
+            port = str(logical.get("port") or "").strip()
+            if host and port:
+                target_authority = f"{host}:{port}"
+    if not target_authority:
+        target_authority = _first_text(("target", "authority"))
+
+    for step in step_dicts:
+        existing_calls = step.get("sdk_calls")
+        existing_call = (
+            next((call for call in existing_calls if isinstance(call, dict)), {})
+            if isinstance(existing_calls, list)
+            else {}
+        )
+        payload = existing_call.get("payload")
+        if not isinstance(payload, dict):
+            payload = existing_call.get("body")
+        if not isinstance(payload, dict):
+            payload = step.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+
+        metadata = existing_call.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        step.pop("command", None)
+        step.pop("code", None)
+        step.pop("execution_mode", None)
+        step["execution_interface"] = {"adapter": "grpc_client"}
+        step["sdk_calls"] = [{
+            "adapter": "grpc_client",
+            "method": "call",
+            "service": service,
+            "rpc_method": rpc_method,
+            "primitive": "GrpcClient.call",
+            "target": target_authority,
+            "payload": payload,
+            "metadata": metadata,
+        }]
+    return plan
 
 def _get_os_context() -> str:
     system = platform.system().lower()
@@ -975,6 +1137,42 @@ def _build_cwe_templates(vulns: list[dict[str, Any]], confirmed: dict[str, Any])
     return _build_cwe_templates_generic(cwe_set)
 
 
+def _normalized_cwe_template_sources(
+    vulns: list[dict[str, Any]],
+    confirmed: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep TemplateManager provenance until authority classification."""
+    manager = TemplateManager()
+    records = manager.get_template_records_for_target(
+        confirmed,
+        include_candidates=True,
+    )
+    if not records:
+        generic = _build_cwe_templates_generic(
+            {v.get("cwe_id", "") for v in vulns}
+        )
+        return ([
+            normalize_knowledge_source(
+                source="manual_cwe_template",
+                content=generic,
+            )
+        ] if generic else [])
+
+    normalized: list[dict[str, Any]] = []
+    for template in records:
+        metadata = dict(template.metadata)
+        tags = {str(tag).strip().lower() for tag in template.tags}
+        is_consolidator = template.author == "co-redteam-consolidator"
+        if is_consolidator and "consolidator_reviewed:false" not in tags:
+            metadata.setdefault("validation_status", "validated")
+        normalized.append(normalize_knowledge_source(
+            source="consolidator" if is_consolidator else "manual_cwe_template",
+            content=template.to_prompt_text(),
+            metadata=metadata,
+        ))
+    return normalized
+
+
 # ═══════════════════════════════════════════════════════════════════
 # Task 2 — 硬核目标摘要提取器 (User Goal Truncation)
 # 原始文本超过 _USER_GOAL_SOFT_LIMIT 时执行硬性正则提取，
@@ -985,7 +1183,12 @@ def _build_cwe_templates(vulns: list[dict[str, Any]], confirmed: dict[str, Any])
 _USER_GOAL_SOFT_LIMIT = 2500
 
 
-def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapter | None = None) -> str:
+def _extract_user_goal_dense(
+    confirmed: dict[str, Any],
+    adapter: ChallengeAdapter | None = None,
+    *,
+    include_knowledge_templates: bool = True,
+) -> str:
     """Build a high-density, minimal User Goal block from confirmed_vuln data.
 
     Only extracts: base_url, endpoints (top 20), CWE IDs + titles,
@@ -1042,60 +1245,8 @@ def _extract_user_goal_dense(confirmed: dict[str, Any], adapter: ChallengeAdapte
         bp_str = "; ".join(f"{name}→{pref}" for name, pref in sorted(prefixes.items()))
         parts.append(f"蓝图前缀: {bp_str}")
 
-    # ── 挑战适配器规则 ──
-    challenge_rules = ""
-    if adapter is not None:
-        challenge_rules = adapter.extra_rules()
-
-    # ── JSON 输出格式要求（极简）──
-    parts.append("""【JSON输出格式 — 声明式 AST 强校验】
-顶层: version(1), plan_id, vuln_summary, rationale, chain_design, steps(list), history_state, primitive_context
-每step必须声明: id(int), status("PLANNED"), type("python"|"shell"), purpose, expected_outcome, depends_on, on_failure("BLOCK_AND_DEBUG"|"SKIP"), why_this_step_advances_state, why_this_payload_is_a_mutation, why_this_is_not_regression, target_primitive, why_this_primitive_advances_chain
-每step必须声明结构化数组（Validator 静态期校验，不通过则 valid:false 拒绝）：
-  imports: [str]
-  sdk_calls: [dict] — 结构化请求声明，支持两种形式：
-    旧字符串形式（兼容，但不含参数契约）: ["HttpClient.get", "HttpClient.post"]
-    新字典形式（推荐，必须包含参数）:
-      {"primitive": "HttpClient.get", "target": "/", "query": {"text": "<value>"}}
-      {"primitive": "HttpClient.post", "target": "/", "body": {"text": "<value>"}, "body_format": "form"}
-      {"primitive": "HttpClient.post", "target": "/", "body": {"key": "<value>"}, "body_format": "json"}
-  body_format 规则:
-    "form" → request body 以 application/x-www-form-urlencoded 发送（等价于 requests.post(data={...})）
-    "json" → request body 以 application/json 发送（等价于 requests.post(json={...})）
-    省略 body_format 时默认为 "form"
-  ⚠️ CRITICAL — Request Contract 保真:
-    当 confirmed_vuln 指明参数位置为 query/form body/header 时，必须使用对应的结构化字段。
-    例如 confirmed_vuln 说 "@RequestParam(name='text')" → 必须使用 body_format="form" 且 body 含 "text" 键。
-    禁止 body=None 而声称已发送payload——这将导致计划被 Gate 拒绝。
-  🚫 IMPORT 禁令 — HttpClient 负责所有编码:
-    HttpClient 已处理 query/form 参数编码、URL 构造、session 管理。
-    不得导入 urllib、urllib.parse、urllib3、requests 或其他原生网络/编码库。
-    需要 query 参数时使用 sdk_call.query 字段；
-    需要 form body 时使用 sdk_call.body + body_format="form"；
-    需要访问响应内容时使用 save_context / HttpClient.last_response。
-【协议统一强制规则 — AST 纯模式】：
-  当 sdk_calls 非空时，系统进入 AST 纯模式。在此模式下：
-  ❌ 禁止输出 command 字段（包括占位符如 "command": "placeholder"、"command": ""）
-  ❌ 禁止同时输出 command + sdk_calls（混合模式导致协议冲突，Validator 直接拒绝）
-  ✅ 输出格式必须为纯 AST：{"imports": [...], "sdk_calls": [...]}
-  ✅ 如果必须使用原始 Python 代码（非标准 SDK 调用），则使用 command 字段 + 不声明 sdk_calls
-  ⚠️ sdk_calls 与 command 互斥！选择其一出，另一省略。
-primitive_context: {current_primitive, target_primitive, transition_edge, fallback_primitive}
-history_state: {tried_payloads:[], failed_reasons:[], consecutive_failures_per_category:{}, forced_path_switch:""}""")
-
     core = "\n\n".join(parts)
-
-    # ── 追加 CWE 模板和公共规则（但限制体积）──
-    cwe_templates = _build_cwe_templates(vulns, confirmed)
-    if cwe_templates:
-        core += f"\n\n【CWE模板】\n{_enforce_section_budget(cwe_templates, 600, 'memory')[0]}"
-
-    core += f"\n\n{_enforce_section_budget(_COMMON_RULES, 800, 'memory')[0]}"
-    if challenge_rules:
-        core += f"\n{_enforce_section_budget(challenge_rules, 500, 'memory')[0]}"
-
-    return core
-
+    return _enforce_section_budget(core, _USER_GOAL_SOFT_LIMIT, "user_goal")[0]
 
 def build_dynamic_prompt(confirmed: dict[str, Any], adapter: ChallengeAdapter | None = None) -> str:
     vulns = confirmed.get("vulnerabilities", [])
@@ -1796,6 +1947,8 @@ def _detect_strategy_stagnation(feedback: dict[str, Any] | None) -> str | None:
         return None
     if feedback.get("exploit_completed") or feedback.get("flag_found"):
         return None
+    if not _has_stagnation_preconditions(feedback):
+        return None
 
     # ── Explicit failure_reason (strongest signal) ──
     failure_reason = str(feedback.get("failure_reason", "")).lower()
@@ -1901,7 +2054,95 @@ def _build_objective_diversification_block(stagnation_type: str) -> str:
     )
 
 
-def _build_plan_generation_contract(confirmed: dict[str, Any]) -> dict[str, Any]:
+_PRIMITIVE_INTERFACE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "arbitrary_file_write": {
+        "transport_requirements": {
+            "protocol": "grpc",
+            "network_transport": "tcp",
+            "port": 50045,
+        },
+        "interface_requirements": {
+            "rpc_method": "SubmitTestimonial",
+        },
+        "execution_requirements": {
+            "forbidden_sdk_primitives": [
+                "HttpClient.get",
+                "HttpClient.post",
+                "HttpClient.raw_request",
+            ],
+            "one_of": [
+                {"execution_interface": {"adapter": "grpc_client"}},
+            ],
+            "sdk_call_contract": {
+                "primitive": "GrpcClient.call",
+                "required_fields": ["target", "service", "method", "payload", "metadata"],
+                "payload_type": "object",
+            },
+            "planner_rules": [
+                "Do not use HttpClient for a gRPC target.",
+                "Do not generate an HTTP JSON body for a gRPC target.",
+                "Use only the structured GrpcClient.call execution primitive.",
+            ],
+            "adapter_scope": (
+                "grpc_client is implemented by redteam_sdk.GrpcClient; "
+                "Planner supplies service, method, payload, and metadata only"
+            ),
+        },
+        "user_input_requirements": {
+            "customer": True,
+        },
+    },
+}
+
+
+def _contains_protocol_evidence(value: Any, protocol: str) -> bool:
+    """Return whether confirmed Stage1 data explicitly mentions a protocol."""
+    if isinstance(value, dict):
+        return any(
+            _contains_protocol_evidence(key, protocol)
+            or _contains_protocol_evidence(item, protocol)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_protocol_evidence(item, protocol) for item in value)
+    return protocol.lower() in str(value or "").lower()
+
+
+def _resolve_planning_primitive(confirmed: dict[str, Any]) -> str:
+    """Read the resolver primary without changing route generation or execution."""
+    try:
+        report = build_route_shadow_report(confirmed, ())
+    except Exception:
+        return ""
+    if not report.resolver_candidates:
+        return ""
+    return report.resolver_candidates[0].primitive_id
+
+
+def _build_primitive_interface_requirements(
+    primitive_id: str,
+    confirmed: dict[str, Any],
+) -> dict[str, Any]:
+    """Return an evidence-gated, payload-free execution interface contract."""
+    interface = _PRIMITIVE_INTERFACE_CONTRACTS.get(primitive_id)
+    if not interface:
+        return {}
+    transport = interface["transport_requirements"]
+    protocol = str(transport["protocol"])
+    if not _contains_protocol_evidence(confirmed, protocol):
+        return {}
+    return {
+        "primitive": primitive_id,
+        "transport_requirements": dict(transport),
+        "interface_requirements": dict(interface["interface_requirements"]),
+        "user_input_requirements": dict(interface["user_input_requirements"]),
+    }
+
+
+def _build_plan_generation_contract(
+    confirmed: dict[str, Any],
+    primitive_id: str = "",
+) -> dict[str, Any]:
     """Normalize Validator request metadata into an explicit LLM contract.
 
     Parameter discovery stays authoritative in the Validator extractor.  This
@@ -1947,7 +2188,7 @@ def _build_plan_generation_contract(confirmed: dict[str, Any]) -> dict[str, Any]
             "body_format": "json",
         }
 
-    return {
+    contract = {
         "contract_name": "PLAN GENERATION CONTRACT",
         "priority_order": [
             "Output schema contract",
@@ -1960,11 +2201,36 @@ def _build_plan_generation_contract(confirmed: dict[str, Any]) -> dict[str, Any]
             "version": 1,
             "steps_location": "steps[]",
             "sdk_call_shape": "dictionary",
-            "execution_mode": "Use sdk_calls or command, never both in one step",
+            "execution_mode": "Standard HTTP sdk_calls use inflater; command must not coexist with sdk_calls",
+            "code_fallback": {
+                "location": "steps[].code",
+                "required_when": "Any sdk_call cannot be represented by the standard HTTP inflater",
+                "content": "Complete non-empty Python implementing the same declared operation",
+                "declaration_rule": "Keep sdk_calls structurally valid; put complex bytes and framing in code",
+                "omit_when": "All sdk_calls are representable by the standard HTTP inflater",
+                "runtime_target_contract": {
+                    "required_input": "Every complex code fallback must read target_context.runtime_targets",
+                    "source": "/workspace/context.json -> target_context.runtime_targets",
+                    "match": "Select by logical.protocol and logical.port",
+                    "consume": "Use runtime.host and runtime.port for the selected non-primary service",
+                    "forbidden": "Never hardcode localhost or 127.0.0.1 for a non-primary service",
+                    "primary_http_compat": "Primary HTTP keeps execution_base_url with base_url fallback",
+                    "resolver_pattern": "next(item['runtime'] for item in runtime_targets if item['logical']['protocol'] == protocol and item['logical']['port'] == port)",
+                },
+            },
         },
         "required_inputs": required_inputs,
         "http_method": parameter_contract.get("method", ""),
         "endpoint": parameter_contract.get("endpoint", ""),
+        "transport_requirements": dict(
+            parameter_contract.get("transport_requirements") or {}
+        ),
+        "interface_requirements": dict(
+            parameter_contract.get("interface_requirements") or {}
+        ),
+        "user_input_requirements": dict(
+            parameter_contract.get("user_input_requirements") or {}
+        ),
         "interface_contract": {
             "sdk_calls_location": "steps[].sdk_calls[]",
             "query_location": "sdk_calls[].query",
@@ -1984,6 +2250,24 @@ def _build_plan_generation_contract(confirmed: dict[str, Any]) -> dict[str, Any]
             },
         },
     }
+    primitive_interface = _build_primitive_interface_requirements(
+        primitive_id,
+        confirmed,
+    )
+    if primitive_interface:
+        contract.update({
+            "transport_requirements": primitive_interface["transport_requirements"],
+            "interface_requirements": primitive_interface["interface_requirements"],
+            "execution_requirements": dict(
+                _PRIMITIVE_INTERFACE_CONTRACTS[primitive_id]["execution_requirements"]
+            ),
+            "user_input_requirements": primitive_interface["user_input_requirements"],
+        })
+        contract["primitive_interface_requirements"] = primitive_interface
+        contract["candidate_route_policy"].append(
+            "Primitive interface requirements override route objective preferences."
+        )
+    return contract
 
 
 def _build_exploit_transition_context(
@@ -2049,6 +2333,7 @@ def _build_candidate_routes_layer(
             max_depth=2,
             max_routes=6,
         )
+        ranked = run_route_shadow(confirmed, ranked)
 
         if not ranked:
             return ""
@@ -2196,83 +2481,341 @@ def _build_primitive_context(confirmed: dict[str, Any], feedback: dict[str, Any]
     return "\n".join(lines)
 
 
-def _build_feedback_block(feedback: dict[str, Any]) -> str:
-    fb_parts: list[str] = [
-        f"confidence={feedback.get('confidence', 0)} | repro_success={feedback.get('repro_success', False)}",
-    ]
-    fb_state = feedback.get("current_exploit_state", "")
-    fb_milestones = feedback.get("milestones_achieved", [])
-    fb_blocker = feedback.get("state_transition_blocker", "")
-    fb_next_action = feedback.get("next_required_action", "")
-    fb_failure_analysis = feedback.get("failure_analysis") or {}
-    fb_next_directions = feedback.get("possible_next_direction") or []
-    if fb_state:
-        fb_parts.append(f"当前攻击状态: {fb_state}")
-    if fb_milestones:
-        fb_parts.append(f"已达成里程碑: {'; '.join(fb_milestones[:3])}")
-    if fb_blocker:
-        fb_parts.append(f"状态阻塞点: {fb_blocker}")
-    if fb_next_action:
-        fb_parts.append(f"下一步: {fb_next_action}")
-    if isinstance(fb_failure_analysis, dict) and fb_failure_analysis:
-        fb_parts.append(f"失败分析: {fb_failure_analysis}")
-    if isinstance(fb_next_directions, list) and fb_next_directions:
-        fb_parts.append(f"可选下一方向: {', '.join(str(x) for x in fb_next_directions[:5])}")
-    fb_summary = feedback.get("summary", "")
-    if fb_summary:
-        fb_parts.append(f"summary: {fb_summary[:200]}")
-    fb_planner = feedback.get("feedback_for_planner", "")
-    if fb_planner:
-        fb_parts.append(f"feedback: {fb_planner[:500]}")
-    fb_errors = feedback.get("errors", [])
-    if isinstance(fb_errors, list) and fb_errors:
-        fb_parts.append(f"errors: {'; '.join(str(e)[:100] for e in fb_errors[:3])}")
+_FEEDBACK_SECTION_BUDGET = 1200
+_FEEDBACK_MIN_BUDGET = 650
+_PRIORITY_FAILURE_TYPES = {
+    "verification_failure",
+    "reflection_blocked",
+    "strategy_stagnation",
+}
 
-    prior_history = feedback.get("prior_history_state")
-    if prior_history and isinstance(prior_history, dict):
-        tried = prior_history.get("tried_payloads", [])
-        failed = prior_history.get("failed_reasons", [])
-        cat_fails = prior_history.get("consecutive_failures_per_category", {})
-        history_lines = []
-        if tried:
-            history_lines.append(f"  已尝试Payload（严禁重复!）: {', '.join(tried[:5])}")
-        if failed:
-            history_lines.append(f"  历史失败原因: {'; '.join(failed[:3])}")
-        if cat_fails:
-            cat_str = ", ".join(f"{k}={v}次" for k, v in cat_fails.items())
-            history_lines.append(f"  分类失败计数: {cat_str}")
-            over_threshold = [k for k, v in cat_fails.items() if v >= 3]
-            if over_threshold:
-                history_lines.append(f"  以下路径已达失败上限，强制切换: {', '.join(over_threshold)}")
-        if history_lines:
-            fb_parts.append("history_state:\n" + "\n".join(history_lines))
 
-    last_exec_raw = feedback.get("last_execution_raw", {})
-    raw_steps = last_exec_raw.get("steps", [])
-    if raw_steps:
-        raw_lines = ["【上一轮执行输出 trace】"]
-        for s in raw_steps[:3]:
-            sid = s.get("step_id", "?")
-            ok = s.get("ok", False)
-            ec = s.get("exit_code", 0)
-            st = str(s.get("stdout_tail", "") or "")[:200]
-            se = str(s.get("stderr_tail", "") or "")[:200]
-            exc = str(s.get("exception_snippet", "") or "")[:200]
-            raw_lines.append(f"  step[{sid}] {'OK' if ok else 'FAIL'} (exit={ec}): stdout={st} stderr={se}")
-            if exc:
-                raw_lines.append(f"    exception={exc}")
-            for h in (s.get("http_responses") or [])[:1]:
-                raw_lines.append(
-                    f"    HTTP {h.get('status_code')} {h.get('method')} "
-                    f"{h.get('url', '')}: {(str(h.get('response_body', '') or '') or '')[:150]}"
-                )
-        fb_parts.append("\n".join(raw_lines))
+def _priority_failure_types(feedback: dict[str, Any] | None) -> set[str]:
+    """Return explicit within-run failures that must outrank static templates."""
+    if not feedback:
+        return set()
 
-    return (
-        "\n\n【上一轮执行反馈 — 必须阅读并修正！】\n"
-        + "\n".join(f"  • {p}" for p in fb_parts)
-        + "\n\n请根据以上反馈修正攻击计划。必须优先考虑当前攻击状态和状态转换阻塞点。"
+    values = {
+        str(feedback.get("failure_type") or "").strip().lower(),
+        str(feedback.get("failure_reason") or "").strip().lower(),
+    }
+    failure_analysis = feedback.get("failure_analysis")
+    if isinstance(failure_analysis, dict):
+        values.add(str(failure_analysis.get("type") or "").strip().lower())
+    if feedback.get("strategy_stagnation"):
+        values.add("strategy_stagnation")
+    return values & _PRIORITY_FAILURE_TYPES
+
+
+def _feedback_value(value: Any, limit: int) -> str:
+    if isinstance(value, (dict, list, tuple)):
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    elif value in (None, ""):
+        text = "<none>"
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 1)] + "…"
+
+
+def _build_feedback_block(
+    feedback: dict[str, Any],
+    limit: int = _FEEDBACK_SECTION_BUDGET,
+) -> str:
+    """Render the current-run decision signal without dropping contract fields."""
+    priority_failures = _priority_failure_types(feedback)
+    required_fields = (
+        "current_exploit_state",
+        "primitive_state",
+        "detected_primitives",
+        "primitive_confidence",
+        "failure_analysis",
+        "state_transition_blocker",
+        "next_required_action",
+        "exploit_momentum",
     )
+
+    def render(value_limit: int, optional_lines: list[str]) -> str:
+        lines = ["【CURRENT-RUN EVALUATOR FEEDBACK】"]
+        lines.extend(
+            f"{key}: {_feedback_value(feedback.get(key), value_limit)}"
+            for key in required_fields
+        )
+        lines.append(
+            "confidence="
+            f"{feedback.get('confidence', 0)} | "
+            f"repro_success={feedback.get('repro_success', False)}"
+        )
+        if priority_failures:
+            lines.append(
+                "PRIORITY: dynamic failure feedback overrides conflicting CWE template "
+                "guidance for this round; retain the template as advisory context only. "
+                f"failures={','.join(sorted(priority_failures))}"
+            )
+        lines.extend(optional_lines)
+        lines.append(
+            "DECISION RULE: revise the next plan from the current exploit state, "
+            "failure analysis, blocker, and next required action."
+        )
+        return "\n".join(lines)
+
+    optional: list[str] = []
+    for key in (
+        "summary",
+        "feedback_for_planner",
+        "errors",
+        "milestones_achieved",
+        "possible_next_direction",
+    ):
+        value = feedback.get(key)
+        if value not in (None, "", [], {}):
+            optional.append(f"{key}: {_feedback_value(value, 180)}")
+
+    value_limit = 160
+    block = render(value_limit, optional)
+    while len(block) > limit and optional:
+        optional.pop()
+        block = render(value_limit, optional)
+    while len(block) > limit and value_limit > 12:
+        value_limit = max(value_limit - 12, 12)
+        block = render(value_limit, optional)
+    if len(block) > limit:
+        raise ValueError(
+            f"[planner] feedback contract cannot fit configured budget ({len(block)} > {limit})"
+        )
+    return block
+
+
+def _transition_endpoints(value: Any) -> tuple[str, str]:
+    if not isinstance(value, dict):
+        return "", ""
+    return (
+        str(value.get("from_state") or "").strip(),
+        str(value.get("to_state") or "").strip(),
+    )
+
+
+def _build_primitive_progress_context(
+    feedback: dict[str, Any] | None,
+    route_knowledge: list[Any] | None = None,
+) -> str:
+    fields = (
+        "confirmed_primitives",
+        "current_primitive",
+        "allowed_next",
+        "allowed_next_primitives",
+        "recommended_transition",
+        "blocked_transition",
+    )
+    if not isinstance(feedback, dict) or not any(key in feedback for key in fields):
+        return ""
+
+    confirmed = [
+        str(item).strip()
+        for item in feedback.get("confirmed_primitives") or []
+        if str(item).strip()
+    ]
+    current = str(feedback.get("current_primitive") or "").strip()
+    allowed_next = [
+        str(item).strip()
+        for item in (
+            feedback.get("allowed_next")
+            or feedback.get("allowed_next_primitives")
+            or []
+        )
+        if str(item).strip()
+    ]
+    recommended = _transition_endpoints(feedback.get("recommended_transition"))
+    blocked = _transition_endpoints(feedback.get("blocked_transition"))
+    recommended_text = " -> ".join(recommended) if all(recommended) else "<none>"
+    blocked_text = " -> ".join(blocked) if all(blocked) else "<none>"
+
+    conflicting_route_primitives: list[str] = []
+    for item in route_knowledge or []:
+        try:
+            route_primitive = str(item.to_plain().get("primitive") or "").strip()
+        except AttributeError:
+            continue
+        if (
+            route_primitive
+            and route_primitive != current
+            and route_primitive not in allowed_next
+            and route_primitive not in conflicting_route_primitives
+        ):
+            conflicting_route_primitives.append(route_primitive)
+
+    lines = [
+        "【Primitive Progress Context】",
+        "DECISION PRIORITY (highest to lowest):",
+        "Level 1: Primitive Progress Context - hard state constraint",
+        "Level 2: Verification Memory - verified facts",
+        "Level 3: Route Knowledge - candidate strategies only",
+        "Level 4: CWE Template / Historical Memory - background knowledge only",
+        "",
+        "Primitive Progress Context represents the verified execution state.",
+        "When Route Knowledge conflicts with Primitive Progress Context, follow Primitive Progress Context.",
+        "Route Knowledge provides candidate strategies only and must not reset the current exploit state.",
+        "Do not generate actions for previous primitives unless explicitly required by the current transition graph.",
+        "",
+        "Current verified capabilities:",
+        *(f"- {item}" for item in confirmed),
+        *(() if confirmed else ("- <none>",)),
+        "",
+        "Current primitive:",
+        current or "<none>",
+        f"current_primitive={current or '<none>'}",
+        "",
+        "Allowed next primitives:",
+        *(f"- {item}" for item in allowed_next),
+        *(() if allowed_next else ("- <none>",)),
+        "",
+        "Recommended next transition:",
+        recommended_text,
+        "",
+        "Forbidden transitions:",
+        blocked_text,
+    ]
+    if all(recommended):
+        lines.append(
+            f"RULE: prioritize steps that advance {recommended_text}; "
+            f"target_primitive must be {recommended[1]}."
+        )
+    lines.append(
+        "RULE: do not skip to a primitive without an explicit edge from the current primitive."
+    )
+    for route_primitive in conflicting_route_primitives:
+        lines.append(
+            f"CONFLICT RULE: do not return to {route_primitive}; "
+            "its Route Knowledge is reference-only."
+        )
+    if all(blocked):
+        lines.append(f"RULE: never select forbidden transition {blocked_text}.")
+    return "\n".join(lines)
+
+
+def _apply_primitive_feedback_constraints(
+    plan: dict[str, Any],
+    feedback: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not _build_primitive_progress_context(feedback):
+        return plan
+
+    assert isinstance(feedback, dict)
+    current = str(feedback.get("current_primitive") or "").strip()
+    recommended = _transition_endpoints(feedback.get("recommended_transition"))
+    blocked = _transition_endpoints(feedback.get("blocked_transition"))
+    graph = get_transition_graph()
+
+    recommendation_is_edge = bool(
+        all(recommended)
+        and (
+            graph.get_transition(*recommended) is not None
+            or recommended[1] in graph.get_next_primitives(recommended[0])
+        )
+    )
+    if recommended == blocked:
+        recommendation_is_edge = False
+
+    steps = plan.get("steps")
+    if not isinstance(steps, list):
+        return plan
+    # A verified current state alone is not a target-selection instruction.
+    # Preserve the Planner's target unless Evaluator supplied an explicit
+    # recommended or blocked transition constraint.
+    if not all(recommended) and not all(blocked):
+        return plan
+
+
+    if recommendation_is_edge:
+        for step in steps:
+            if isinstance(step, dict):
+                step["target_primitive"] = recommended[1]
+        primitive_context = plan.setdefault("primitive_context", {})
+        if isinstance(primitive_context, dict):
+            primitive_context["current_primitive"] = recommended[0]
+            primitive_context["target_primitive"] = recommended[1]
+            primitive_context["transition_edge"] = (
+                f"{recommended[0]}->{recommended[1]}"
+            )
+        return plan
+
+    allowed_targets = {
+        transition.to_state
+        for transition in graph.get_capability_transitions()
+        if transition.from_state == current
+    }
+    allowed_targets.update(graph.get_next_primitives(current))
+    if all(blocked):
+        allowed_targets.discard(blocked[1])
+    if current:
+        plan["steps"] = [
+            step
+            for step in steps
+            if not isinstance(step, dict)
+            or not str(step.get("target_primitive") or "").strip()
+            or str(step.get("target_primitive") or "").strip() in allowed_targets
+        ]
+        steps = plan["steps"]
+        primitive_context = plan.get("primitive_context")
+        if isinstance(primitive_context, dict):
+            target = str(primitive_context.get("target_primitive") or "").strip()
+            if target and target not in allowed_targets:
+                primitive_context["current_primitive"] = current
+                primitive_context["target_primitive"] = ""
+                primitive_context["transition_edge"] = ""
+
+    if all(blocked):
+        plan["steps"] = [
+            step
+            for step in steps
+            if not isinstance(step, dict)
+            or str(step.get("target_primitive") or "").strip() != blocked[1]
+        ]
+        primitive_context = plan.get("primitive_context")
+        if (
+            isinstance(primitive_context, dict)
+            and str(primitive_context.get("target_primitive") or "").strip()
+            == blocked[1]
+        ):
+            primitive_context["current_primitive"] = current or blocked[0]
+            primitive_context["target_primitive"] = ""
+            primitive_context["transition_edge"] = ""
+    return plan
+
+
+def _verified_current_primitive(
+    feedback: dict[str, Any] | None,
+) -> str:
+    """Return the system-owned current primitive, if one is available."""
+    if isinstance(feedback, dict):
+        current = str(feedback.get("current_primitive") or "").strip()
+        if current:
+            return current
+
+    trajectory = get_trajectory()
+    get_current_primitive = getattr(trajectory, "get_current_primitive", None)
+    if not callable(get_current_primitive):
+        return ""
+    return str(get_current_primitive() or "").strip()
+
+
+def _apply_verified_current_primitive(
+    plan: dict[str, Any],
+    verified_current_primitive: str,
+) -> dict[str, Any]:
+    """Overlay verified state without changing the Planner-owned target."""
+    current = str(verified_current_primitive or "").strip()
+    if not current:
+        return plan
+
+    primitive_context = plan.get("primitive_context")
+    if not isinstance(primitive_context, dict):
+        primitive_context = {}
+        plan["primitive_context"] = primitive_context
+    primitive_context["current_primitive"] = current
+    return plan
 
 
 def run_planner(
@@ -2288,7 +2831,13 @@ def run_planner(
         plan = _mock_plan(confirmed, memory)
         if feedback:
             plan["prior_feedback"] = feedback
+        plan = _apply_primitive_feedback_constraints(plan, feedback)
+        plan = _normalize_generated_plan(plan, _runtime_targets_snapshot(confirmed))
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        plan = _apply_verified_current_primitive(
+            plan,
+            _verified_current_primitive(feedback),
+        )
         out_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
         return plan
 
@@ -2298,7 +2847,21 @@ def run_planner(
     memory_context = _build_memory_context(memory, confirmed, feedback)
     route_knowledge_provider = RouteKnowledgeProvider()
     route_knowledge = route_knowledge_provider.for_confirmed(confirmed)
-    route_knowledge_context = route_knowledge_provider.build_planner_context(confirmed)
+    _normalized_route_sources = [
+        normalize_knowledge_source(
+            source="route_knowledge_provider",
+            content=item.to_plain(),
+            metadata={"generation_status": getattr(item, "route_status", "candidate_only")},
+        )
+        for item in route_knowledge
+    ]
+    _route_authority = group_knowledge_by_authority(_normalized_route_sources)
+    route_knowledge_context = json.dumps(
+        _route_authority[REFERENCE_AUTHORITY],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) if _route_authority[REFERENCE_AUTHORITY] else ""
+    _primitive_progress_context = _build_primitive_progress_context(feedback)
     for item in route_knowledge:
         print(
             "[planner] Route knowledge injected: "
@@ -2307,35 +2870,127 @@ def run_planner(
             f"signals=[{','.join(item.expected_signals)}]"
         )
 
-    # ── Candidate Routes: injected into user message (NOT system prompt) ──
-    # System prompt budget is too tight for route comparison; user message
-    # goes directly to LLM without budget compaction.
-    _candidate_routes_for_user = _build_candidate_routes_layer(confirmed, feedback)
+    # Candidate routes remain raw only until the normalizer below classifies
+    # them.  No route content is appended directly to either LLM message.
+    _candidate_routes_context = _build_candidate_routes_layer(confirmed, feedback)
     _exploit_transition_context = _build_exploit_transition_context()
+    _planning_primitive = _resolve_planning_primitive(confirmed)
 
-    # Decision context order: facts -> evaluator feedback -> FSM constraint ->
-    # candidate routes -> generation contract -> memory.
-    user = {
-        "confirmed_vuln": confirmed,
-        "prior_feedback": feedback,
-        "last_execution_raw": (feedback or {}).get("last_execution_raw", {}),
-    }
     if _exploit_transition_context:
-        user["exploit_chain_constraint"] = _exploit_transition_context
         print(
             "[planner] Exploit chain constraint injected:",
             json.dumps(_exploit_transition_context, ensure_ascii=False),
         )
-    user["route_knowledge"] = [item.to_plain() for item in route_knowledge]
-    if _candidate_routes_for_user:
-        user["candidate_routes"] = _candidate_routes_for_user
-    # Keep the generation contract after advisory route knowledge so its
-    # schema/placement rules have the highest recency in the user context.
-    user["plan_generation_contract"] = _build_plan_generation_contract(confirmed)
-    user["layered_memory"] = json.loads(memory.planning_context())
-    user["retrieved_experience"] = memory_context
+    _plan_generation_contract = _build_plan_generation_contract(
+        confirmed,
+        _planning_primitive,
+    )
 
-    core_logic = _extract_user_goal_dense(confirmed, adapter=adapter)
+    core_logic = _extract_user_goal_dense(
+        confirmed,
+        adapter=adapter,
+        include_knowledge_templates=False,
+    )
+    _normalized_user_goal_source = normalize_knowledge_source(
+        source="user_goal",
+        content=core_logic,
+        knowledge_type=HARD_CONSTRAINT,
+    )
+    _feedback_facts, _feedback_constraints, _feedback_strategies = (
+        partition_feedback_authority(feedback)
+    )
+    _template_sources = _normalized_cwe_template_sources(
+        confirmed.get("vulnerabilities", []),
+        confirmed,
+    )
+    _template_authority = group_knowledge_by_authority(_template_sources)
+
+    def _render_normalized_contents(values: tuple[Any, ...]) -> str:
+        return "\n\n".join(
+            value if isinstance(value, str) else json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for value in values
+        )
+
+    _knowledge_templates = _render_normalized_contents(
+        _template_authority[REFERENCE_AUTHORITY]
+    )
+    _verified_template_strategies = _render_normalized_contents(
+        _template_authority[STRATEGY_AUTHORITY]
+    )
+    _normalized_sources = [
+        normalize_knowledge_source(
+            source="verification_memory",
+            content=confirmed,
+        ),
+        normalize_knowledge_source(
+            source="evaluator",
+            content=_feedback_facts,
+        ),
+        normalize_knowledge_source(
+            source="primitive_transition_graph",
+            content=(_exploit_transition_context, _primitive_progress_context),
+        ),
+        normalize_knowledge_source(
+            source="state_restriction",
+            content=_feedback_constraints,
+        ),
+        normalize_knowledge_source(
+            source="state_restriction",
+            content=_plan_generation_contract,
+        ),
+        normalize_knowledge_source(
+            source="evaluator_strategy",
+            content=_feedback_strategies,
+            knowledge_type=STRATEGY_OPTION,
+        ),
+        normalize_knowledge_source(
+            source="planner_strategy_option",
+            content=_candidate_routes_context,
+            knowledge_type=STRATEGY_OPTION,
+        ),
+        normalize_knowledge_source(
+            source="memory_retrieval",
+            content=memory_context,
+        ),
+        normalize_knowledge_source(
+            source="memory_snapshot",
+            content=json.loads(memory.planning_context()),
+        ),
+        _normalized_user_goal_source,
+        *_normalized_route_sources,
+        *_template_sources,
+    ]
+    _normalized_authority = group_knowledge_by_authority(_normalized_sources)
+    _user_authority = compile_context_authority(
+        verified_state=_normalized_sources[0]["content"],
+        trajectory_information=_normalized_sources[1]["content"],
+        transition_information=(
+            _normalized_sources[2]["content"][0],
+            _normalized_sources[2]["content"][1],
+            _normalized_sources[3]["content"],
+        ),
+        knowledge_templates=_knowledge_templates,
+        hard_constraints=(
+            _normalized_sources[4]["content"],
+            _normalized_user_goal_source["content"],
+        ),
+        strategy_options={
+            "evaluator_options": _normalized_sources[5]["content"],
+            "candidate_routes": _normalized_sources[6]["content"],
+            "verified_templates": _verified_template_strategies,
+        },
+        reference_knowledge={
+            "route_provider_context": route_knowledge_context,
+            "layered_memory": _normalized_sources[8]["content"],
+            "memory_retrieval": _normalized_sources[7]["content"],
+        },
+    )
+    user = _user_authority.to_prompt_payload()
 
     if core_logic.startswith("【严重配置错误】"):
         print(f"[planner] ⚠️ {core_logic}")
@@ -2398,8 +3053,10 @@ def run_planner(
     l4_parts: list[str] = []
 
     primitive_context = _build_primitive_context(confirmed, feedback)
-    if primitive_context:
-        l4_parts.append(_enforce_section_budget(primitive_context, 500, "memory")[0])
+    _primitive_strategy_layer = (
+        _enforce_section_budget(primitive_context, 500, "memory")[0]
+        if primitive_context else ""
+    )
 
     verif = get_verification()
     verif_context = verif.build_planner_context()
@@ -2407,24 +3064,44 @@ def run_planner(
         l4_parts.append(_enforce_section_budget(verif_context, 300, "memory")[0])
 
     l4 = _apply_memory_budget("verified_facts", "\n\n".join(l4_parts)) if l4_parts else ""
+    _primitive_progress_layer = (
+        _enforce_section_budget(_primitive_progress_context, 1200, "memory")[0]
+        if _primitive_progress_context else ""
+    )
 
-    # Evaluator feedback outranks advisory route knowledge. Route knowledge in
-    # turn outranks ordinary long-term memory and remains payload-free.
-    _feedback_layer = (
-        _enforce_section_budget(_build_feedback_block(feedback), 700, "memory")[0]
-        if feedback
-        else ""
+    def _budget_authority_value(value: Any, limit: int) -> str:
+        if value in (None, "", {}, [], ()):
+            return ""
+        raw = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+        return _enforce_section_budget(raw, limit, "memory")[0]
+
+    # Authority sources are budgeted before compilation so every source takes
+    # part in the same P0-P3 compaction policy.
+    _feedback_fact_layer = _budget_authority_value(_feedback_facts, 600)
+    _feedback_constraint_layer = _budget_authority_value(_feedback_constraints, 400)
+    _feedback_strategy_layer = _budget_authority_value(_feedback_strategies, 400)
+    _transition_layer = _budget_authority_value(_exploit_transition_context, 400)
+    _verified_strategy_layer = _budget_authority_value(
+        _verified_template_strategies,
+        500,
     )
-    _route_layer = (
-        _compact_route_knowledge(route_knowledge)
-        if route_knowledge
-        else ""
+    _reference_layer = _budget_authority_value(
+        _render_normalized_contents(
+            _normalized_authority[REFERENCE_AUTHORITY]
+        ),
+        800,
     )
-    _memory_layer = (
-        _enforce_section_budget(memory_context, 400, "memory")[0]
-        if memory_context
-        else ""
-    )
+
+    # Dynamic evaluator feedback remains separate from normalized references.
+    _priority_feedback = bool(_priority_failure_types(feedback))
+    _feedback_layer = _build_feedback_block(feedback) if feedback else ""
+    _route_layer = ""
+    _memory_layer = ""
+    _knowledge_layer = ""
 
     # ── L5: Trajectory State (dehydrated compact JSON, ~300 char budget) ──
     traj = get_trajectory()
@@ -2432,7 +3109,7 @@ def run_planner(
     l5 = _apply_memory_budget("trajectory_state", traj_context) if traj_context else ""
 
     # ── L6: User Goal (never mid-text sliced — compacted by section if needed) ──
-    l6 = core_logic
+    l6 = _normalized_user_goal_source["content"]
 
     # ── Explicit knowledge order: runtime -> facts -> feedback -> route -> memory ──
     _retry_key = "RETRY"
@@ -2441,32 +3118,82 @@ def run_planner(
     _layers["L1"] = l1
     _layers["L2"] = l2
     _layers["L3"] = l3
+    if _primitive_progress_layer:
+        _layers["PRIMITIVE_PROGRESS"] = _primitive_progress_layer
+    if _transition_layer:
+        _layers["TRANSITION"] = _transition_layer
     _layers["L4"] = l4
-    if _feedback_layer:
-        _layers["FEEDBACK"] = _feedback_layer
+    if _feedback_fact_layer:
+        _layers["FEEDBACK_FACTS"] = _feedback_fact_layer
+    if _feedback_constraint_layer:
+        _layers["FEEDBACK_CONSTRAINTS"] = _feedback_constraint_layer
+    if _feedback_strategy_layer:
+        _layers["FEEDBACK_STRATEGY"] = _feedback_strategy_layer
     if _retry_block:
         _layers[_retry_key] = _retry_block
     if _route_layer:
         _layers["ROUTE"] = _route_layer
     if _diversify_block:
         _layers[_diversify_key] = _diversify_block
+    if _primitive_strategy_layer:
+        _layers["PRIMITIVE_STRATEGY"] = _primitive_strategy_layer
     if _memory_layer:
         _layers["MEMORY"] = _memory_layer
+    if _verified_strategy_layer:
+        _layers["VERIFIED_STRATEGY"] = _verified_strategy_layer
+    if _knowledge_layer:
+        _layers["KNOWLEDGE"] = _knowledge_layer
+    if _reference_layer:
+        _layers["REFERENCE"] = _reference_layer
     _layers["L5"] = l5
     _layers["L6"] = l6
-    # Drop priority (first dropped = lowest value):
-    #   MEMORY (long-term, large) → RETRY (old failure debris) →
-    #   L5 (trajectory) → L4 (verified facts) → ROUTE (second) →
-    #   DIVERSIFY (decision constraint) → FEEDBACK (evaluator signal) →
-    #   L6 (mission — absolute last resort)
+
+    # Lowest-value context is compacted first. P0 layers are never dropped:
+    # L1-L4, primitive/transition state, and hard constraints remain present.
     _drop_order = [
-        "MEMORY", _retry_key, "L5", "L4",
-        "ROUTE", _diversify_key, "FEEDBACK", "L6",
+        # P3 reference/background
+        "REFERENCE", "KNOWLEDGE", "MEMORY",
+        # P2 optional strategy/history
+        "FEEDBACK_STRATEGY", "PRIMITIVE_STRATEGY", "VERIFIED_STRATEGY",
+        "ROUTE", _diversify_key,
+        # P1 current-round feedback/trajectory (compact, do not erase)
+        "FEEDBACK_FACTS", "L5",
+        # P0 compressible representation, still retained
+        _retry_key, "L6",
     ]
     _drop_idx = 0
 
     def _assemble() -> str:
-        return "\n\n".join(v for v in _layers.values() if v)
+        blocks = compile_context_authority(
+            environment_facts=_layers.get("L1", ""),
+            verified_state=_layers.get("L4", ""),
+            trajectory_information=(
+                _layers.get("L5", ""),
+                _layers.get("FEEDBACK_FACTS", ""),
+            ),
+            transition_information=(
+                _layers.get("PRIMITIVE_PROGRESS", ""),
+                _layers.get("TRANSITION", ""),
+                _layers.get("FEEDBACK_CONSTRAINTS", ""),
+            ),
+            historical_experience=_layers.get("MEMORY", ""),
+            knowledge_templates=_layers.get("KNOWLEDGE", ""),
+            hard_constraints=(
+                _layers.get("L2", ""),
+                _layers.get("L3", ""),
+                _layers.get(_retry_key, ""),
+                _layers.get("L6", ""),
+            ),
+            strategy_options=(
+                _layers.get("PRIMITIVE_STRATEGY", ""),
+                _layers.get("VERIFIED_STRATEGY", ""),
+                _layers.get("ROUTE", ""),
+                _layers.get(_diversify_key, ""),
+                _layers.get("FEEDBACK_STRATEGY", ""),
+            ),
+            reference_knowledge=_layers.get("REFERENCE", ""),
+        )
+        return blocks.render()
 
     system_prompt_with_memory = _assemble()
 
@@ -2488,15 +3215,27 @@ def run_planner(
         before_total = len(system_prompt_with_memory)
 
         if _drop_idx >= len(_drop_order):
-            # All layers dropped/compacted — force-compact L6 as last resort
-            l6_compacted, _ = _enforce_section_budget(
-                _layers["L6"], _FINAL_PAYLOAD_HARD_CAP - len(l1) - len(l2) - len(l3) - 10,
-                "user_goal",
-            )
-            _layers["L6"] = l6_compacted
-            _layers["L4"] = ""
-            _layers["L5"] = ""
-            system_prompt_with_memory = _assemble()
+            # Compact representations only; verified facts and transition
+            # restrictions remain present even in the overflow fallback.
+            for key, floor, section in (
+                ("L6", 200, "user_goal"),
+                (_retry_key, 120, "memory"),
+                ("FEEDBACK_FACTS", 80, "memory"),
+                ("L5", 80, "trajectory"),
+            ):
+                content = _layers.get(key, "")
+                if not content or len(system_prompt_with_memory) <= _FINAL_PAYLOAD_HARD_CAP:
+                    continue
+                overflow = len(system_prompt_with_memory) - _FINAL_PAYLOAD_HARD_CAP
+                target = max(len(content) - overflow - 64, floor)
+                compacted, _ = _enforce_section_budget(content, target, section)
+                _layers[key] = compacted
+                system_prompt_with_memory = _assemble()
+            if len(system_prompt_with_memory) > _FINAL_PAYLOAD_HARD_CAP:
+                raise ValueError(
+                    "[planner] FATAL: retained P0 authority context exceeds "
+                    f"HARD_LIMIT {_FINAL_PAYLOAD_HARD_CAP}"
+                )
             break
 
         layer_key = _drop_order[_drop_idx]
@@ -2520,17 +3259,12 @@ def run_planner(
                 made_progress = True  # already fits, guard must not drop
                 _drop_idx += 1
             else:
-                # No reduction — keep latest summary only or drop entirely
-                parts = layer_content.split("\n── Older")
-                if len(parts) >= 2 and len(parts[0]) < before_layer:
-                    _layers[layer_key] = parts[0]
-                    after_layer = len(parts[0])
-                    made_progress = after_layer < before_layer
-                else:
-                    _layers[layer_key] = ""
-                    after_layer = 0
-                    _drop_idx += 1
-                    made_progress = True
+                # Retry constraints are P0: compact but never erase the source.
+                trimmed, _ = _enforce_section_budget(layer_content, 120, "memory")
+                _layers[layer_key] = trimmed
+                after_layer = len(trimmed)
+                _drop_idx += 1
+                made_progress = True
             _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
             _budget_diag[layer_key]["passes"] += 1
             _budget_diag[layer_key]["rendered"] = after_layer
@@ -2563,9 +3297,26 @@ def run_planner(
             _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
             _budget_diag[layer_key]["passes"] += 1
             _budget_diag[layer_key]["rendered"] = after_layer
-        elif layer_key in ("L4", "L5", "MEMORY", "ROUTE", "FEEDBACK"):
+        elif layer_key == "FEEDBACK":
+            target_limit = max(len(layer_content) // 2, _FEEDBACK_MIN_BUDGET)
+            trimmed = _build_feedback_block(feedback or {}, target_limit)
+            after_layer = len(trimmed)
+            if after_layer < before_layer:
+                _layers[layer_key] = trimmed
+                made_progress = True
+            else:
+                made_progress = True
+                _drop_idx += 1
+            _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
+            _budget_diag[layer_key]["passes"] += 1
+            _budget_diag[layer_key]["rendered"] = after_layer
+        elif layer_key in (
+            "REFERENCE", "KNOWLEDGE", "MEMORY", "FEEDBACK_STRATEGY",
+            "PRIMITIVE_STRATEGY", "ROUTE", "FEEDBACK_FACTS", "L5",
+        ):
             section_type = "trajectory" if layer_key == "L5" else "memory"
-            target_limit = max(len(layer_content) // 2, 100)
+            floor = 100 if layer_key in ("FEEDBACK_FACTS", "L5") else 0
+            target_limit = max(len(layer_content) // 2, floor)
             trimmed, dropped = _enforce_section_budget(layer_content, target_limit, section_type)
             after_layer = len(trimmed)
             if after_layer < before_layer:
@@ -2576,9 +3327,13 @@ def run_planner(
                 made_progress = True
                 _drop_idx += 1
             else:
-                # No reduction — drop entirely
-                _layers[layer_key] = ""
-                after_layer = 0
+                # P1 remains represented; P2/P3 may be removed.
+                if floor:
+                    _layers[layer_key] = trimmed
+                    after_layer = len(trimmed)
+                else:
+                    _layers[layer_key] = ""
+                    after_layer = 0
                 _drop_idx += 1
                 made_progress = True
             _budget_diag.setdefault(layer_key, {"original": before_layer, "rendered": after_layer, "passes": 0})
@@ -2605,8 +3360,10 @@ def run_planner(
 
         # Monotonic-length guard: if total didn't shrink AND no layer progress, force advance
         if after_total >= before_total and not made_progress:
-            # Force-drop current layer and advance
-            if _layers.get(layer_key):
+            # Only optional P2/P3 sources may be force-dropped. P0/P1 sources
+            # advance to the overflow fallback without being erased.
+            protected = {_retry_key, "L6", "FEEDBACK_FACTS", "L5"}
+            if layer_key not in protected and _layers.get(layer_key):
                 _layers[layer_key] = ""
             _drop_idx += 1
             system_prompt_with_memory = _assemble()
@@ -2614,7 +3371,11 @@ def run_planner(
     # ── Aggregated budget diagnostic (at most one line per compacted section) ──
     if _budget_diag:
         diag_parts = []
-        for lk in ("MEMORY", "RETRY", "L5", "DIVERSIFY", "ROUTE", "FEEDBACK", "L4", "L6"):
+        for lk in (
+            "REFERENCE", "KNOWLEDGE", "MEMORY", "FEEDBACK_STRATEGY",
+            "PRIMITIVE_STRATEGY", "ROUTE", "DIVERSIFY", "FEEDBACK_FACTS",
+            "L5", "RETRY", "L6",
+        ):
             d = _budget_diag.get(lk)
             if d and d["passes"] > 0:
                 diag_parts.append(
@@ -2665,7 +3426,17 @@ def run_planner(
     )
     plan.setdefault("version", 1)
     plan["platform"] = platform.system()
+    plan = _apply_primitive_feedback_constraints(plan, feedback)
+    plan = _normalize_generated_plan(
+        plan,
+        _runtime_targets_snapshot(confirmed),
+        _plan_generation_contract,
+    )
 
+    plan = _apply_verified_current_primitive(
+        plan,
+        _verified_current_primitive(feedback),
+    )
     # Task 6: Extract structured AST metadata from each step
     plan = _extract_plan_ast(plan)
 
