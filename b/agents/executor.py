@@ -1372,21 +1372,21 @@ def _run_docker(
     step_id = step.get("id", 0)
 
     # ── Protocol Unification: execution priority ──
-    # Priority: code > sdk_calls (inflater) > command
-    # - code  field is the canonical executable payload (always preferred)
-    # - sdk_calls is an optimization path when code is missing
+    # Priority: supported sdk_calls (inflater) > code > command
+    # - fully supported sdk_calls are the canonical deterministic payload
+    # - code is the fallback when sdk_calls are absent or unsupported
     # - command is the last-resort fallback
     sdk_calls = step.get("sdk_calls") or []
     sdk_calls_supported = _sdk_calls_fully_supported_by_inflater(sdk_calls)
-    if step.get("code") and step["code"].strip():
+    if sdk_calls and sdk_calls_supported:
+        code = _inflate_ast_to_script(step)
+        print(f"[executor] using AST inflater path step[{step_id}] ({len(code)} chars)")
+    elif step.get("code") and step["code"].strip():
         code = _rewrite_code_fallback_runtime_targets(step["code"], runtime_targets)
         if sdk_calls:
-            print(f"[executor] code field overrides sdk_calls step[{step_id}] ({len(code)} chars)")
+            print(f"[executor] unsupported sdk_calls; using code fallback step[{step_id}] ({len(code)} chars)")
         else:
             print(f"[executor] using code field step[{step_id}] ({len(code)} chars)")
-    elif sdk_calls and sdk_calls_supported:
-        code = _inflate_ast_to_script(step)
-        print(f"[executor] using AST inflater path step[{step_id}] (no code; {len(code)} chars)")
     elif sdk_calls:
         return {
             "ok": False, "exit_code": -1, "stdout": "",

@@ -126,15 +126,23 @@ class _CaptureScriptSandbox:
 
 # ── Execution priority tests ──────────────────────────────────
 
-def test_priority_A_code_wins_over_sdk_calls(tmp_path):
-    """Case A: step has both code + sdk_calls → code must execute, inflater must NOT run."""
+def test_priority_A_supported_sdk_calls_win_over_code(tmp_path, monkeypatch):
+    """Case A: supported sdk_calls deterministically override raw code."""
+    inflate_calls = []
+    original_inflater = executor._inflate_ast_to_script
+
+    def _capture_inflater(step):
+        inflate_calls.append(step["id"])
+        return original_inflater(step)
+
+    monkeypatch.setattr(executor, "_inflate_ast_to_script", _capture_inflater)
     sandbox = _CaptureScriptSandbox()
     result, _ = executor._run_docker(
         {
             "id": 101,
             "type": "python",
             "sdk_calls": [{"primitive": "HttpClient.get", "target": "/health"}],
-            "code": "print('CODE_EXECUTED')",
+            "code": "raise RuntimeError('RAW_CODE_MUST_NOT_EXECUTE')",
         },
         sandbox,
         tmp_path,
@@ -143,8 +151,9 @@ def test_priority_A_code_wins_over_sdk_calls(tmp_path):
     generated = (tmp_path / "step_101.py").read_text(encoding="utf-8")
     assert result["ok"] is True
     assert len(sandbox.calls) == 1
-    assert "CODE_EXECUTED" in generated
-    assert 'resp = s.get("/health")' not in generated  # inflater was NOT used
+    assert inflate_calls == [101]
+    assert 'resp = s.get("/health")' in generated
+    assert "RAW_CODE_MUST_NOT_EXECUTE" not in generated
 
 
 def test_priority_B_sdk_calls_inflater_when_no_code(tmp_path):
@@ -183,6 +192,25 @@ def test_priority_C_code_executes_when_no_sdk_calls(tmp_path):
     assert result["ok"] is True
     assert len(sandbox.calls) == 1
     assert "CODE_ONLY" in generated
+
+
+def test_priority_D_command_executes_when_no_sdk_calls_or_code(tmp_path):
+    """Case D: command remains the legacy last-resort fallback."""
+    sandbox = _CaptureScriptSandbox()
+    result, _ = executor._run_docker(
+        {
+            "id": 108,
+            "type": "python",
+            "command": "print('COMMAND_ONLY')",
+        },
+        sandbox,
+        tmp_path,
+    )
+
+    generated = (tmp_path / "step_108.py").read_text(encoding="utf-8")
+    assert result["ok"] is True
+    assert len(sandbox.calls) == 1
+    assert "COMMAND_ONLY" in generated
 
 
 def test_complex_sdk_calls_with_code_fall_back_to_code(tmp_path):

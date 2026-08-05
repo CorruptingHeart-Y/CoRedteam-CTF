@@ -64,6 +64,18 @@ class _LLM:
         }
 
 
+class _AuthorityAwareLLM(_LLM):
+    def complete_json(self, system: str, user: str) -> dict[str, Any]:
+        self.system_prompt = system
+        self.user_prompt = user
+        json.loads(user)
+        return {
+            "version": 1,
+            "steps": [],
+            "primitive_context": {},
+        }
+
+
 def _isolate(monkeypatch: Any, *, history: str = "", reference: str = "") -> None:
     route_type = type("_LongRouteKnowledge", (_RouteKnowledge,), {"context": reference})
     monkeypatch.setattr(planner, "_build_memory_context", lambda *args: history)
@@ -227,3 +239,46 @@ def test_state_advance_resets_zero_progress_counter() -> None:
 
     assert next_streak == 0
     assert hard_reasons == ["state_advance: init → probe_success"]
+
+
+def test_authority_blocks_are_input_only_and_mock_returns_plan_schema_only(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _isolate(monkeypatch)
+    llm = _AuthorityAwareLLM()
+
+    plan = planner.run_planner(
+        settings=SimpleNamespace(mock_llm=False),
+        memory=_Memory(),
+        confirmed={"title": "test", "target_context": {}, "vulnerabilities": []},
+        feedback=None,
+        out_path=tmp_path / "plan.json",
+        llm=llm,
+    )
+    user = json.loads(llm.user_prompt)
+
+    assert "FACT_BLOCK" in user
+    assert "CONSTRAINT_BLOCK" in user
+    assert "are INPUT ONLY" in llm.system_prompt
+    assert "Return only one plan schema JSON object" in llm.system_prompt
+    assert {"version", "steps", "primitive_context"} <= set(plan)
+    assert not planner._AUTHORITY_OUTPUT_FIELDS.intersection(plan)
+    assert "PLAN" not in plan
+
+def test_authority_polluted_plan_wrapper_is_safely_unwrapped() -> None:
+    nested_plan = {
+        "version": 1,
+        "steps": [],
+        "primitive_context": {},
+    }
+    polluted = {
+        "FACT_BLOCK": {"copied": True},
+        "CONSTRAINT_BLOCK": {"copied": True},
+        "PLAN": nested_plan,
+    }
+
+    assert planner._unwrap_authority_plan_output(polluted) == nested_plan
+
+    mixed_output = {**polluted, "unexpected": True}
+    assert planner._unwrap_authority_plan_output(mixed_output) is mixed_output

@@ -1,7 +1,16 @@
 {
   "confirmed_base_url": "",
-  "confirmable_endpoints": [],
+  "confirmable_endpoints": [
+    "/"
+  ],
   "injectable_params": {},
+  "verified_input_context": [
+    {
+      "method": "GET",
+      "path": "/",
+      "parameter": "text"
+    }
+  ],
   "injectable_endpoints": [],
   "accepted_fields": [],
   "rejected_fields": [],
@@ -9,7 +18,20 @@
   "reflection_confirmed": false,
   "payload_blacklist": [],
   "payload_bypass_techniques": [],
-  "working_primitives": [],
+  "working_primitives": [
+    {
+      "primitive_id": "ssti_reflection",
+      "confidence": 0.95,
+      "evidence": "HTTP 500 MethodInvocationException 表明注入的 Velocity 代码被解析执行，证明模板表达式被反射处理",
+      "engine": ""
+    },
+    {
+      "primitive_id": "ssti_execution",
+      "confidence": 0.7,
+      "evidence": "RCE payload attempted but failed due to constructor error; execution not yet confirmed",
+      "engine": ""
+    }
+  ],
   "primitive_knowledge": {},
   "confirmed_cve": "",
   "target_app": "",

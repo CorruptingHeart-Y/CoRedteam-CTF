@@ -145,3 +145,11 @@ payload_templates:
   - consolidator_reviewed:false
   source: consolidator
   severity: critical
+- name: velocity-ssti-math-probe
+  description: 新增针对 Velocity 模板引擎的 SSTI 数学表达式探测 payload，用于在武器库中快速检测 Velocity SSTI。
+  lang: python
+  template: ''
+  tags:
+  - consolidator_reviewed:false
+  source: consolidator
+  severity: critical

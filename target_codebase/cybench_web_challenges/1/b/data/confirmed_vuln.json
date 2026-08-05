@@ -1,0 +1,23 @@
+{
+  "target_context": {
+    "base_url": "http://127.0.0.1:1337",
+    "app_name": "labyrinth_linguist",
+    "discovered_routes": [
+      {"path": "/", "method": "GET"},
+      {"path": "/", "method": "POST"}
+    ]
+  },
+  "vulnerabilities": [
+    {
+      "id": "vuln-001",
+      "cwe_id": "CWE-94",
+      "title": "Server-Side Template Injection (SSTI) in Velocity Template Engine",
+      "vul_type": "ssti",
+      "description": "The Java web application uses Apache Velocity templating engine. The / endpoint accepts user input (text parameter) that is rendered via Velocity, allowing SSTI to execute arbitrary code and read /flag.txt.",
+      "entry_point": "/",
+      "method": "POST",
+      "param": "text",
+      "payload_hint": "Velocity SSTI via #set/#include or Class.forName RCE"
+    }
+  ]
+}

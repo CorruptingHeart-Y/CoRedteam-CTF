@@ -29,11 +29,24 @@ class _RouteKnowledgeStub:
 
 
 class _VerificationStub:
+    def __init__(self, verified_input_context: list[dict[str, str]] | None = None) -> None:
+        self.verified_input_context = verified_input_context or []
+
     def build_planner_context(self) -> str:
-        return ""
+        if not self.verified_input_context:
+            return ""
+        return json.dumps(
+            {"verified_input_context": self.verified_input_context},
+            ensure_ascii=False,
+        )
 
     def get_stats(self) -> dict[str, int]:
-        return {"facts_count": 0}
+        return {"facts_count": int(bool(self.verified_input_context))}
+
+    def get_fact(self, key: str, default: Any = None) -> Any:
+        if key == "verified_input_context":
+            return self.verified_input_context
+        return default
 
 
 class _TrajectoryStub:
@@ -249,6 +262,88 @@ def test_required_parameter_is_generated_in_an_accepted_sdk_location(
     )
     assert in_query or in_form
     assert "text" not in call
+
+
+def test_verified_get_surface_controls_contract_example(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        planner,
+        "get_verification",
+        lambda: _VerificationStub([
+            {"method": "GET", "path": "/", "parameter": "text"}
+        ]),
+    )
+
+    contract = planner._build_plan_generation_contract(_confirmed_metadata())
+
+    assert contract["http_method"] == "GET"
+    assert contract["endpoint"] == "/"
+    assert contract["required_inputs"] == [
+        {"name": "text", "accepted_locations": ["query"]}
+    ]
+    assert contract["examples"]["correct"] == {
+        "primitive": "HttpClient.get",
+        "target": "/",
+        "query": {"text": "<value>"},
+    }
+
+
+def test_missing_verified_surface_preserves_parameter_contract_inference(
+    monkeypatch: Any,
+) -> None:
+    monkeypatch.setattr(planner, "get_verification", lambda: _VerificationStub())
+
+    contract = planner._build_plan_generation_contract(_confirmed_metadata())
+
+    assert contract["http_method"] == "POST"
+    assert contract["endpoint"] == "/endpoint"
+    assert contract["required_inputs"] == [
+        {"name": "text", "accepted_locations": ["query", "form"]}
+    ]
+    assert contract["examples"]["correct"] == {
+        "primitive": "HttpClient.post",
+        "target": "/endpoint",
+        "body": {"text": "<value>"},
+        "body_format": "form",
+    }
+
+
+def test_planner_uses_verified_get_example_without_post_bias(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    _isolate_planner(monkeypatch, "")
+    monkeypatch.setattr(
+        planner,
+        "get_verification",
+        lambda: _VerificationStub([
+            {"method": "GET", "path": "/", "parameter": "text"}
+        ]),
+    )
+
+    def _contract_example_response(context: dict[str, Any]) -> dict[str, Any]:
+        contract = _authority_source(
+            context,
+            "CONSTRAINT_BLOCK",
+            "hard_constraints",
+        )
+        return {
+            **_base_plan(),
+            "steps": [{
+                "id": 1,
+                "status": "PLANNED",
+                "type": "python",
+                "imports": ["redteam_sdk.HttpClient"],
+                "sdk_calls": [contract["examples"]["correct"]],
+            }],
+        }
+
+    plan = _run_planner(tmp_path, _CapturingLLM(_contract_example_response))
+    call = plan["steps"][0]["sdk_calls"][0]
+
+    assert call["primitive"] == "HttpClient.get"
+    assert call["target"] == "/"
+    assert call["query"] == {"text": "<value>"}
+    assert "body" not in call
 
 
 def test_many_candidate_routes_do_not_override_generation_contract(

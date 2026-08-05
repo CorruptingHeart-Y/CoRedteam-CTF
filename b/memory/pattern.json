@@ -497,6 +497,54 @@
       "error_type": "Step type missing — all steps have `type=None` causing immediate rejection by executor with '不支持的 type: None'",
       "root_cause": "Planner 在构造计划步骤时未遵守步骤定义规范，完全没有包含 `type` 字段（或错误地将其设为 `None`）。这导致沙箱环境根本不会执行任何操作，所有后续依赖 step 的逻辑均为空转。Planner 基于虚假的 GET 回显给出了误导性反馈，进一步误导自身。",
       "fix_suggestion": "【绝对禁令】任何提交给执行器的步骤必须显式包含合法的 `type` 字段（如 'code'、'http'、'exploit'）。缺少该字段的步骤将被直接丢弃。在执行任何 HTTP 请求前，必须先根据目标 HTML 表单确认正确的 HTTP 方法（method），若表单为 POST 则严禁使用 GET。同时，在未确认 SSTI 执行上下文前，应先用无害的数学运算或字符串拼接 payload 验证模板注入点是否可执行，再递进到命令执行。"
+    },
+    {
+      "id": "consolidator_70d5",
+      "error_type": "API_MISUSAGE：request().query_kwarg",
+      "root_cause": "特工将 urllib 风格的 query 参数误用于 requests 的 `requests.get(url, query=xxx)`，requests 模块不支持该关键字参数，正确参数应为 `params`。该错误表明特工未查阅文档或运行时未打印确认，盲目编写代码。",
+      "fix_suggestion": "绝对禁令：禁止使用 `query=` 作为 requests 的参数名。在所有 HTTP 请求代码中，只允许使用 `params` 传递查询字符串。建议运行时先执行一个无害请求（如 `requests.get(url, params={'text': 'hello'})`）确认连通性，再注射 payload。"
+    },
+    {
+      "id": "consolidator_8bba",
+      "error_type": "SDK_API_MISUSE: HttpClient.get() missing required url argument",
+      "root_cause": "特工未查阅 HttpClient 的方法签名，仅传递了命名参数 `params` 而未传入位置参数 `url`，且该错误在两个步骤中重复出现，说明特工没有从第一步错误中自动修正行为。这暴露出特工在代码生成阶段缺乏对运行时 API 签名的强约束检查。",
+      "fix_suggestion": "【绝对禁令与新战术】严禁在未事先确认 HttpClient 方法签名的情况下编写步骤代码，必须将目标 URL 作为第一个位置参数传入，例如 `HttpClient.get('http://host.docker.internal:1337/', params=...)`。同时，在编写任何调用 SDK 的代码前，务必在上下文中检索或推断所使用 API 的参数列表，避免同一类 TypeError 反复出现。"
+    },
+    {
+      "id": "consolidator_8d85",
+      "error_type": "Velocity-RCE-Output-Not-Captured",
+      "root_cause": "Planner 在生成 Velocity RCE payload 时，仅调用了 java.lang.Runtime.exec()，但没有附加读取进程输入流的代码（如 BufferedReader 或 IOUtils.toString()），导致服务器只返回了 Process 对象的 toString() 结果，而不是命令的真实输出。特工收到反馈后因迭代限制无法修正。",
+      "fix_suggestion": "【绝对禁令与新战术】禁止使用无法捕获输出的 Velocity RCE 载荷。每次构造 Velocity 模板注入 RCE 时，必须内嵌完整的输出读取逻辑。推荐使用空字符串反射获取 ClassLoader，依次加载 Runtime、InputStreamReader、BufferedReader，并调用 readLine() 将命令输出拼接为最终模板输出。必要时可封装为多行 #set 模板，确保一行内可完成。该做法不受沙箱约束（仅通过 HTTP 参数发送），无需触碰 Python 黑名单。"
+    },
+    {
+      "id": "consolidator_5408",
+      "error_type": "SSTI payload directly landed without verification probe",
+      "root_cause": "Planner 假设用户输入一定会被 Velocity 模板解析，忽视了现代 Web 应用可能存在的输入转义、模板预编译、模板引擎不匹配等防御/误判因素。缺乏对注入点“执行可行性”的证明，直接投递高复杂度 RCE payload 导致无法区分是 payload 无效还是注入点本身不存在，从而陷入死循环。",
+      "fix_suggestion": "【绝对禁令】在任何 SSTI (包括 Velocity, Freemarker, Thymeleaf 等) 攻击中，严禁不经验证直接使用 RCE payload。必须首先执行一个仅包含算术表达式且不会触发安全过滤的最小化探测 payload（如 #set($x=7*7)$x 或 ${7*7}），并观察响应中是否出现计算结果。若原样反射，则依次尝试：不同模板语法、不同参数位置、URL 编码绕过、更改 HTTP 方法，直至证明模板引擎切实解析了输入。只有铁证（响应中出现计算结果或错误回显）存在时，才可升级到 RCE payload。"
+    },
+    {
+      "id": "consolidator_69bc",
+      "error_type": "VERIFICATION_FAILURE_DUE_TO_NO_INJECTION_POINT_PROBING — SSTI payload echoed back without execution, and no minimal math expression probe was performed before deploying RCE payload.",
+      "root_cause": "Planner 的利用策略缺乏强制性探测阶段，直接将 CWE-917 漏洞等同于可即时执行任意代码的入口，而忽略了注入上下文可能存在的限制（HTML 编码、参数名错误、请求格式不匹配等）。迭代中从未发出 'text=#set($x=7*7)$x' 这类探测请求，导致无法区分 'payload 无效' 与 '注入点不存在'，从而在死循环中浪费尝试次数。",
+      "fix_suggestion": "【绝对禁令与新战术】任何模板注入漏洞（SSTI）利用的下次执行流程中，第一步必须发送一个无害数学运算 payload（例如 Velocity 的 #set($x=7*7)$x 或通用表达式 ${7*7}），并自动校验响应中是否出现计算结果（49）。仅在确认注入点可执行后，才允许进入 RCE 尝试。若计算结果未出现，必须自动切换参数名、编码方式、Content-Type（form/json）进行覆盖率探测，直到注入点被定位或所有路径验证失败。禁止直接跳过大版本 RCE payload 的盲目尝试。"
+    },
+    {
+      "id": "consolidator_941f",
+      "error_type": "SSTI_RCE_attempt_without_prior_verification",
+      "root_cause": "Planner 没有遵循漏洞利用的分层验证原则，在 SSTI 场景中直接投递复杂的 RCE payload，且对 Velocity 模板引擎语法特性不敏感，使用了其他引擎的探测语法（如 {{7*7}}），导致无法获得模板解析是否生效的明确信号，错失调整策略的机会。",
+      "fix_suggestion": "【绝对禁令】今后任何 SSTI 漏洞利用第一步必须是发送目标引擎特有的数学表达式（如 Velocity 用 `#set($x=7*7)$x` 或 `${7*7}`），并严格检查响应中是否出现计算结果（如 49）。如果表达式被原样输出，需进一步确认是否通过其他参数或上下文注入，或目标并非 Velocity。切勿直接投递 RCE payload 或采用其他引擎的语法。"
+    },
+    {
+      "id": "consolidator_4491",
+      "error_type": "使用 Jinja2 语法（如 {{7*7}}、{{...}}）对 Velocity 模板引擎进行注入，导致 payload 不被解析",
+      "root_cause": "特工未识别目标模板引擎为 Velocity 而非 Jinja2/FreeMarker，缺乏对应语法映射",
+      "fix_suggestion": "【绝对禁令】禁止对 Velocity 模板使用 {{ }} 包裹表达式；正确语法为 #set($x=...) 或 ${x}。注入前必须先用 #set($x=7*7)$x 验证反射。"
+    },
+    {
+      "id": "consolidator_4053",
+      "error_type": "跳过 SSTI 反射验证，直接投放复杂 RCE payload 导致无法定位问题",
+      "root_cause": "特工未养成“探测→确认→利用”的渗透步骤，急于执行 RCE 而未确认注入点是否可达",
+      "fix_suggestion": "【强制流程】对任何 SSTI 必须先发送纯数学表达式 payload（如 #set($x=7*7)$x），检查响应中是否出现计算结果 49，再视反射位置构造 RCE。"
     }
   ]
 }

@@ -63,6 +63,19 @@ MEMORY_BUDGET: dict[str, int] = {
 # 最终 payload 的物理硬上限（所有层拼接后强制执行一次，双保险）
 _FINAL_PAYLOAD_HARD_CAP = 5000
 
+_AUTHORITY_OUTPUT_FIELDS = frozenset({
+    "FACT_BLOCK", "CONSTRAINT_BLOCK", "STRATEGY_BLOCK", "REFERENCE_BLOCK",
+})
+_AUTHORITY_INPUT_ONLY_CONTRACT = (
+    "OUTPUT CONTRACT (MANDATORY)\n"
+    "FACT_BLOCK, CONSTRAINT_BLOCK, STRATEGY_BLOCK, and REFERENCE_BLOCK are INPUT ONLY. "
+    "Never copy authority blocks into the output.\n"
+    "Return only one plan schema JSON object. Its top-level fields MUST include "
+    "version, steps, and primitive_context.\n"
+    "Do not emit FACT_BLOCK, CONSTRAINT_BLOCK, STRATEGY_BLOCK, REFERENCE_BLOCK, "
+    "or a PLAN wrapper."
+)
+
 
 def _enforce_section_budget(content: str, limit: int, section: str) -> tuple[str, int]:
     """Enforce per-section budget with section-aware compaction.
@@ -290,7 +303,8 @@ def _build_hard_constraints_block() -> str:
         "  ✅ OOB 唯一通道: redteam_sdk.OOBReceiver\n"
         "  HttpClient handles query and form encoding.\n"
         "  Do not import urllib, urllib.parse, requests, or raw networking libraries.\n"
-        "  For query parameters use sdk_call.query.\n"
+        "  Do not use query= as HttpClient.get argument. Use params= for URL query parameters.\n"
+        "  sdk_call.query is logical AST metadata, not a Python argument.\n"
         "  For form parameters use sdk_call.body with body_format=\"form\"."
     )
 
@@ -299,15 +313,15 @@ def _build_sdk_contract_block() -> str:
     """[Layer 3] SDK API Contract — 唯一合法接口契约。"""
     return (
         "SDK API CONTRACT (唯一合法接口)\n"
-        "  from redteam_sdk import HttpClient, ContextStore, OOBReceiver\n"
-        "  s = HttpClient(target_base)    # 自动 session 持久化\n"
-        "  s.get(path) / s.post(path, data=...) / s.put(path, json=...)\n"
-        "  s.raw_request('GET', '/path#frag')  # WAF绕过保留特殊字符\n"
-        "  oob = OOBReceiver(port=8765); oob.start()\n"
-        "  hit = oob.wait_for_callback(timeout=30)\n"
-        "  target_base=json.load(open('/workspace/context.json')).get('target_context',{}).get('base_url','')\n"
+        "  HttpClient.get(url, params=None, headers=None, **kwargs)\n"
+        "  HttpClient.post(url, params=None, data=None, json=None, headers=None)\n"
+        "  HttpClient.raw_request(method, path, headers, body)\n"
+        "params: query string; data: POST form body; json: JSON body; headers: HTTP headers.\n"
+        "  Do not use query= as HttpClient.get argument.\n"
+        "  Use params= for URL query parameters.\n"
         "  PLAN AST: imports:[str]; sdk_calls:[{\"primitive\":\"HttpClient.get|post\","
         "\"target\":\"/\",\"query|body\":{},\"body_format\":\"form|json\"}]\n"
+        "  query is a logical HTTP parameter category, not a Python function argument.\n"
         "  Every steps[] item MUST include type: \"python\" or \"shell\".\n"
         "  sdk_calls and command are mutually exclusive."
     )
@@ -398,6 +412,22 @@ def _extract_plan_ast(plan: dict[str, Any]) -> dict[str, Any]:
         if isinstance(st, dict) and st.get("type") == "python":
             _extract_step_ast(st)
     return plan
+
+
+def _unwrap_authority_plan_output(payload: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap only the exact authority-block pollution shape."""
+    nested_plan = payload.get("PLAN")
+    if not isinstance(nested_plan, dict) or "steps" in payload:
+        return payload
+    required_fields = {"version", "steps", "primitive_context"}
+    has_authority_fields = bool(_AUTHORITY_OUTPUT_FIELDS.intersection(payload))
+    if (
+        has_authority_fields
+        and required_fields.issubset(nested_plan)
+        and set(payload).issubset(_AUTHORITY_OUTPUT_FIELDS | {"PLAN"})
+    ):
+        return dict(nested_plan)
+    return payload
 
 
 def _runtime_targets_snapshot(
@@ -737,7 +767,12 @@ with open('/workspace/context.json') as f: ctx = json.load(f)
 target_base = ctx.get('target_context', {}).get('base_url', '')
 s = HttpClient(target_base)          # 自动恢复/保存 Session Cookie
 
-s.get(path) / s.post(path, data=...) / s.put(path, json=...) / s.delete(path)
+HttpClient.get(url, params=None, headers=None, **kwargs)
+HttpClient.post(url, params=None, data=None, json=None, headers=None)
+HttpClient.raw_request(method, path, headers, body)
+# params=query string; data=POST form body; json=JSON body; headers=HTTP headers
+# Do not use query= as HttpClient.get argument. Use params= for URL query parameters.
+# sdk_calls[].query is a logical HTTP parameter category, not a Python function argument.
 s.raw_request('GET', '/path#frag')    # WAF绕过：保留 # %00 ..;/ 等字符
 s.auto_extract_csrf()                 # 从 JWT cookie 或 HTML 自动提取 antiCSRFToken
 
@@ -2167,23 +2202,60 @@ def _build_plan_generation_contract(
     example_locations = (
         required_inputs[0]["accepted_locations"] if required_inputs else ["form"]
     )
+    contract_method = parameter_contract.get("method", "")
+    contract_endpoint = parameter_contract.get("endpoint", "")
+    example_target = contract_endpoint or "/endpoint"
+
+    verification = get_verification()
+    verified_contexts = (
+        verification.get_fact("verified_input_context", [])
+        if hasattr(verification, "get_fact") else []
+    )
+    if isinstance(verified_contexts, dict):
+        verified_contexts = [verified_contexts]
+    elif not isinstance(verified_contexts, list):
+        verified_contexts = []
+    verified_surface = next(
+        (
+            context
+            for context in verified_contexts
+            if isinstance(context, dict)
+            and str(context.get("method", "")).upper() in {"GET", "POST"}
+            and isinstance(context.get("path"), str)
+            and context.get("path")
+            and isinstance(context.get("parameter"), str)
+            and context.get("parameter")
+        ),
+        None,
+    )
+    if verified_surface:
+        contract_method = str(verified_surface["method"]).upper()
+        contract_endpoint = verified_surface["path"]
+        example_target = contract_endpoint
+        example_name = verified_surface["parameter"]
+        example_locations = ["query"] if contract_method == "GET" else ["form"]
+        required_inputs = [{
+            "name": example_name,
+            "accepted_locations": example_locations,
+        }]
+
     if "form" in example_locations:
         correct_example = {
             "primitive": "HttpClient.post",
-            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "target": example_target,
             "body": {example_name: "<value>"},
             "body_format": "form",
         }
     elif "query" in example_locations:
         correct_example = {
             "primitive": "HttpClient.get",
-            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "target": example_target,
             "query": {example_name: "<value>"},
         }
     else:
         correct_example = {
             "primitive": "HttpClient.post",
-            "target": parameter_contract.get("endpoint") or "/endpoint",
+            "target": example_target,
             "body": {example_name: "<value>"},
             "body_format": "json",
         }
@@ -2220,8 +2292,8 @@ def _build_plan_generation_contract(
             },
         },
         "required_inputs": required_inputs,
-        "http_method": parameter_contract.get("method", ""),
-        "endpoint": parameter_contract.get("endpoint", ""),
+        "http_method": contract_method,
+        "endpoint": contract_endpoint,
         "transport_requirements": dict(
             parameter_contract.get("transport_requirements") or {}
         ),
@@ -3179,6 +3251,7 @@ def run_planner(
             historical_experience=_layers.get("MEMORY", ""),
             knowledge_templates=_layers.get("KNOWLEDGE", ""),
             hard_constraints=(
+                _AUTHORITY_INPUT_ONLY_CONTRACT,
                 _layers.get("L2", ""),
                 _layers.get("L3", ""),
                 _layers.get(_retry_key, ""),
@@ -3424,6 +3497,7 @@ def run_planner(
         system_prompt_with_memory,
         json.dumps(user, ensure_ascii=False),
     )
+    plan = _unwrap_authority_plan_output(plan)
     plan.setdefault("version", 1)
     plan["platform"] = platform.system()
     plan = _apply_primitive_feedback_constraints(plan, feedback)

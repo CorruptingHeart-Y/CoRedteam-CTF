@@ -908,6 +908,7 @@ def _record_primitive_learning(
 def _record_verified_facts(
     fb: dict[str, Any],
     step_results: list[dict[str, Any]],
+    plan: dict[str, Any] | None = None,
 ) -> None:
     """从单轮的执行结果中提取已确认的事实并写入 verification memory。"""
     verif = get_verification()
@@ -917,6 +918,36 @@ def _record_verified_facts(
     detected_primitives = fb.get("detected_primitives", [])
     primitive_confidence = fb.get("primitive_confidence", {})
     primitive_evidence = fb.get("primitive_evidence", {})
+    input_context_verified = (
+        state in ("payload_injected", "gadget_triggered", "oob_received")
+        or "input_processed" in (fb.get("confirmed_primitives") or [])
+    )
+    if input_context_verified and isinstance(plan, dict):
+        successful_step_ids = {
+            r.get("step_id")
+            for r in step_results
+            if (r.get("result") or {}).get("ok")
+        }
+        for step in plan.get("steps") or []:
+            if step.get("id") not in successful_step_ids:
+                continue
+            for call in step.get("sdk_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                primitive = call.get("primitive", "")
+                method = primitive.rsplit(".", 1)[-1].upper()
+                path = call.get("target", "")
+                if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"} or not isinstance(path, str):
+                    continue
+                for field in ("query", "body"):
+                    parameters = call.get(field)
+                    if not isinstance(parameters, dict):
+                        continue
+                    for parameter in parameters:
+                        if isinstance(parameter, str) and parameter:
+                            verif.confirm_input_context(method, path, parameter)
+
+
 
     all_stdout = " ".join(
         _coordinator_text((r.get("result") or {}).get("stdout", "")) for r in step_results
@@ -1297,7 +1328,7 @@ def run_pipeline(
         _record_primitive_learning(fb, last_plan, step_results)
 
         # ── Verification Facts Recording ──
-        _record_verified_facts(fb, step_results)
+        _record_verified_facts(fb, step_results, last_plan)
 
         render_evaluator_feedback(fb)
 

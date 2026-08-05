@@ -10,6 +10,7 @@ def _default_facts() -> dict[str, Any]:
         "confirmed_base_url": "",
         "confirmable_endpoints": [],
         "injectable_params": {},
+        "verified_input_context": [],
         "injectable_endpoints": [],
         "accepted_fields": [],
         "rejected_fields": [],
@@ -118,6 +119,18 @@ class VerificationMemory:
                     ep_params.append(p)
             self._save()
 
+    def confirm_input_context(self, method: str, path: str, parameter: str) -> None:
+        """Persist one input channel that has been confirmed by execution evidence."""
+        context = {
+            "method": method.upper(),
+            "path": path,
+            "parameter": parameter,
+        }
+        contexts = self.facts.setdefault("verified_input_context", [])
+        if context not in contexts:
+            contexts.append(context)
+            self._save()
+
     def add_accepted_field(self, field: str) -> None:
         self.confirm("accepted_fields", field)
 
@@ -198,6 +211,18 @@ class VerificationMemory:
 
         if self.facts.get("confirmed_base_url"):
             lines.append(f"  URL: {self.facts['confirmed_base_url']}")
+
+        for context in self.facts.get("verified_input_context", []):
+            if not isinstance(context, dict):
+                continue
+            method = context.get("method", "")
+            path = context.get("path", "")
+            parameter = context.get("parameter", "")
+            if method and path and parameter:
+                lines.append(
+                    "  Verified input context (reuse before exploring alternatives): "
+                    f"method={method} path={path} parameter={parameter}"
+                )
 
         confirmed_eps = self.facts.get("confirmable_endpoints", [])
         if confirmed_eps:
